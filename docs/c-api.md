@@ -37,7 +37,8 @@ structured `ckfe_error`, never a null job with an OK status. Polling is
 nonblocking and returns a snapshot
 with explicit `total_*_known` flags. Call `ckfe_job_cancel` for cooperative
 cancellation and continue polling until a terminal state is observed. The
-frontend owns presentation and conflict policy; the backend never calls back
+frontend owns presentation and the user's choices. The backend assesses
+conflict rules and binds execution to reviewed evidence; it never calls back
 into the UI.
 
 For regular-file copy, `processed_bytes` is updated from the bounded native
@@ -94,6 +95,26 @@ acknowledged. Rules, manual native names, per-row eligibility, rejection reasons
 retained names and recovery identifiers are backend results. Unknown or failed
 inventory cannot become `identical` or authorize mirror deletion. See
 [native contracts](native-contracts.md) for lifetime and platform limits.
+
+Compare accepts no journal root and a zero operation ID. Mutation-only
+namespace fields are ignored in that profile; rules remain descriptive and
+every executable row is Report. A Compare receipt cannot authorize Copy or
+Sync. Other profiles still require their mutation journal and operation ID.
+
+`ck_fs_actions.h` provides batch rename, native Trash and receipt-bound restore.
+Use preview row reasons to disable unavailable commands. Renames reject cycles
+and occupied destinations and order chains from their free end. Trash requires
+explicit native capability consent and never falls back to permanent deletion.
+Restore accepts a live opaque receipt and a freshly held original parent; it
+never imports authority from serialized Trash metadata. Destroying a job is a
+nonblocking cancellation/release. A terminal action state follows journal
+finalization and release of the operation's native input owners; separately
+retained Trash receipts keep read-only identity pins until their own disposal.
+
+`ck_fs_session.h` provides worker-only durable baseline sessions and verified
+commit receipts. Open retains both root locks, including overlap protection;
+commit is generation-checked and crash recovery preserves uncertain evidence.
+These baseline primitives do not substitute for a composed two-way executor.
 
 ## Comparison and policy headers
 

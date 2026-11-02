@@ -1,22 +1,27 @@
 # Operations and feature inventory
 
-## 0.2 implementation status
+## 0.3 implementation status
 
 | Surface | Implemented | Qualification boundary |
 | --- | --- | --- |
 | Comparison planning | Copy/Move/Update/Missing/Sync/Mirror/Compare proposals, size/time/digest modes, bounded immutable pages, filters and protected exclusions | Preview facts; no native mutation authority |
-| Conflict policies | Per-item/selection/subtree/class rules, precedence, newest/size/source/target/keep-both choices, explicit tie handling, zero-length/retention protection | C++ evaluation; execution receipts and frontend controls still require integration |
-| Two-way foundation | Baseline codec/checksum, edit/delete classification, metadata conflicts, deletion count/ratio guards, pending-state preservation | Pure state machine; durable sessions, locking and native journal/baseline commits remain required |
+| Conflict policies | Per-item/selection/subtree/class rules, precedence, newest/size/source/target/keep-both choices, explicit tie handling, zero-length/retention protection | Native tree review freezes rules and manual native names into a revocable receipt; provider refusal remains visible |
+| Durable sessions | Baseline codec/checksum, edit/delete classification, metadata conflicts, deletion guards, overlapping-root locks, native verification receipts, durable generation compare-and-swap and recovery | Session commit verifies both roots; a baseline receipt alone never executes a two-way data plan |
+| Reviewed trees | Native inventory, immutable pages and facts, assessment, receipt-bound execution, stale receipt rejection, pause/resume/cancel and explicit worker drain | Each provider must qualify publication, metadata and source retirement; unsupported primitives cannot become success |
+| Retained replacement | Journaled old-target retention and explicit retained names before incoming publication | Requires stable old-object content and an object-bound native rename; unknown coverage refuses replacement |
+| Batch rename | Exception-free C jobs, exact native names, duplicate/cycle/collision review, reverse dependency order, one-use approval and bounded verified retry | Windows qualified native handle rename; POSIX source-name mutation remains refused |
+| Native Trash/restore | Explicit capability opt-in, private native metadata, live opaque receipt, held original-parent identity and no-overwrite restore | Qualified local Windows NTFS regular files; directories and other providers need their own positive qualification |
 | Preservation | Versioned policy assessment, ordinary-scope native checks, mode/time verification and special-bit stripping | Complete preservation remains unavailable; opaque attributes and unsupported security are refused |
 | Job lifecycle | Worker-side setup, cancellation, bounded/coalesced events, retained terminal byte progress, explicit reconciliation outcomes | Cross-platform CI and installed-consumer checks qualify each revision |
 | Recovery | Private journal inspection and immutable C summary/pages | Read-only; no automatic replay authority |
 | Browser models | Optional C++ browser target | Separate from C ABI engine/platform dependencies |
 
-Native recursive execution from a reviewed comparison plan, replacement/version
-retention, full ACL/xattr/security replay, arbitrary batch rename, durable
-two-way sessions/overlapping-root locks, Trash/restore, and identity-verified
-retry/resume are still delivery gates. A passing planning/unit suite does not
-establish those mutation capabilities.
+Full ACL/xattr/security replay, complete mixed-direction hierarchical execution,
+provider-owned durable private-root capabilities, directory Trash and verified
+prefix resume remain delivery gates. Implemented interfaces and a passing
+planning suite do not establish a platform's mutation capabilities. Consult the
+[revision-specific evidence](validation-2026-11-02.md): the macOS strong
+publication gate remains open, so its positive copy qualification is failing.
 
 ## Available in the first C ABI revision
 
@@ -51,10 +56,10 @@ establish those mutation capabilities.
 - Recursive deletion engine and recovery primitives, awaiting their stable C
   ABI adapter.
 
-## Planned ABI slices
+## Qualification and further ABI slices
 
-The next slices add typed conflict decisions, recursive copy, rename, delete,
-Trash/capability adapters, progress-event draining, recovery inspection and
-reconciliation, and explicit `WaitingForDecision`, `Cancelling`, `Partial`,
-`Unsupported`, and `Denied` state transitions. These are API work items, not
-permissions to weaken the identity or path-safety rules above.
+The next slices complete mixed-direction hierarchical execution, native
+preservation, provider-owned durable journal-root capabilities and verified
+prefix resume. Existing tree/action/session APIs already carry typed review,
+capability, partial/recovery and access outcomes. No interface declaration or
+capability-family bit authorizes weakening identity or path-safety rules.
