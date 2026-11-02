@@ -562,6 +562,115 @@ public:
             return Observation<bool>::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "content.fsync"});
         return Observation<bool>::available(true);
     }
+    Observation<bool> apply_current_caller_ownership() override {
+        using Result = Observation<bool>;
+        if (!content_write_access_ || !publication_)
+            return Result::unavailable(ObservationState::Denied,
+                adapter_error(AdapterError::InvalidAccess, "regular_metadata.ownership_staging_only"));
+        struct stat native{};
+        if (fstat(descriptor_.get(), &native) != 0)
+            return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "regular_metadata.ownership_before"});
+        if (!S_ISREG(native.st_mode) || native.st_nlink != 1)
+            return Result::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::ProviderReviewRequired, "regular_metadata.ownership_kind_links"));
+        const auto uid = geteuid();
+        const auto gid = getegid();
+        // Account explicitly for setgid-parent inheritance. Only staging is
+        // writable here, and the source's uid/gid are never replayed.
+        if ((native.st_uid != uid || native.st_gid != gid) && fchown(descriptor_.get(), uid, gid) != 0)
+            return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "regular_metadata.fchown_caller"});
+        if (fstat(descriptor_.get(), &native) != 0)
+            return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "regular_metadata.ownership_after"});
+        if (native.st_uid != uid || native.st_gid != gid)
+            return Result::unavailable(ObservationState::Changed,
+                adapter_error(AdapterError::MetadataChanged, "regular_metadata.ownership_verification"));
+        return Result::available(true);
+    }
+    Observation<bool> qualify_ordinary_regular_metadata() const override {
+        using Result = Observation<bool>;
+        const auto refuse = [](const char* operation) {
+            return Result::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::ProviderReviewRequired, operation));
+        };
+        auto before = inspect_basic();
+        if (!before.value()) return refuse("regular_metadata.basic_coverage");
+        const auto& basic = *before.value();
+        if (!basic.kind.value() || *basic.kind.value() != ObjectKind::RegularFile ||
+            !basic.posix_permissions.value() || (*basic.posix_permissions.value() & ~0777U) != 0 ||
+            !basic.link_count.value() || *basic.link_count.value() != 1)
+            return refuse("regular_metadata.kind_mode_links");
+        const auto storage = inspect_storage();
+        if (!storage.value() || !storage.value()->flags.value() || storage.value()->flags.value()->value != 0)
+            return refuse("regular_metadata.storage_flags");
+        OwnedDescriptor readable(-1);
+#if defined(__linux__)
+        struct statfs filesystem{};
+        if (fstatfs(descriptor_.get(), &filesystem) != 0 || filesystem.f_type != EXT4_SUPER_MAGIC)
+            return refuse("regular_metadata.unaudited_linux_filesystem");
+        // Acquire metadata-query read rights from the verified held-fd proxy,
+        // never the original basename, and without privilege/elevation.
+        const auto proxy = attribute_proxy();
+        if (!proxy.value()) return refuse("regular_metadata.held_descriptor_proxy");
+        readable = OwnedDescriptor(open(proxy.value()->c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC));
+        if (readable.get() < 0) return refuse("regular_metadata.held_descriptor_read_access");
+        struct stat original{}, reopened{};
+        if (fstat(descriptor_.get(), &original) != 0 || fstat(readable.get(), &reopened) != 0 ||
+            original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino || !S_ISREG(reopened.st_mode))
+            return refuse("regular_metadata.held_handle_identity");
+        int flags = 0;
+        // EXTENTS is an ordinary ext4 representation, not replayable policy.
+        // All other flags, including unknown bits, require separate review.
+        if (ioctl(readable.get(), FS_IOC_GETFLAGS, &flags) != 0 ||
+            (static_cast<unsigned>(flags) & ~static_cast<unsigned>(FS_EXTENT_FL)) != 0)
+            return refuse("regular_metadata.inode_flags");
+        struct fsxattr extended{};
+        if (ioctl(readable.get(), FS_IOC_FSGETXATTR, &extended) != 0 || extended.fsx_xflags != 0 ||
+            extended.fsx_projid != 0 || extended.fsx_extsize != 0 || extended.fsx_cowextsize != 0)
+            return refuse("regular_metadata.project_storage_policy");
+        const auto names = flistxattr(readable.get(), nullptr, 0);
+#else
+        struct statfs filesystem{};
+        if (fstatfs(descriptor_.get(), &filesystem) != 0 ||
+            (std::strcmp(filesystem.f_fstypename, "apfs") != 0 && std::strcmp(filesystem.f_fstypename, "hfs") != 0))
+            return refuse("regular_metadata.unaudited_darwin_filesystem");
+        readable = OwnedDescriptor(fcntl(descriptor_.get(), F_DUPFD_CLOEXEC, 0));
+        if (readable.get() < 0) return refuse("regular_metadata.held_descriptor");
+        const auto names = flistxattr(readable.get(), nullptr, 0, XATTR_SHOWCOMPRESSION);
+#endif
+        if (names != 0) return refuse("regular_metadata.xattrs_labels_capabilities");
+#if defined(__linux__)
+        // Required known security names are probed even if omitted from the
+        // caller-visible list. Denied/unsupported replies are not absence.
+        // Arbitrary trusted.* remains unknown under the versioned subset.
+        for (const auto* name : {"system.posix_acl_access", "system.posix_acl_default",
+            "security.capability", "security.selinux", "security.SMACK64", "security.SMACK64EXEC",
+            "security.SMACK64MMAP", "security.SMACK64TRANSMUTE", "security.SMACK64IPIN",
+            "security.SMACK64IPOUT", "security.ima", "security.evm"}) {
+            errno = 0;
+            if (fgetxattr(readable.get(), name, nullptr, 0) >= 0 || errno != ENODATA)
+                return refuse("regular_metadata.required_security_name");
+        }
+#else
+        const auto acl = read_security(SecurityPart::DarwinExtendedAcl);
+        if (!acl.value() || acl.value()->presence != SecurityPresence::Absent)
+            return refuse("regular_metadata.required_security_name");
+#endif
+        PosixOpenedEntry query(std::move(readable), scope_, true);
+        const auto layout = query.inspect_data_layout();
+        if (!layout.value() || !basic.logical_size.value() ||
+            layout.value()->logical_size != *basic.logical_size.value())
+            return refuse("regular_metadata.layout_coverage");
+        const auto& ranges = layout.value()->ranges;
+        const auto size = *basic.logical_size.value();
+        if ((size == 0 && !ranges.empty()) || (size != 0 &&
+            (ranges.size() != 1 || ranges.front().offset != 0 || ranges.front().length != size)))
+            return refuse("regular_metadata.sparse_layout");
+        const auto after = inspect_basic();
+        if (!after.value()) return refuse("regular_metadata.final_basic_coverage");
+        auto unchanged = detail::data_layout_metadata_unchanged(basic, *after.value());
+        if (!unchanged.value() || !*unchanged.value()) return refuse("regular_metadata.changed_during_qualification");
+        return Result::available(true);
+    }
     Observation<bool> apply_portable_basic_metadata(const BasicMetadata& source) override {
         using Result = Observation<bool>;
         if (!content_write_access_)
@@ -590,7 +699,7 @@ public:
             const auto& error = *source.modified.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
-        if (fchmod(descriptor_.get(), static_cast<mode_t>(*source.posix_permissions.value())) != 0)
+        if (fchmod(descriptor_.get(), static_cast<mode_t>(*source.posix_permissions.value() & 0777U)) != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "metadata.portable_basic.fchmod"});
         const auto to_timespec = [](const FileTimestamp& value, timespec& result, const char* operation)
             -> std::optional<UnavailableObservation> {
@@ -1900,6 +2009,9 @@ public:
         }
         if (requests_content_read(access)) {
             original->content_access_ = true;
+#if defined(__linux__)
+            original->inode_flags_access_ = requests_inode_flags(access);
+#endif
             original->layout_access_ = requests_layout(access);
             return Result::available(std::move(original));
         }

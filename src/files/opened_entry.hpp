@@ -112,6 +112,16 @@ public:
     virtual Observation<std::size_t> write_content(std::uint64_t offset, std::span<const std::byte> bytes,
                                                     ContentWriteLimits limits = {}, std::stop_token stop = {});
     virtual Observation<bool> flush_content();
+    // Strict ordinary-file qualification through this held object. Success
+    // requires an audited local filesystem, caller-visible attribute inventory,
+    // explicit ACL / known label/capability absence, ordinary storage flags and
+    // dense main-data layout. Arbitrary hidden attribute namespaces remain
+    // UNKNOWN: success qualifies only OrdinaryCallerVisibleV1. May acquire metadata-query read rights through
+    // the held descriptor; never reopens the original source name.
+    virtual Observation<bool> qualify_ordinary_regular_metadata() const;
+    // Staging-only explicit current effective uid/gid policy; never adopts
+    // source ownership. Default refuses (including Windows).
+    virtual Observation<bool> apply_current_caller_ownership();
     // Apply only the platform's explicitly qualified portable-basic metadata
     // subset to this worker-created staging object. This is not a complete
     // preservation operation: callers must account separately for ownership,

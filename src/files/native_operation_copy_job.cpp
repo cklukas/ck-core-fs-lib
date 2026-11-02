@@ -5,6 +5,7 @@
 #include "directory_cursor.hpp"
 #include "native_operation_recovery_evidence.hpp"
 #include "opened_entry.hpp"
+#include "regular_metadata_preservation.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -262,7 +263,7 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
                                                            "native_operation_copy.staging_handle");
         return state->request.prepare_metadata(*state->staging, stop);
     };
-    copy.verify_copy = [state](std::stop_token) {
+    copy.verify_copy = [state](std::stop_token stop) {
         if (!state->source || !state->staging)
             return rejected<bool>(AdapterError::InvalidNativeResult,
                                   "native_operation_copy.verify_handles");
@@ -275,6 +276,10 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
             !destination.value()->kind.value() || !destination.value()->logical_size.value())
             return rejected<bool>(AdapterError::UnsupportedQuery, "native_operation_copy.verify_metadata",
                                   ObservationState::Unknown);
+        if (state->request.verify_metadata_before_publication) {
+            auto verified = state->request.verify_metadata_before_publication(*state->staging, stop);
+            if (!verified.value() || !*verified.value()) return verified;
+        }
         return Observation<bool>::available(
             same(*source.value()->identity.value(), state->request.source_identity) &&
             *source.value()->kind.value() == ObjectKind::RegularFile &&
@@ -334,9 +339,13 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
             if (!identity.value()) return unavailable_bool(*identity.unavailable_detail());
             return Observation<bool>::available(same(*identity.value(), state->request.destination_identity));
         };
-        commit.commit_destination = [state](std::stop_token) {
+        commit.commit_destination = [state](std::stop_token stop) {
             if (!state->staging) return rejected<bool>(AdapterError::InvalidNativeResult,
                                                         "native_operation_copy.commit_staging_handle");
+            if (state->request.verify_metadata_before_publication) {
+                auto verified = state->request.verify_metadata_before_publication(*state->staging, stop);
+                if (!verified.value() || !*verified.value()) return verified;
+            }
             auto published = state->staging->publish_noreplace(*state->request.destination,
                                                                 state->request.destination_name);
             if (!published.value()) return unavailable_bool(*published.unavailable_detail());
@@ -446,6 +455,12 @@ Observation<OperationBatchJob::Pointer> create_native_operation_copy_batch(
             return rejected<OperationBatchJob::Pointer>(AdapterError::UnqualifiedIdentity,
                                                          "native_operation_copy_batch.source_identity");
 
+        auto preservation = RegularMetadataPreservation::create(
+            source, request.policy.allow_unhandled_metadata_loss, request.policy.metadata_scope);
+        if (!preservation.value())
+            return Observation<OperationBatchJob::Pointer>::unavailable(
+                preservation.unavailable_detail()->state, preservation.unavailable_detail()->error);
+
         const auto item_id = item_journal_id(request.journal_id, item);
         const auto staging_name = generated_name(destination_name.encoding(), ".ck-copy-staging-", item_id, item);
         const auto journal_name = generated_name(request.journal_root->encoding(), ".ck-copy-journal-", item_id, item);
@@ -486,31 +501,12 @@ Observation<OperationBatchJob::Pointer> create_native_operation_copy_batch(
             request.policy.copy_limits,
             {},
             FileOperation::Copy};
-        const auto held_source = source;
-        const auto allow_metadata_loss = request.policy.allow_unhandled_metadata_loss;
-        copy_request.prepare_metadata = [held_source, allow_metadata_loss](OpenedEntry& staging,
-                                                                            std::stop_token) {
-            OperationMetadataRequest metadata_request;
-            metadata_request.apply_traversal_metadata = [&staging, held_source](std::stop_token) {
-                return staging.apply_portable_basic_metadata(held_source->metadata());
-            };
-            metadata_request.apply_security_metadata = [allow_metadata_loss](std::stop_token) {
-                if (allow_metadata_loss)
-                    return Observation<bool>::available(true);
-                return Observation<bool>::unavailable(ObservationState::Unsupported,
-                    {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),
-                     "native_operation_copy.metadata_loss_consent"});
-            };
-            // Portable basic metadata is the only preservation subset this
-            // factory binds today. The explicit no-op records that final-time
-            // handling beyond that subset was not claimed as preserved.
-            metadata_request.apply_final_times = [](std::stop_token) {
-                return Observation<bool>::available(true);
-            };
-            metadata_request.flush_destination = [&staging](std::stop_token) {
-                return staging.flush_content();
-            };
-            return OperationMetadataJob::create(std::move(metadata_request));
+        const auto metadata_policy = *preservation.value();
+        copy_request.prepare_metadata = [metadata_policy](OpenedEntry& staging, std::stop_token stop) {
+            return metadata_policy->prepare(staging, stop);
+        };
+        copy_request.verify_metadata_before_publication = [metadata_policy](OpenedEntry& staging, std::stop_token stop) {
+            return metadata_policy->verify(staging, stop);
         };
         auto created = NativeOperationCopyJob::create(std::move(copy_request));
         if (!created.value())

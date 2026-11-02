@@ -32,6 +32,8 @@ public:
     Observation<LinkMetadata> read_link_metadata(InventoryLimits limits = {}) const;
     Observation<ContentRead> read_content(ContentReadLimits limits = {}, std::uint64_t offset = 0,
                                           std::stop_token stop = {}) const;
+    // Worker-only native qualification on the exact retained object.
+    Observation<bool> qualify_ordinary_regular_metadata() const;
     const Observation<IdentityComparison>& previous_continuity() const noexcept { return previous_continuity_; }
     // A later live observation in the same unbroken held-object family, with
     // the same parent/basename. Reusing a cached snapshot is never a refresh.

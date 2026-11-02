@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(ck-core-fs-lib VERSION 0.1.0 LANGUAGES C CXX)
+project(ck-core-fs-lib VERSION 0.2.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -8,6 +8,8 @@ include(CMakePackageConfigHelpers)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(CK_CORE_FS_BUILD_BROWSER "Build the higher-level C++ file browser models" ON)
 
 set(CK_CORE_FS_SOURCES
   src/files/ancestor_walk_job.cpp
@@ -22,11 +24,7 @@ set(CK_CORE_FS_SOURCES
   src/files/directory_access.cpp
   src/files/directory_cursor.cpp
   src/files/directory_entry_probe.cpp
-  src/files/directory_index_listing_job.cpp
-  src/files/directory_index_lookup.cpp
-  src/files/directory_index_marks.cpp
   src/files/directory_index_record.cpp
-  src/files/directory_index_sort_job.cpp
   src/files/directory_index_store.cpp
   src/files/directory_inventory_job.cpp
   src/files/directory_listing.cpp
@@ -37,9 +35,6 @@ set(CK_CORE_FS_SOURCES
   src/files/fscrypt_key_status.cpp
   src/files/fscrypt_policy.cpp
   src/files/held_child.cpp
-  src/files/indexed_pane.cpp
-  src/files/indexed_pane_marks.cpp
-  src/files/indexed_pane_sources.cpp
   src/files/inode_flags.cpp
   src/files/integrity_info.cpp
   src/files/link_metadata.cpp
@@ -74,14 +69,6 @@ set(CK_CORE_FS_SOURCES
   src/files/operation_recovery.cpp
   src/files/operation_review.cpp
   src/files/operation_topology_projection.cpp
-  src/files/pane_acquire_job.cpp
-  src/files/pane_command.cpp
-  src/files/pane_filter.cpp
-  src/files/pane_listing_job.cpp
-  src/files/pane_model.cpp
-  src/files/pane_order.cpp
-  src/files/pane_page.cpp
-  src/files/pane_refresh_job.cpp
   src/files/preservation_capability_diff.cpp
   src/files/recursive_inventory_job.cpp
   src/files/security.cpp
@@ -98,13 +85,43 @@ set(CK_CORE_FS_SOURCES
 )
 
 add_library(ck_core_fs_engine STATIC ${CK_CORE_FS_SOURCES})
+target_sources(ck_core_fs_engine PRIVATE
+  src/files/preservation_policy.cpp
+  src/files/regular_metadata_preservation.cpp
+  src/files/comparison_plan.cpp
+  src/files/conflict_rules.cpp
+  src/files/sync_baseline.cpp)
+target_compile_definitions(ck_core_fs_engine PRIVATE CK_FS_POLICY_STATIC)
 add_library(ck_file_engine ALIAS ck_core_fs_engine)
-add_library(ck_files_core ALIAS ck_core_fs_engine)
 set_target_properties(ck_core_fs_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(ck_core_fs_engine
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/files>
          $<INSTALL_INTERFACE:include/ck-core-fs>)
 target_compile_features(ck_core_fs_engine PUBLIC cxx_std_20)
+
+# Pane ordering/filtering and index views depend on browser policy. The reusable
+# directory_index_record/store primitives remain in the engine below this layer.
+if(CK_CORE_FS_BUILD_BROWSER)
+  add_library(ck_core_fs_browser STATIC
+    src/files/directory_index_listing_job.cpp
+    src/files/directory_index_lookup.cpp
+    src/files/directory_index_marks.cpp
+    src/files/directory_index_sort_job.cpp
+    src/files/indexed_pane.cpp
+    src/files/indexed_pane_marks.cpp
+    src/files/indexed_pane_sources.cpp
+    src/files/pane_acquire_job.cpp
+    src/files/pane_command.cpp
+    src/files/pane_filter.cpp
+    src/files/pane_listing_job.cpp
+    src/files/pane_model.cpp
+    src/files/pane_order.cpp
+    src/files/pane_page.cpp
+    src/files/pane_refresh_job.cpp)
+  add_library(ck_files_core ALIAS ck_core_fs_browser)
+  set_target_properties(ck_core_fs_browser PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(ck_core_fs_browser PUBLIC ck_core_fs_engine)
+endif()
 
 add_library(ck_files_platform STATIC)
 set_target_properties(ck_files_platform PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -126,7 +143,8 @@ target_link_libraries(ck_files_platform PUBLIC ck_core_fs_engine)
 target_include_directories(ck_files_platform PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/files>)
 target_compile_features(ck_files_platform PUBLIC cxx_std_20)
 
-add_library(ck_file_engine_c SHARED src/c-api/ck_file_engine.cpp)
+add_library(ck_file_engine_c SHARED src/c-api/ck_file_engine.cpp src/c-api/preservation_policy_c.cpp
+  src/c-api/comparison_plan_c.cpp)
 target_compile_features(ck_file_engine_c PUBLIC cxx_std_20)
 target_compile_definitions(ck_file_engine_c PRIVATE CK_FILE_ENGINE_BUILD)
 target_include_directories(ck_file_engine_c
@@ -148,9 +166,49 @@ if(BUILD_TESTING)
   target_link_libraries(ck_core_fs_c_abi_tests PRIVATE ck_file_engine_c)
   target_include_directories(ck_core_fs_c_abi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME ck_core_fs_c_abi_tests COMMAND ck_core_fs_c_abi_tests)
+  add_executable(ck_fs_preservation_policy_tests tests/preservation_policy_tests.cpp)
+  target_compile_definitions(ck_fs_preservation_policy_tests PRIVATE CK_FS_POLICY_STATIC)
+  target_link_libraries(ck_fs_preservation_policy_tests PRIVATE ck_core_fs_engine ck_file_engine_c)
+  add_test(NAME preservation_policy COMMAND ck_fs_preservation_policy_tests)
+  add_executable(ck_fs_comparison_plan_tests tests/comparison_plan_tests.cpp)
+  target_link_libraries(ck_fs_comparison_plan_tests PRIVATE ck_core_fs_engine)
+  if(MSVC)
+    target_compile_options(ck_fs_comparison_plan_tests PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(ck_fs_comparison_plan_tests PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME comparison_plan COMMAND ck_fs_comparison_plan_tests)
+  add_executable(ck_fs_comparison_plan_c_tests tests/comparison_plan_c_tests.c)
+  target_link_libraries(ck_fs_comparison_plan_c_tests PRIVATE ck_file_engine_c)
+  if(MSVC)
+    target_compile_options(ck_fs_comparison_plan_c_tests PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(ck_fs_comparison_plan_c_tests PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME comparison_plan_c COMMAND ck_fs_comparison_plan_c_tests)
+  add_executable(ck_fs_conflict_rules_tests tests/conflict_rules_tests.cpp)
+  target_link_libraries(ck_fs_conflict_rules_tests PRIVATE ck_core_fs_engine)
+  add_test(NAME conflict_rules COMMAND ck_fs_conflict_rules_tests)
+  add_executable(ck_fs_sync_baseline_tests tests/sync_baseline_tests.cpp)
+  target_link_libraries(ck_fs_sync_baseline_tests PRIVATE ck_core_fs_engine)
+  add_test(NAME sync_baseline COMMAND ck_fs_sync_baseline_tests)
+  add_executable(ck_fs_regular_metadata_tests tests/regular_metadata_preservation_tests.cpp)
+  target_link_libraries(ck_fs_regular_metadata_tests PRIVATE ck_files_platform)
+  add_test(NAME regular_metadata COMMAND ck_fs_regular_metadata_tests)
+  set_tests_properties(regular_metadata PROPERTIES
+    ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/tasks")
+  add_executable(ck_fs_job_lifecycle_tests tests/job_lifecycle_tests.cpp)
+  target_link_libraries(ck_fs_job_lifecycle_tests PRIVATE ck_file_engine_c)
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tasks")
+  add_test(NAME job_lifecycle COMMAND ck_fs_job_lifecycle_tests "${CMAKE_CURRENT_BINARY_DIR}/tasks")
+  set_tests_properties(job_lifecycle PROPERTIES TIMEOUT 180)
 endif()
 
-install(TARGETS ck_core_fs_engine ck_files_platform ck_file_engine_c
+set(CK_CORE_FS_INSTALL_TARGETS ck_core_fs_engine ck_files_platform ck_file_engine_c)
+if(CK_CORE_FS_BUILD_BROWSER)
+  list(APPEND CK_CORE_FS_INSTALL_TARGETS ck_core_fs_browser)
+endif()
+install(TARGETS ${CK_CORE_FS_INSTALL_TARGETS}
   EXPORT ck_core_fs_targets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

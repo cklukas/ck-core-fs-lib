@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "ck_fs_policy.h"
 
 #if defined(_WIN32) && defined(CK_FILE_ENGINE_BUILD)
 #define CK_FILE_ENGINE_API __declspec(dllexport)
@@ -22,6 +23,7 @@ typedef struct ckfe_engine ckfe_engine;
 typedef struct ckfe_directory ckfe_directory;
 typedef struct ckfe_entry ckfe_entry;
 typedef struct ckfe_job ckfe_job;
+typedef struct ckfe_recovery ckfe_recovery;
 
 typedef enum ckfe_api_status {
     CKFE_API_OK = 0,
@@ -131,6 +133,71 @@ typedef struct ckfe_job_snapshot {
     uint8_t total_bytes_known;
 } ckfe_job_snapshot;
 
+typedef struct ckfe_job_event {
+    uint64_t sequence;
+    ckfe_job_snapshot snapshot;
+} ckfe_job_event;
+
+typedef enum ckfe_recovery_action {
+    CKFE_RECOVERY_IGNORE_TERMINAL = 0,
+    CKFE_RECOVERY_INSPECT_STAGING = 1,
+    CKFE_RECOVERY_VERIFY_DESTINATION = 2,
+    CKFE_RECOVERY_VERIFY_BEFORE_RETIREMENT = 3,
+    CKFE_RECOVERY_INSPECT_PUBLICATION = 4,
+    CKFE_RECOVERY_INSPECT_RETIREMENT = 5,
+    CKFE_RECOVERY_INSPECT_DELETION = 6,
+    CKFE_RECOVERY_REQUIRE_REVIEW = 7
+} ckfe_recovery_action;
+typedef struct ckfe_recovery_item {
+    uint64_t item;
+    uint32_t journal_state;
+    ckfe_recovery_action action;
+    uint8_t requires_reconciliation;
+} ckfe_recovery_item;
+typedef struct ckfe_recovery_summary {
+    uint64_t items;
+    uint8_t requires_reconciliation;
+    uint8_t untrusted_tail;
+    uint8_t untrusted_evidence;
+} ckfe_recovery_summary;
+
+enum {
+    CKFE_COPY_OPTIONS_VERSION = 1,
+    CKFE_METADATA_COMPLETE_V1 = 0,
+    CKFE_METADATA_ORDINARY_CALLER_VISIBLE_V1 = 1
+};
+typedef struct ckfe_copy_options_v1 {
+    uint32_t version;
+    uint32_t struct_size;
+    uint32_t metadata_scope;
+    uint32_t allow_metadata_loss;
+    uint32_t reserved[4];
+} ckfe_copy_options_v1;
+
+enum {
+    CKFE_PRESERVED_ORDINARY_MODE = 1u << 0,
+    CKFE_PRESERVED_ACCESS_TIME = 1u << 1,
+    CKFE_PRESERVED_MODIFIED_TIME = 1u << 2,
+    CKFE_PRESERVED_SOURCE_OWNER = 1u << 3,
+    CKFE_PRESERVED_ACL = 1u << 4,
+    CKFE_PRESERVED_XATTRS = 1u << 5,
+    CKFE_PRESERVED_LABELS_CAPABILITIES = 1u << 6,
+    CKFE_PRESERVED_PRIVILEGE_BITS = 1u << 7,
+    CKFE_PRESERVED_BIRTH_CHANGE_TIMES = 1u << 8,
+    CKFE_PRESERVED_STORAGE_REPRESENTATION = 1u << 9
+};
+typedef struct ckfe_job_preservation_report_v1 {
+    uint32_t version;
+    uint32_t struct_size;
+    uint32_t requested_scope;
+    uint32_t current_effective_uid_gid_applied;
+    uint64_t source_preserved_fields;
+    uint64_t explicitly_excluded_fields;
+    uint64_t unknown_fields;
+    ckfe_observation_state provider_qualification;
+    uint32_t reserved;
+} ckfe_job_preservation_report_v1;
+
 CK_FILE_ENGINE_API const char *ckfe_version(void);
 CK_FILE_ENGINE_API uint32_t ckfe_abi_version_major(void);
 CK_FILE_ENGINE_API uint32_t ckfe_abi_version_minor(void);
@@ -177,6 +244,16 @@ CK_FILE_ENGINE_API ckfe_api_status ckfe_job_start_copy_regular(
     ckfe_entry *source, ckfe_directory *destination, const char *destination_name_utf8,
     const char *journal_root_utf8, int allow_metadata_loss,
     ckfe_job **out_job, ckfe_error *error);
+// Versioned explicit requested scope. COMPLETE retains the legacy strict gate.
+// ORDINARY_CALLER_VISIBLE requests mode0777, atime/mtime and current caller
+// ownership, with qualified visible metadata/ACL/known-security checks. It
+// excludes arbitrary hidden namespaces, original ownership, birth/ctime and
+// physical storage representation: they remain unknown/unpreserved. Unsupported
+// providers refuse the request. This is not a complete-metadata-copy profile.
+CK_FILE_ENGINE_API ckfe_api_status ckfe_job_start_copy_regular_v1(
+    ckfe_entry *source, ckfe_directory *destination, const char *destination_name_utf8,
+    const char *journal_root_utf8, const ckfe_copy_options_v1 *options,
+    ckfe_job **out_job, ckfe_error *error);
 CK_FILE_ENGINE_API ckfe_api_status ckfe_job_start_move_regular(
     ckfe_entry *source, ckfe_directory *destination, const char *destination_name_utf8,
     const char *journal_root_utf8, int allow_metadata_loss,
@@ -184,7 +261,35 @@ CK_FILE_ENGINE_API ckfe_api_status ckfe_job_start_move_regular(
 CK_FILE_ENGINE_API void ckfe_job_cancel(ckfe_job *job);
 CK_FILE_ENGINE_API ckfe_api_status ckfe_job_poll(
     ckfe_job *job, ckfe_job_snapshot *snapshot, ckfe_error *error);
+// Worker progress snapshots use a fixed 64-event queue. Overflow replaces
+// oldest snapshots and reports the count; the newest terminal snapshot stays
+// available through poll even after draining. Sequence numbers are monotonic.
+// A capacity of zero is valid. Draining does not wait for native I/O.
+CK_FILE_ENGINE_API ckfe_api_status ckfe_job_drain_events(
+    ckfe_job *job, ckfe_job_event *events, size_t capacity,
+    size_t *count, uint64_t *coalesced, ckfe_error *error);
+// Reports achieved fields only after verified successful completion; excluded
+// or unknown fields are never promoted to preserved. Ownership means effective
+// UID+GID, explicitly including correction of setgid-parent inheritance.
+CK_FILE_ENGINE_API ckfe_api_status ckfe_job_get_preservation_report_v1(
+    ckfe_job *job, ckfe_job_preservation_report_v1 *report, size_t report_size,
+    ckfe_error *error);
 CK_FILE_ENGINE_API void ckfe_job_destroy(ckfe_job *job);
+
+// Bounded, read-only journal inspection; call open on a filesystem worker.
+// The private journal is opened through the native adapter. Inspection never
+// authorizes replay, cleanup or source retirement. Recovery handles are
+// immutable and must not be destroyed concurrently with a read.
+CK_FILE_ENGINE_API ckfe_api_status ckfe_recovery_open_utf8(
+    const char *private_root, const char *journal_name,
+    ckfe_recovery **out, ckfe_error *error);
+CK_FILE_ENGINE_API ckfe_api_status ckfe_recovery_get_summary(
+    const ckfe_recovery *recovery, ckfe_recovery_summary *summary, ckfe_error *error);
+// At most 256 rows per call; a zero capacity probes without consuming rows.
+CK_FILE_ENGINE_API ckfe_api_status ckfe_recovery_read_page(
+    const ckfe_recovery *recovery, uint64_t first, ckfe_recovery_item *items,
+    size_t capacity, size_t *count, ckfe_error *error);
+CK_FILE_ENGINE_API void ckfe_recovery_destroy(ckfe_recovery *recovery);
 
 #ifdef __cplusplus
 }

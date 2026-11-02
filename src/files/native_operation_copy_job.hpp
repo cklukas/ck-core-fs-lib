@@ -7,6 +7,7 @@
 #include "operation_journal_file.hpp"
 #include "held_child.hpp"
 #include "recursive_inventory_job.hpp"
+#include "regular_metadata_preservation.hpp"
 
 #include <functional>
 #include <memory>
@@ -41,6 +42,9 @@ struct NativeOperationCopyRequest final {
     std::function<Observation<OperationMetadataJob::Pointer>(OpenedEntry&, std::stop_token)>
         prepare_metadata;
     FileOperation operation = FileOperation::Copy;
+    // Optional additional held-object metadata guard, run after application
+    // and immediately before publication. The batch binds its strict policy.
+    std::function<Observation<bool>(OpenedEntry&, std::stop_token)> verify_metadata_before_publication;
 };
 
 // Worker-only native binding of OperationCopyJob and OperationCommitJob. Move
@@ -89,7 +93,14 @@ private:
 struct NativeOperationCopyBatchPolicy final {
     StreamCopyLimits copy_limits{};
     OperationJournalLimits journal_limits{};
+    // false: qualify ordinary mode + atime/mtime with explicitly current
+    // caller ownership; unsupported security/storage/query coverage refuses.
+    // true: explicit consent to unhandled metadata loss. Privilege-affecting
+    // POSIX mode bits are always cleared, and source capabilities not replayed.
     bool allow_unhandled_metadata_loss = false;
+    // Explicit subset selection is required for ordinary caller-visible
+    // preservation. The default retains complete-scope typed refusal.
+    RegularMetadataScope metadata_scope = RegularMetadataScope::CompleteMetadataV1;
 };
 
 struct NativeOperationCopyBatchRequest final {

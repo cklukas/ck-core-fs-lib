@@ -79,6 +79,9 @@ Observation<HeldChild::Pointer> HeldChild::refresh(std::stop_token stop) const {
 bool HeldChild::continues(const HeldChild& previous) const noexcept {
     return family_ == previous.family_ && revision_ > previous.revision_ && parent_.get() == previous.parent_.get() && name_ == previous.name_;
 }
+Observation<bool> HeldChild::qualify_ordinary_regular_metadata() const {
+    return child_->qualify_ordinary_regular_metadata();
+}
 Observation<BasicMetadata> HeldChild::inspect_basic() const { return child_->inspect_basic(); }
 Observation<LinkMetadata> HeldChild::read_link_metadata(InventoryLimits limits) const {
     return child_->read_link_metadata(limits);

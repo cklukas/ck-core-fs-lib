@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace ck::files {
@@ -311,7 +312,8 @@ OperationExecutionState NativeOperationMoveJob::advance(std::stop_token stop) {
 
 OperationProgress NativeOperationMoveJob::progress() const noexcept {
     if (cross_filesystem_copy_) return cross_filesystem_copy_->progress();
-    return {phase_, 0, std::nullopt};
+    // A rename transfers no file data. Byte totals describe actual transfer.
+    return {phase_, 0, std::uint64_t{0}};
 }
 
 NativeOperationMoveBatchJob::NativeOperationMoveBatchJob(std::vector<NativeOperationMoveJob::Pointer> jobs)
@@ -333,38 +335,63 @@ Observation<NativeOperationMoveBatchJob::Pointer> NativeOperationMoveBatchJob::c
 
 OperationBatchState NativeOperationMoveBatchJob::advance(std::stop_token stop) {
     if (result_.state == OperationBatchState::Complete || result_.state == OperationBatchState::Failed ||
-        result_.state == OperationBatchState::Cancelled || result_.state == OperationBatchState::NeedsReconciliation)
+        result_.state == OperationBatchState::Cancelled || result_.state == OperationBatchState::RetainedSource ||
+        result_.state == OperationBatchState::NeedsReconciliation)
         return result_.state;
     if (result_.state == OperationBatchState::Ready)
         result_.state = OperationBatchState::Running;
     while (current_ < jobs_.size()) {
         const auto job_state = jobs_[current_]->state();
         if (job_state != OperationExecutionState::Complete && job_state != OperationExecutionState::Failed &&
-            job_state != OperationExecutionState::Cancelled && job_state != OperationExecutionState::NeedsReconciliation)
+            job_state != OperationExecutionState::Cancelled && job_state != OperationExecutionState::RetainedSource &&
+            job_state != OperationExecutionState::NeedsReconciliation)
             break;
         auto &item = result_.items[current_];
         item.outcome = job_state == OperationExecutionState::Complete ? OperationItemOutcome::Complete
             : job_state == OperationExecutionState::Cancelled ? OperationItemOutcome::Cancelled
+            : job_state == OperationExecutionState::RetainedSource ? OperationItemOutcome::RetainedSource
             : job_state == OperationExecutionState::NeedsReconciliation ? OperationItemOutcome::NeedsReconciliation
             : OperationItemOutcome::Failed;
         item.failure = jobs_[current_]->result().failure;
         ++current_;
     }
     if (current_ >= jobs_.size()) {
-        bool failed = false, cancelled = false, reconciliation = false;
+        bool failed = false, cancelled = false, reconciliation = false, retained = false;
         for (const auto &item : result_.items) {
             failed = failed || item.outcome == OperationItemOutcome::Failed;
             cancelled = cancelled || item.outcome == OperationItemOutcome::Cancelled;
             reconciliation = reconciliation || item.outcome == OperationItemOutcome::NeedsReconciliation;
+            retained = retained || item.outcome == OperationItemOutcome::RetainedSource;
         }
         result_.state = reconciliation ? OperationBatchState::NeedsReconciliation
+            : retained ? OperationBatchState::RetainedSource
             : failed ? OperationBatchState::Failed
             : cancelled ? OperationBatchState::Cancelled : OperationBatchState::Complete;
         return result_.state;
     }
     if (stop.stop_requested()) {
-        if (started_[current_])
-            jobs_[current_]->advance(stop);
+        if (started_[current_]) {
+            const auto state = jobs_[current_]->advance(stop);
+            if (state != OperationExecutionState::Complete && state != OperationExecutionState::Failed &&
+                state != OperationExecutionState::Cancelled && state != OperationExecutionState::RetainedSource &&
+                state != OperationExecutionState::NeedsReconciliation)
+                return result_.state;
+            auto &item = result_.items[current_];
+            item.outcome = state == OperationExecutionState::Complete ? OperationItemOutcome::Complete
+                : state == OperationExecutionState::Failed ? OperationItemOutcome::Failed
+                : state == OperationExecutionState::RetainedSource ? OperationItemOutcome::RetainedSource
+                : state == OperationExecutionState::NeedsReconciliation ? OperationItemOutcome::NeedsReconciliation
+                : OperationItemOutcome::Cancelled;
+            item.failure = jobs_[current_]->result().failure;
+            if (state == OperationExecutionState::NeedsReconciliation) {
+                result_.state = OperationBatchState::NeedsReconciliation;
+                return result_.state;
+            }
+            if (state == OperationExecutionState::RetainedSource) {
+                result_.state = OperationBatchState::RetainedSource;
+                return result_.state;
+            }
+        }
         result_.state = OperationBatchState::Cancelled;
         return result_.state;
     }
@@ -374,11 +401,21 @@ OperationBatchState NativeOperationMoveBatchJob::advance(std::stop_token stop) {
 }
 
 OperationProgress NativeOperationMoveBatchJob::progress() const noexcept {
-    if (current_ < jobs_.size()) return jobs_[current_]->progress();
-    return {result_.state == OperationBatchState::Complete
-                ? OperationExecutionState::Complete
-                : OperationExecutionState::Failed,
-            0, std::nullopt};
+    OperationProgress result;
+    result.state = result_.state == OperationBatchState::Complete
+        ? OperationExecutionState::Complete : OperationExecutionState::Copying;
+    bool known = true;
+    std::uint64_t total = 0;
+    for (const auto &job : jobs_) {
+        const auto progress = job->progress();
+        if (progress.observed_bytes > UINT64_MAX - result.observed_bytes)
+            return {result.state, UINT64_MAX, std::nullopt};
+        result.observed_bytes += progress.observed_bytes;
+        if (!progress.total_bytes || *progress.total_bytes > UINT64_MAX - total) known = false;
+        else total += *progress.total_bytes;
+    }
+    if (known) result.total_bytes = total;
+    return result;
 }
 
 Observation<NativeOperationMoveBatchJob::Pointer> create_native_operation_move_batch(

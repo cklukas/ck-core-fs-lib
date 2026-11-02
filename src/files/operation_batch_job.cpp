@@ -3,6 +3,7 @@
 #include "operation_batch_job.hpp"
 
 #include <cstdint>
+#include <limits>
 
 namespace ck::files {
 namespace {
@@ -99,7 +100,17 @@ OperationBatchState OperationBatchJob::advance(std::stop_token stop) {
         if (started_[current_]) {
             request_.jobs[current_]->advance(stop);
             record_current();
-            if (terminal(request_.jobs[current_]->state())) ++current_;
+            const auto state = request_.jobs[current_]->state();
+            if (!terminal(state)) return result_.state;
+            ++current_;
+            if (state == OperationExecutionState::NeedsReconciliation) {
+                result_.state = OperationBatchState::NeedsReconciliation;
+                return result_.state;
+            }
+            if (state == OperationExecutionState::RetainedSource) {
+                result_.state = OperationBatchState::RetainedSource;
+                return result_.state;
+            }
         }
         result_.state = OperationBatchState::Cancelled;
         return result_.state;
@@ -114,11 +125,22 @@ OperationBatchState OperationBatchJob::advance(std::stop_token stop) {
 }
 
 OperationProgress OperationBatchJob::progress() const noexcept {
-    if (current_ < request_.jobs.size()) return request_.jobs[current_]->progress();
-    return {result_.state == OperationBatchState::Complete
-                ? OperationExecutionState::Complete
-                : OperationExecutionState::Failed,
-            0, std::nullopt};
+    OperationProgress aggregate;
+    aggregate.state = result_.state == OperationBatchState::Complete
+        ? OperationExecutionState::Complete : OperationExecutionState::Copying;
+    std::uint64_t total = 0;
+    bool known = true;
+    for (const auto& job : request_.jobs) {
+        const auto value = job->progress();
+        if (value.observed_bytes > std::numeric_limits<std::uint64_t>::max() - aggregate.observed_bytes)
+            return {aggregate.state, std::numeric_limits<std::uint64_t>::max(), std::nullopt};
+        aggregate.observed_bytes += value.observed_bytes;
+        if (!value.total_bytes || *value.total_bytes > std::numeric_limits<std::uint64_t>::max() - total)
+            known = false;
+        else total += *value.total_bytes;
+    }
+    if (known) aggregate.total_bytes = total;
+    return aggregate;
 }
 
 Observation<bool> OperationBatchJob::cleanup_item(std::size_t item) {

@@ -34,6 +34,8 @@ OperationProgress OperationExecutionJob::progress() const noexcept {
     if (request_.copy) {
         const auto& copy = request_.copy->result();
         progress.observed_bytes = copy.observed_bytes;
+        if (copy.state == OperationCopyState::Verified)
+            progress.total_bytes = copy.observed_bytes;
     }
     return progress;
 }

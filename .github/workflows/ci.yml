@@ -5,32 +5,127 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+    inputs:
+      macos_qualification:
+        description: 'Qualify on a self-hosted Mac with S8T/PRO-BLADE temporary volumes'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 1
+  CTEST_PARALLEL_LEVEL: 1
+
 jobs:
   build:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.os }} / browser ${{ matrix.browser }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest, windows-2025]
+        os: [ubuntu-24.04, windows-2025]
+        browser: ['ON']
+        include:
+          - os: ubuntu-24.04
+            browser: 'OFF'
     steps:
       - uses: actions/checkout@v5
-      - name: Configure
-        run: cmake -S . -B build -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
-      - name: Build
-        run: cmake --build build --config RelWithDebInfo --parallel 6
-      - name: Test
-        run: ctest --test-dir build --build-config RelWithDebInfo --output-on-failure
-      - name: Install
-        run: cmake --install build --config RelWithDebInfo --prefix install
-      - name: Build installed C consumer
+        with:
+          persist-credentials: false
+      - name: Build, test, install, and run installed C consumer
+        shell: pwsh
+        run: |
+          $task = Join-Path '${{ runner.temp }}' 'ck-core-fs-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.browser }}'
+          $env:TMPDIR = Join-Path $task 'tmp'
+          $env:TEMP = $env:TMPDIR
+          $env:TMP = $env:TMPDIR
+          # The helper owns creation and refuses stale output directories.
+          cmake "-DQUALIFICATION_OUTPUT=$task" "-DQUALIFICATION_BROWSER=${{ matrix.browser }}" -P tools/qualification.cmake
+          exit $LASTEXITCODE
+
+  sanitizers:
+    name: Linux / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address-undefined, thread]
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Select a current installed Clang
         shell: bash
         run: |
-          cmake -S tests/consumer -B consumer-build \
-            -DCMAKE_PREFIX_PATH="$PWD/install" \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build consumer-build --config RelWithDebInfo --parallel 6
+          set -euo pipefail
+          for version in 23 22 21 20; do
+            if command -v "clang-$version" >/dev/null && command -v "clang++-$version" >/dev/null; then
+              echo "CC=clang-$version" >> "$GITHUB_ENV"
+              echo "CXX=clang++-$version" >> "$GITHUB_ENV"
+              "clang-$version" --version
+              exit 0
+            fi
+          done
+          echo '::error::Qualification requires installed Clang >=20; no kernel/ASLR changes or sanitizer suppressions are permitted.'
+          exit 1
+      - name: Qualify fully instrumented sources and threaded jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          task="$RUNNER_TEMP/ck-core-fs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.sanitizer }}"
+          export TMPDIR="$task/tmp" TEMP="$task/tmp" TMP="$task/tmp"
+          cmake -DQUALIFICATION_OUTPUT="$task" \
+            -DQUALIFICATION_SANITIZER=${{ matrix.sanitizer }} \
+            -P tools/qualification.cmake
+
+  macos:
+    name: Mac qualification / requires mounted temporary volume
+    if: github.event_name == 'workflow_dispatch' && inputs.macos_qualification
+    runs-on: [self-hosted, macOS, ck-core-fs-qualification]
+    timeout-minutes: 20
+    steps:
+      # Configure this runner's own temporary storage beneath S8T/tmp or
+      # PRO-BLADE/tmp before assigning the ck-core-fs-qualification label.
+      - name: Require permitted runner temporary storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          allowed=false
+          for volume in S8T PRO-BLADE; do
+            if /sbin/mount | /usr/bin/grep -F " on /Volumes/$volume " >/dev/null; then
+              case "$RUNNER_TEMP/" in
+                "/Volumes/$volume/tmp/"*) allowed=true ;;
+              esac
+            fi
+          done
+          if [ "$allowed" != true ]; then
+            echo '::error::Mac runner needs mounted S8T or PRO-BLADE and runner temporary storage on that volume. No system-temp fallback.'
+            exit 1
+          fi
+          task=$(mktemp -d "$RUNNER_TEMP/ck-core-fs-bootstrap.XXXXXXXX")
+          echo "TMPDIR=$task" >> "$GITHUB_ENV"
+          echo "TEMP=$task" >> "$GITHUB_ENV"
+          echo "TMP=$task" >> "$GITHUB_ENV"
+          echo "CK_MAC_BOOTSTRAP=$task" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build, test, install, and run installed C consumer
+        shell: bash
+        run: cmake "-DQUALIFICATION_OUTPUT=$CK_MAC_BOOTSTRAP/qualification" -P tools/qualification.cmake
+      - name: Release bootstrap temporary storage
+        if: always() && env.CK_MAC_BOOTSTRAP != ''
+        shell: bash
+        run: |
+          case "$CK_MAC_BOOTSTRAP" in
+            "$RUNNER_TEMP"/ck-core-fs-bootstrap.*) cmake -E rm -rf "$CK_MAC_BOOTSTRAP" ;;
+            *) echo 'Unexpected bootstrap path; refusing cleanup'; exit 1 ;;
+          esac

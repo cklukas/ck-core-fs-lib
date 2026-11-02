@@ -80,6 +80,16 @@ Observation<bool> OpenedEntry::flush_content() {
     return Observation<bool>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "content.flush_native_query"});
 }
+Observation<bool> OpenedEntry::qualify_ordinary_regular_metadata() const {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),
+         "regular_metadata.platform_unqualified"});
+}
+Observation<bool> OpenedEntry::apply_current_caller_ownership() {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),
+         "regular_metadata.caller_ownership_unqualified"});
+}
 Observation<bool> OpenedEntry::apply_portable_basic_metadata(const BasicMetadata&) {
     return Observation<bool>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery),
