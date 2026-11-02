@@ -317,3 +317,31 @@ DLL SHA-256 was
 `82fd8dc637a5478a643cb0b3c34c0d50bf2255c43cf54436e631035749c6f017`.
 These focused results do not qualify unintegrated root capabilities, full
 Complete-copy preservation, macOS publication, or the full Windows tree suite.
+
+### Windows AddressSanitizer and exact-name fixture cleanup
+
+The committed `731e633b3ae0a29f187fdb574008bb88459d48db` snapshot built on the
+workstation with MSVC AddressSanitizer applied to the engine, native platform,
+C wrapper objects and test executables. The clean targeted build took 321.57
+seconds. The seven native NTFS cases and critical receipt/security tests passed,
+as did the pure-C executable against the actual instrumented DLL. No sanitizer
+finding was suppressed and no uninstrumented SDK was mixed into the process.
+The archive SHA-256 is
+`12b4f62f095e1b6004eb88b573d7b58d71812b50ca888003000c5cb76efb95cc`;
+matching installed MSVC runtime SHA-256 is
+`3aa742521e8cbd23252f0545aa51d5a15624a3e4430fbe2f81567afaeb3fc59b`.
+Records and logs are in `/Volumes/S8T/tmp/ck-core-fs-dir-asan.m5djf5jd`.
+
+The full C action suite also passed under that instrumented executable with
+the fixture-runner correction below, including cleanup with zero remaining
+children. That run took 1.89 seconds. It does not constitute Windows TSan or
+full-tree qualification.
+
+CI for `731e633` passed both Linux browser configurations, Linux ASan/UBSan and
+Linux TSan. Windows passed the native Trash operations but failed fixture
+cleanup: a normal DOS path trimmed the restored trailing-space filename during
+Python rmtree. The runner now retains the extended Windows namespace through
+TemporaryDirectory creation and cleanup. Errors remain fatal; no ignore or
+skip was added. Windows also retains the separately tracked metadata-fixture
+collision and reviewed-tree fixture failures. See
+[CI run 41544431697](https://github.com/cklukas/ck-core-fs-lib/actions/runs/41544431697).
