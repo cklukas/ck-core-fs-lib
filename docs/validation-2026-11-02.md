@@ -97,3 +97,32 @@ Remote evidence:
 `/home/klukas/tmp/cde-hardening-20261102-01/fs-consumer-contracts/checkpoint-1f0ce39.json`.
 The subsequent preservation-report fix `3efe038` requires its own pinned rerun;
 these results are not attributed to that later revision.
+
+## Independent report-fix rerun and harness integration
+
+The peer separately pinned `3efe0381ed2983748ca0bef8c49e6075cf5f0951` on
+Linux ARM64. Incremental build: 5.115 seconds, three compiled objects/nine Ninja
+steps. All eight core suites passed in 6.403 seconds. The expanded fourteen
+installed-C contracts produced twelve passes and two retained Complete-scope
+preservation failures. Both loss-report contracts verified Unknown provider
+qualification and zero caller UID/GID application, while verified basic fields
+remained correct. Ordinary scope with loss disabled still passed its copy and
+cancellation cases.
+
+Peer-reported installed library SHA-256:
+`f7d6be27ee7b4cc12f6d5e63447e531b95fb6f0a7ae00f2fd7205d39d61cfb13`.
+Evidence: `checkpoint-3efe038.json` and `3efe038-contracts.log` in the same
+remote qualification root listed above.
+
+The independent standalone harness was reviewed and integrated from peer commit
+`ba4e378a357d2bcb5e9e166caf564dc89f4a3847`. It uses only the installed C ABI;
+Windows filesystem fixtures remain separately unqualified. No preservation
+success gate is reclassified as an expected pass or substituted for a loss test.
+
+The owner ran the imported harness on macOS against installed report-fix output
+SHA-256 `3e1e4fd99bc365fce320f2b7fa069eeedda6fb2260658cd99be560e22de40f96`.
+It configured/compiled as C and ran fourteen contracts in 1.02 seconds: nine
+passed, four preservation-success cases failed as Unsupported, and the raw-byte
+fixture skipped only on native EILSEQ. Both loss-report regressions passed. The
+ordinary/Complete preservation failures remain capability gaps; no broad native
+mutation or cancellation-latency qualification follows from these results.
