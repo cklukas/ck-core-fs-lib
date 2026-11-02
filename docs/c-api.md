@@ -18,7 +18,10 @@ runtime allocator.
 
 ## Jobs
 
-Start functions return quickly. Polling is nonblocking and returns a snapshot
+Start functions return quickly. `CKFE_API_OK` means a non-null job handle was
+created; a rejected operation returns `CKFE_API_OPERATION_UNAVAILABLE` and a
+structured `ckfe_error`, never a null job with an OK status. Polling is
+nonblocking and returns a snapshot
 with explicit `total_*_known` flags. Call `ckfe_job_cancel` for cooperative
 cancellation and continue polling until a terminal state is observed. The
 frontend owns presentation and conflict policy; the backend never calls back
@@ -26,7 +29,10 @@ into the UI.
 
 ## Encoding
 
-UTF-8 paths are accepted for portable callers. Windows callers that need exact
+On POSIX, `_utf8` path/name inputs are byte-preserving component strings: the
+library does not validate or re-encode them, so non-UTF-8 native filenames are
+not rejected. On Windows, `_utf8` inputs are decoded as UTF-8 and invalid
+sequences are reported as Unsupported/UnrepresentableName. Windows callers that need exact
 UTF-16 names can use the UTF-16 entry points. The native adapter performs the
 final filesystem operation through its wide/native boundary; the C API's UTF-8
 conversion is not a permission to use narrow Win32 I/O.

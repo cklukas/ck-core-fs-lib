@@ -7,8 +7,11 @@ int main(void) {
     ckfe_error error;
     ckfe_error_init(&error);
     assert(strcmp(ckfe_version(), "0.1.0") == 0);
+    assert(ckfe_abi_version_major() == 0);
+    assert(ckfe_abi_version_minor() == 1);
     assert(strcmp(ckfe_api_status_name(CKFE_API_OK), "ok") == 0);
     assert(strcmp(ckfe_job_state_name(CKFE_JOB_RECOVERY_REQUIRED), "recovery_required") == 0);
+    assert(strcmp(ckfe_api_status_name(CKFE_API_OPERATION_UNAVAILABLE), "operation_unavailable") == 0);
 
     ckfe_engine *engine = NULL;
     assert(ckfe_engine_create(&engine) == CKFE_API_OK);

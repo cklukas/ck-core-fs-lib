@@ -59,8 +59,8 @@ char *copy_text(const std::string &text) noexcept {
 void set_error(ckfe_error *out, const UnavailableObservation &detail) noexcept {
     if (!out) return;
     clear_error(out);
-    out->state = static_cast<int32_t>(detail.state);
-    out->domain = static_cast<int32_t>(detail.error.domain);
+    out->state = static_cast<ckfe_observation_state>(detail.state);
+    out->domain = static_cast<ckfe_error_domain>(detail.error.domain);
     out->code = detail.error.code;
     out->operation = copy_text(detail.error.operation);
 }
@@ -68,8 +68,8 @@ void set_error(ckfe_error *out, const UnavailableObservation &detail) noexcept {
 void set_exception(ckfe_error *out, const char *operation) noexcept {
     if (!out) return;
     clear_error(out);
-    out->state = static_cast<int32_t>(ObservationState::Failed);
-    out->domain = static_cast<int32_t>(ErrorDomain::Adapter);
+    out->state = CKFE_OBSERVATION_FAILED;
+    out->domain = CKFE_ERROR_ADAPTER;
     out->code = static_cast<int64_t>(AdapterError::InvalidNativeResult);
     out->operation = copy_text(operation);
 }
@@ -200,7 +200,7 @@ ckfe_api_status start_job(Start &&start, ckfe_job **out, ckfe_error *error) {
     *out = nullptr;
     try {
         auto operation = start();
-        if (!operation.value()) { set_error(error, *operation.unavailable_detail()); return CKFE_API_OK; }
+        if (!operation.value()) { set_error(error, *operation.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         auto *job = new ckfe_job{std::move(operation).take_value()};
         job->snapshot.state = CKFE_JOB_RUNNING;
         job->worker = std::jthread([job](std::stop_token) { run_job(*job); });
@@ -215,12 +215,17 @@ extern "C" {
 
 const char *ckfe_version(void) { return "0.1.0"; }
 
+uint32_t ckfe_abi_version_major(void) { return 0; }
+
+uint32_t ckfe_abi_version_minor(void) { return 1; }
+
 const char *ckfe_api_status_name(ckfe_api_status status) {
     switch (status) {
     case CKFE_API_OK: return "ok";
     case CKFE_API_INVALID_ARGUMENT: return "invalid_argument";
     case CKFE_API_OUT_OF_MEMORY: return "out_of_memory";
     case CKFE_API_EXCEPTION: return "exception";
+    case CKFE_API_OPERATION_UNAVAILABLE: return "operation_unavailable";
     }
     return "unknown";
 }
@@ -266,7 +271,7 @@ ckfe_api_status ckfe_directory_open_utf8(ckfe_engine *engine, const char *path, 
         if (!host) { set_exception(error, "c_api.directory_path"); return CKFE_API_INVALID_ARGUMENT; }
         auto opened = engine->filesystem.open_directory(*host,
             follow ? DirectoryLinkPolicy::FollowFinalLink : DirectoryLinkPolicy::RejectFinalLink);
-        if (!opened.value()) { set_error(error, *opened.unavailable_detail()); return CKFE_API_OK; }
+        if (!opened.value()) { set_error(error, *opened.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         *out = new ckfe_directory{std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value())};
         return CKFE_API_OK;
     } catch (const std::bad_alloc &) { return CKFE_API_OUT_OF_MEMORY; }
@@ -281,12 +286,12 @@ ckfe_api_status ckfe_directory_open_utf16(ckfe_engine *engine, const uint16_t *p
         value.reserve(units);
         for (size_t index = 0; index != units; ++index) value.push_back(static_cast<char16_t>(path[index]));
         auto address = NativeAbsolutePath::from_windows(value);
-        if (!address.value()) { set_error(error, *address.unavailable_detail()); return CKFE_API_OK; }
+        if (!address.value()) { set_error(error, *address.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         auto host = address.value()->host_path();
-        if (!host.value()) { set_error(error, *host.unavailable_detail()); return CKFE_API_OK; }
+        if (!host.value()) { set_error(error, *host.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         auto opened = engine->filesystem.open_directory(*host.value(),
             follow ? DirectoryLinkPolicy::FollowFinalLink : DirectoryLinkPolicy::RejectFinalLink);
-        if (!opened.value()) { set_error(error, *opened.unavailable_detail()); return CKFE_API_OK; }
+        if (!opened.value()) { set_error(error, *opened.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         *out = new ckfe_directory{std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value())};
         return CKFE_API_OK;
     } catch (const std::bad_alloc &) { return CKFE_API_OUT_OF_MEMORY; }
@@ -306,9 +311,9 @@ ckfe_api_status ckfe_entry_open_utf8(ckfe_directory *directory, const char *name
         const auto encoding = NameEncoding::PosixBytes;
 #endif
         auto native = native_name_utf8(name, encoding);
-        if (!native.value()) { set_error(error, *native.unavailable_detail()); return CKFE_API_OK; }
+        if (!native.value()) { set_error(error, *native.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         auto child = HeldChild::observe_with_access(directory->cursor, std::move(native).take_value(), EntryAccess::ContentRead);
-        if (!child.value()) { set_error(error, *child.unavailable_detail()); return CKFE_API_OK; }
+        if (!child.value()) { set_error(error, *child.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         *out = new ckfe_entry{std::move(child).take_value()};
         return CKFE_API_OK;
     } catch (const std::bad_alloc &) { return CKFE_API_OUT_OF_MEMORY; }
@@ -321,9 +326,9 @@ ckfe_api_status ckfe_entry_open_utf16(ckfe_directory *directory, const uint16_t 
     *out = nullptr;
     try {
         auto native = native_name_utf16(name, units);
-        if (!native.value()) { set_error(error, *native.unavailable_detail()); return CKFE_API_OK; }
+        if (!native.value()) { set_error(error, *native.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         auto child = HeldChild::observe_with_access(directory->cursor, std::move(native).take_value(), EntryAccess::ContentRead);
-        if (!child.value()) { set_error(error, *child.unavailable_detail()); return CKFE_API_OK; }
+        if (!child.value()) { set_error(error, *child.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         *out = new ckfe_entry{std::move(child).take_value()};
         return CKFE_API_OK;
     } catch (const std::bad_alloc &) { return CKFE_API_OUT_OF_MEMORY; }
@@ -337,10 +342,10 @@ ckfe_api_status ckfe_entry_metadata(const ckfe_entry *entry, ckfe_metadata *meta
     std::memset(metadata, 0, sizeof(*metadata));
     try {
         auto value = entry->child->inspect_basic();
-        if (!value.value()) { set_error(error, *value.unavailable_detail()); return CKFE_API_OK; }
+        if (!value.value()) { set_error(error, *value.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         const auto &source = *value.value();
         if (source.kind.value()) {
-            metadata->available_fields |= 1ULL << 0;
+            metadata->available_fields |= CKFE_METADATA_KIND;
             switch (*source.kind.value()) {
             case ObjectKind::RegularFile: metadata->kind = CKFE_OBJECT_REGULAR_FILE; break;
             case ObjectKind::Directory: metadata->kind = CKFE_OBJECT_DIRECTORY; break;
@@ -350,11 +355,11 @@ ckfe_api_status ckfe_entry_metadata(const ckfe_entry *entry, ckfe_metadata *meta
             default: metadata->kind = CKFE_OBJECT_OTHER; break;
             }
         }
-        if (source.logical_size.value()) { metadata->available_fields |= 1ULL << 1; metadata->logical_size = *source.logical_size.value(); }
-        if (source.allocated_size.value()) { metadata->available_fields |= 1ULL << 2; metadata->allocated_size = *source.allocated_size.value(); }
-        if (source.link_count.value()) { metadata->available_fields |= 1ULL << 3; metadata->link_count = *source.link_count.value(); }
+        if (source.logical_size.value()) { metadata->available_fields |= CKFE_METADATA_LOGICAL_SIZE; metadata->logical_size = *source.logical_size.value(); }
+        if (source.allocated_size.value()) { metadata->available_fields |= CKFE_METADATA_ALLOCATED_SIZE; metadata->allocated_size = *source.allocated_size.value(); }
+        if (source.link_count.value()) { metadata->available_fields |= CKFE_METADATA_LINK_COUNT; metadata->link_count = *source.link_count.value(); }
         if (source.identity.value()) {
-            metadata->available_fields |= 1ULL << 4;
+            metadata->available_fields |= CKFE_METADATA_IDENTITY;
             metadata->identity_scheme = static_cast<uint8_t>(source.identity.value()->scheme);
             std::memcpy(metadata->identity_volume, source.identity.value()->volume.bytes.data(), 16);
             std::memcpy(metadata->identity_object, source.identity.value()->object.bytes.data(), 16);
@@ -376,10 +381,10 @@ ckfe_api_status ckfe_job_start_copy_regular(ckfe_entry *source, ckfe_directory *
 #endif
         auto name = native_name_utf8(destination_name, encoding);
         auto root = journal_path(journal_root);
-        if (!name.value()) { set_error(error, *name.unavailable_detail()); return CKFE_API_OK; }
-        if (!root.value()) { set_error(error, *root.unavailable_detail()); return CKFE_API_OK; }
+        if (!name.value()) { set_error(error, *name.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
+        if (!root.value()) { set_error(error, *root.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         auto prepared = prepare_native_operation_journal_root(*root.value());
-        if (!prepared.value()) { set_error(error, *prepared.unavailable_detail()); return CKFE_API_OK; }
+        if (!prepared.value()) { set_error(error, *prepared.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         NativeOperationCopyBatchRequest request;
         request.sources = {source->child}; request.destination = destination->cursor;
         request.destination_names = {std::move(name).take_value()}; request.journal_root = std::move(root).take_value();
@@ -405,10 +410,10 @@ ckfe_api_status ckfe_job_start_move_regular(ckfe_entry *source, ckfe_directory *
 #endif
         auto name = native_name_utf8(destination_name, encoding);
         auto root = journal_path(journal_root);
-        if (!name.value()) { set_error(error, *name.unavailable_detail()); return CKFE_API_OK; }
-        if (!root.value()) { set_error(error, *root.unavailable_detail()); return CKFE_API_OK; }
+        if (!name.value()) { set_error(error, *name.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
+        if (!root.value()) { set_error(error, *root.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         auto prepared = prepare_native_operation_journal_root(*root.value());
-        if (!prepared.value()) { set_error(error, *prepared.unavailable_detail()); return CKFE_API_OK; }
+        if (!prepared.value()) { set_error(error, *prepared.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         NativeOperationMoveBatchRequest request;
         request.sources = {source->child}; request.destination = destination->cursor;
         request.destination_names = {std::move(name).take_value()}; request.journal_root = std::move(root).take_value();

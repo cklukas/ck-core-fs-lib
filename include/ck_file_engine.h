@@ -27,8 +27,49 @@ typedef enum ckfe_api_status {
     CKFE_API_OK = 0,
     CKFE_API_INVALID_ARGUMENT = 1,
     CKFE_API_OUT_OF_MEMORY = 2,
-    CKFE_API_EXCEPTION = 3
+    CKFE_API_EXCEPTION = 3,
+    CKFE_API_OPERATION_UNAVAILABLE = 4
 } ckfe_api_status;
+
+typedef enum ckfe_observation_state {
+    CKFE_OBSERVATION_AVAILABLE = 0,
+    CKFE_OBSERVATION_UNSUPPORTED = 1,
+    CKFE_OBSERVATION_UNKNOWN = 2,
+    CKFE_OBSERVATION_DENIED = 3,
+    CKFE_OBSERVATION_GONE = 4,
+    CKFE_OBSERVATION_CHANGED = 5,
+    CKFE_OBSERVATION_FAILED = 6
+} ckfe_observation_state;
+
+typedef enum ckfe_error_domain {
+    CKFE_ERROR_NONE = 0,
+    CKFE_ERROR_POSIX = 1,
+    CKFE_ERROR_WIN32 = 2,
+    CKFE_ERROR_ADAPTER = 3,
+    CKFE_ERROR_NTSTATUS = 4
+} ckfe_error_domain;
+
+typedef enum ckfe_adapter_error {
+    CKFE_ADAPTER_INVALID_PATH = 1,
+    CKFE_ADAPTER_INVALID_NATIVE_RESULT = 2,
+    CKFE_ADAPTER_NOT_APPLICABLE = 3,
+    CKFE_ADAPTER_UNSUPPORTED_QUERY = 4,
+    CKFE_ADAPTER_UNQUALIFIED_IDENTITY = 5,
+    CKFE_ADAPTER_INTERRUPTED_READ = 6,
+    CKFE_ADAPTER_FINAL_LINK_REJECTED = 7,
+    CKFE_ADAPTER_NOT_DIRECTORY = 8,
+    CKFE_ADAPTER_INVENTORY_LIMIT = 9,
+    CKFE_ADAPTER_INVALID_LIMIT = 10,
+    CKFE_ADAPTER_INVALID_IDENTIFIER = 11,
+    CKFE_ADAPTER_INVALID_ACCESS = 12,
+    CKFE_ADAPTER_ATTRIBUTE_ABSENT = 13,
+    CKFE_ADAPTER_PROVIDER_REVIEW_REQUIRED = 14,
+    CKFE_ADAPTER_METADATA_CHANGED = 15,
+    CKFE_ADAPTER_UNREPRESENTABLE_NAME = 16,
+    CKFE_ADAPTER_PLAN_INVALID = 17,
+    CKFE_ADAPTER_PLAN_TOPOLOGY_UNSAFE = 18,
+    CKFE_ADAPTER_PLAN_DECISION_STALE = 19
+} ckfe_adapter_error;
 
 typedef enum ckfe_job_state {
     CKFE_JOB_READY = 0,
@@ -53,11 +94,19 @@ typedef enum ckfe_object_kind {
 } ckfe_object_kind;
 
 typedef struct ckfe_error {
-    int32_t state;
-    int32_t domain;
+    ckfe_observation_state state;
+    ckfe_error_domain domain;
     int64_t code;
     char *operation;
 } ckfe_error;
+
+enum {
+    CKFE_METADATA_KIND = UINT64_C(1) << 0,
+    CKFE_METADATA_LOGICAL_SIZE = UINT64_C(1) << 1,
+    CKFE_METADATA_ALLOCATED_SIZE = UINT64_C(1) << 2,
+    CKFE_METADATA_LINK_COUNT = UINT64_C(1) << 3,
+    CKFE_METADATA_IDENTITY = UINT64_C(1) << 4
+};
 
 typedef struct ckfe_metadata {
     uint64_t available_fields;
@@ -83,6 +132,8 @@ typedef struct ckfe_job_snapshot {
 } ckfe_job_snapshot;
 
 CK_FILE_ENGINE_API const char *ckfe_version(void);
+CK_FILE_ENGINE_API uint32_t ckfe_abi_version_major(void);
+CK_FILE_ENGINE_API uint32_t ckfe_abi_version_minor(void);
 CK_FILE_ENGINE_API const char *ckfe_api_status_name(ckfe_api_status status);
 CK_FILE_ENGINE_API const char *ckfe_job_state_name(ckfe_job_state state);
 // Initialize before first use. Every successful API call overwrites an error;

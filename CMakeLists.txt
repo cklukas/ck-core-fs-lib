@@ -136,7 +136,10 @@ target_link_libraries(ck_file_engine_c PRIVATE ck_files_platform)
 if(WIN32)
   target_compile_definitions(ck_file_engine_c PRIVATE NOMINMAX)
 endif()
-set_target_properties(ck_file_engine_c PROPERTIES OUTPUT_NAME ck-core-fs-lib)
+set_target_properties(ck_file_engine_c PROPERTIES
+  OUTPUT_NAME ck-core-fs-lib
+  VERSION ${PROJECT_VERSION}
+  SOVERSION 0)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -159,6 +162,10 @@ install(EXPORT ck_core_fs_targets
   FILE ck-core-fs-targets.cmake
   NAMESPACE ck::
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ck-core-fs)
+
+configure_file(cmake/ck-core-fs-lib.pc.in ${CMAKE_CURRENT_BINARY_DIR}/ck-core-fs-lib.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ck-core-fs-lib.pc
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 configure_package_config_file(
   cmake/ck-core-fs-config.cmake.in
