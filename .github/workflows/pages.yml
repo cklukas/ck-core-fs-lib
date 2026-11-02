@@ -40,7 +40,8 @@ jobs:
             "$work/build/bin/ckdocs"
           echo "CKDOCS=$work/build/bin/ckdocs" >> "$GITHUB_ENV"
       - name: Build the site
-        run: "$CKDOCS" build --root "$PWD" --out "$RUNNER_TEMP/site" --strict
+        run: |
+          "$CKDOCS" build --root "$PWD" --out "$RUNNER_TEMP/site" --strict
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
