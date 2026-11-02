@@ -16,6 +16,7 @@ nav:
     pages:
       - docs/architecture.md
       - docs/operations.md
+      - docs/operation-planning.md
       - docs/safety.md
   - title: API
     pages:

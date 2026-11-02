@@ -10,11 +10,12 @@ the C ABI provides stable ownership, polling, cancellation, structured
 metadata, and terminal job states.
 
 The first consumable revision exposes held-handle directory/entry inspection
-and journaled regular-file copy and move jobs. Recursive delete, rename,
-capability adapters, conflict decisions, recovery inspection, and event-drain
-surfaces remain explicitly tracked extensions; the implementation already
-contains the lower-level identity/recovery primitives that those APIs will
-wrap.
+and journaled regular-file copy and move jobs. The planned operation model is
+documented in [`docs/operation-planning.md`](docs/operation-planning.md):
+versioned preservation policy, bounded comparison/planning, reviewed conflict
+receipts, recursive update/sync/mirror execution, rename/delete/Trash adapters,
+events, and recovery. These remain explicit extensions; the implementation
+must not collapse them into frontend policy or shell out to another tool.
 
 Windows code must retain wide/native handle boundaries and extended-length
 path semantics. POSIX code keeps byte-native names. No final filesystem I/O is

@@ -41,6 +41,13 @@ all metadata that the operation contract requires. The C ABI does not silently
 turn unsupported security or provider metadata into a successful copy. A
 caller that explicitly accepts the declared loss may set the flag to nonzero.
 
+The next ABI slice will add opaque preview-plan and receipt handles. A plan
+will carry the selected action profile, comparison mode, filters, link and
+filesystem-boundary policy, and a stable decision token. Execution will accept
+only a matching receipt and will revalidate held identities before mutation.
+Unknown, unreadable, changed, or failed rows will remain typed review results;
+they cannot become `identical` or authorize mirror deletion.
+
 ## Encoding
 
 On POSIX, `_utf8` path/name inputs are byte-preserving component strings: the
