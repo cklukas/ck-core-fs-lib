@@ -95,6 +95,8 @@ def main():
     os.environ.update(TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary),
                       CMAKE_BUILD_PARALLEL_LEVEL="1", CTEST_PARALLEL_LEVEL="1",
                       PYTHONDONTWRITEBYTECODE="1")
+    if system == "Windows":
+        os.environ["CK_FS_REQUIRE_V_DEV_DRIVE"] = "1"
     manifest = output / "source.sha256"
     manifest.write_text("".join(f"{sha}  {name}\n" for name, sha in sorted(source_manifest)))
     shutil.copyfile(args.baseline_record, output / "baseline-qualification.log")
@@ -124,6 +126,8 @@ target_link_libraries(platform_qualification PRIVATE ck::ck_files_platform ck::c
                   installed_manifest_sha256=digest(output / "installed.sha256"),
                   baseline_record=str(args.baseline_record.resolve()), baseline_record_sha256=digest(args.baseline_record),
                   prefix=str(prefix), output=str(output), config="RelWithDebInfo", compile_slots=1,
+                  environment={key: os.environ.get(key) for key in
+                               ("CK_FS_REQUIRE_V_DEV_DRIVE", "TEMP", "TMP", "TMPDIR")},
                   started=utc(), platform=platform.platform(), python=sys.version, stages=[],
                   duration_baseline="No comparable local clean qualification-test build recorded. Inspect verbose compile/link inputs; CI host timings are not a local duration baseline.",
                   assets="No separate bundled assets; all installed headers and binaries fingerprinted.")
