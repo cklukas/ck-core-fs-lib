@@ -37,6 +37,7 @@ public:
     static Observation<Pointer> create(NativeOperationMoveRequest request);
 
     OperationExecutionState state() const noexcept { return phase_; }
+    OperationProgress progress() const noexcept;
     const OperationExecutionResult& result() const noexcept { return result_; }
     OperationExecutionState advance(std::stop_token stop = {});
 
@@ -72,6 +73,7 @@ public:
     static Observation<Pointer> create(std::vector<NativeOperationMoveJob::Pointer> jobs);
     OperationBatchState state() const noexcept { return result_.state; }
     const OperationBatchResult& result() const noexcept { return result_; }
+    OperationProgress progress() const noexcept;
     OperationBatchState advance(std::stop_token stop = {});
 
 private:

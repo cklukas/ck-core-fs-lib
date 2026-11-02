@@ -16,6 +16,8 @@
   and metadata-loss policy.
 - Nonblocking job start, snapshot polling, cooperative cancellation, and
   join-before-destroy lifetime semantics.
+- Byte progress snapshots with an explicit known-total flag; no guessed
+  percentage is exposed when the source size is not qualified.
 - Terminal states for completion, cancellation, failure, changed source,
   and recovery required.
 

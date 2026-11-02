@@ -309,6 +309,11 @@ OperationExecutionState NativeOperationMoveJob::advance(std::stop_token stop) {
     return phase_;
 }
 
+OperationProgress NativeOperationMoveJob::progress() const noexcept {
+    if (cross_filesystem_copy_) return cross_filesystem_copy_->progress();
+    return {phase_, 0, std::nullopt};
+}
+
 NativeOperationMoveBatchJob::NativeOperationMoveBatchJob(std::vector<NativeOperationMoveJob::Pointer> jobs)
     : jobs_(std::move(jobs)), started_(jobs_.size(), false) {
     result_.items.reserve(jobs_.size());
@@ -366,6 +371,14 @@ OperationBatchState NativeOperationMoveBatchJob::advance(std::stop_token stop) {
     started_[current_] = true;
     jobs_[current_]->advance(stop);
     return result_.state;
+}
+
+OperationProgress NativeOperationMoveBatchJob::progress() const noexcept {
+    if (current_ < jobs_.size()) return jobs_[current_]->progress();
+    return {result_.state == OperationBatchState::Complete
+                ? OperationExecutionState::Complete
+                : OperationExecutionState::Failed,
+            0, std::nullopt};
 }
 
 Observation<NativeOperationMoveBatchJob::Pointer> create_native_operation_move_batch(

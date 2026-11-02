@@ -113,6 +113,14 @@ OperationBatchState OperationBatchJob::advance(std::stop_token stop) {
     return result_.state;
 }
 
+OperationProgress OperationBatchJob::progress() const noexcept {
+    if (current_ < request_.jobs.size()) return request_.jobs[current_]->progress();
+    return {result_.state == OperationBatchState::Complete
+                ? OperationExecutionState::Complete
+                : OperationExecutionState::Failed,
+            0, std::nullopt};
+}
+
 Observation<bool> OperationBatchJob::cleanup_item(std::size_t item) {
     if (item >= request_.jobs.size())
         return rejected<bool>(AdapterError::InvalidIdentifier, "operation_batch.cleanup_item");

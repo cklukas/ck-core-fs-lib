@@ -44,6 +44,7 @@ public:
 
     OperationBatchState state() const noexcept { return result_.state; }
     const OperationBatchResult& result() const noexcept { return result_; }
+    OperationProgress progress() const noexcept;
     std::size_t current_item() const noexcept { return current_; }
     OperationBatchState advance(std::stop_token stop = {});
     Observation<bool> cleanup_item(std::size_t item);

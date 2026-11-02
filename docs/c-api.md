@@ -27,6 +27,11 @@ cancellation and continue polling until a terminal state is observed. The
 frontend owns presentation and conflict policy; the backend never calls back
 into the UI.
 
+For regular-file copy, `processed_bytes` is updated from the bounded native
+copy state machine and `total_bytes_known` is true only when a stable source
+size observation is available. A frontend must display indeterminate progress
+when the flag is false.
+
 ## Encoding
 
 On POSIX, `_utf8` path/name inputs are byte-preserving component strings: the

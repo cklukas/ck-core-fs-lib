@@ -159,6 +159,12 @@ void snapshot_failure(ckfe_job &job) {
     }
 }
 
+void snapshot_progress(ckfe_job &job, const OperationProgress &progress) {
+    job.snapshot.processed_bytes = progress.observed_bytes;
+    job.snapshot.total_bytes_known = progress.total_bytes.has_value() ? 1 : 0;
+    job.snapshot.total_bytes = progress.total_bytes.value_or(0);
+}
+
 void run_job(ckfe_job &job) noexcept {
     try {
         for (;;) {
@@ -177,6 +183,7 @@ void run_job(ckfe_job &job) noexcept {
                 job.snapshot.state = batch_state(operation->state());
                 job.snapshot.processed_items = operation->result().items.empty() ? 0 :
                     operation->result().items.size() - (operation->state() == OperationBatchState::Running ? 1 : 0);
+                snapshot_progress(job, operation->progress());
                 snapshot_failure(job);
             } else {
                 auto &operation = std::get<MoveJob>(job.operation);
@@ -185,6 +192,7 @@ void run_job(ckfe_job &job) noexcept {
                 job.snapshot.state = move_state(operation->state());
                 job.snapshot.processed_items = operation->result().items.empty() ? 0 :
                     operation->result().items.size() - (operation->state() == OperationBatchState::Running ? 1 : 0);
+                snapshot_progress(job, operation->progress());
                 snapshot_failure(job);
             }
         }
