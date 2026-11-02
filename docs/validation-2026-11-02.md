@@ -66,3 +66,34 @@ Compiled-input manifest SHA-256:
 `146d8729c3619abfc0e78daccc9c44e280fbce431598e40353019ff7d1f589f6`.
 Output SHA-256:
 `3e1e4fd99bc365fce320f2b7fa069eeedda6fb2260658cd99be560e22de40f96`.
+
+## Independent Linux ARM64 installed-consumer qualification
+
+The CDE peer reported an independently pinned run of
+`1f0ce395dced405a6fa6f4033d2d43dd0edd7793`. The reused configured build rebuilt
+116 Ninja steps in 99.053 seconds, consistent with the changed shared headers
+and compile definitions. All eight core CTests passed in 11.686 seconds. The
+pure C installed consumer configured, built and linked against the isolated
+installed prefix, with the loaded library path verified using `ldd`.
+
+Of twelve independent behavioral contracts, ten passed. Ordinary-scope copy
+and cancellation used version-1 options with `allow_metadata_loss=0`. Successful
+copy checked exact data, mode 0640, mtime 1000000001, effective UID/GID, reported
+ordinary mode/atime/mtime preservation and Available provider qualification.
+Invalid outputs, stale errors, metadata reset, job ownership, byte-native names,
+held-parent rename/substitution, entry substitution and final-link policies also
+passed. Cancellation remains a tiny-file completion/cancellation race test;
+blocked-transfer latency is not established.
+
+The two Complete-metadata copy/cancellation contracts failed at terminal
+Unsupported, with zero achieved fields. Those are retained capability failures;
+they do not qualify Complete preservation or identify a separate cancellation
+defect. Local ordinary fixture success does not establish other providers,
+recursive execution or durable two-way synchronization.
+
+Installed `.so` 0.2.0 SHA-256 reported by the independent run:
+`6e5c8fbd3129d52562e8f288d7987864d351acd0ba9b03bfad0de6a0002d7f4e`.
+Remote evidence:
+`/home/klukas/tmp/cde-hardening-20261102-01/fs-consumer-contracts/checkpoint-1f0ce39.json`.
+The subsequent preservation-report fix `3efe038` requires its own pinned rerun;
+these results are not attributed to that later revision.
