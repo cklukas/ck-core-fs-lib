@@ -271,6 +271,9 @@ CK_FILE_ENGINE_API ckfe_api_status ckfe_job_drain_events(
 // Reports achieved fields only after verified successful completion; excluded
 // or unknown fields are never promoted to preserved. Ownership means effective
 // UID+GID, explicitly including correction of setgid-parent inheritance.
+// Completion with allow_metadata_loss=1 does not qualify the requested scope:
+// provider_qualification remains UNKNOWN and caller ownership is not claimed.
+// Verified basic fields can still be reported independently of scope coverage.
 CK_FILE_ENGINE_API ckfe_api_status ckfe_job_get_preservation_report_v1(
     ckfe_job *job, ckfe_job_preservation_report_v1 *report, size_t report_size,
     ckfe_error *error);

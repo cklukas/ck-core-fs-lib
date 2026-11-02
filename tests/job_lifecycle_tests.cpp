@@ -357,12 +357,19 @@ struct Fixture {
         ckfe_directory_destroy(destination);
         ckfe_engine_destroy(engine);
     }
-    ckfe_job *start(const char *name) {
+    ckfe_job *start(const char *name, bool ordinary_scope = false) {
         Error error;
         ckfe_job *job = nullptr;
         // Lifecycle qualification explicitly consents to metadata loss. Strict policy
         // rejection is covered separately; never turn unsupported into a skipped test.
-        ok(ckfe_job_start_copy_regular(source, destination, name, journal.c_str(), 1, &job, &error.value), error);
+        if (ordinary_scope) {
+            const ckfe_copy_options_v1 options{CKFE_COPY_OPTIONS_VERSION, sizeof(ckfe_copy_options_v1),
+                CKFE_METADATA_ORDINARY_CALLER_VISIBLE_V1, 1, {0,0,0,0}};
+            ok(ckfe_job_start_copy_regular_v1(source, destination, name, journal.c_str(),
+                &options, &job, &error.value), error);
+        } else {
+            ok(ckfe_job_start_copy_regular(source, destination, name, journal.c_str(), 1, &job, &error.value), error);
+        }
         assert(job);
         return job;
     }
@@ -378,12 +385,25 @@ struct Fixture {
 
 void completed_copy(Fixture &fixture, bool concurrent_drain) {
     const char *name = concurrent_drain ? "concurrent.bin" : "overflow.bin";
-    auto *job = fixture.start(name);
+    auto *job = fixture.start(name, concurrent_drain);
     Events events;
     const auto terminal = wait(job, concurrent_drain ? &events : nullptr);
     assert(terminal.state == CKFE_JOB_COMPLETED);
     assert(terminal.total_bytes_known && terminal.total_bytes == fixture_size);
     assert(terminal.processed_bytes == fixture_size && terminal.processed_items == 1);
+    Error report_error;
+    ckfe_job_preservation_report_v1 report{};
+    ok(ckfe_job_get_preservation_report_v1(job, &report, sizeof(report), &report_error.value), report_error);
+    assert(report.requested_scope == (concurrent_drain ? CKFE_METADATA_ORDINARY_CALLER_VISIBLE_V1 : CKFE_METADATA_COMPLETE_V1));
+    // Both legacy complete-scope and explicit ordinary-scope jobs consented
+    // to loss. They verified basic fields but bypassed provider inventory and
+    // current-caller ownership application. Completion cannot invent those.
+    assert(report.provider_qualification == CKFE_OBSERVATION_UNKNOWN);
+    assert(report.current_effective_uid_gid_applied == 0);
+    assert((report.source_preserved_fields & (CKFE_PRESERVED_ACCESS_TIME | CKFE_PRESERVED_MODIFIED_TIME)) ==
+        (CKFE_PRESERVED_ACCESS_TIME | CKFE_PRESERVED_MODIFIED_TIME));
+    assert((report.unknown_fields & CKFE_PRESERVED_XATTRS) != 0);
+    assert((report.explicitly_excluded_fields & CKFE_PRESERVED_SOURCE_OWNER) != 0);
     events.finish(job, CKFE_JOB_COMPLETED);
     if (!concurrent_drain) assert(events.lost > 0 && events.count == 64);
     const auto after_drain = poll(job);

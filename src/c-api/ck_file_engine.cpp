@@ -46,6 +46,9 @@ struct ckfe_job {
     size_t event_begin = 0, event_count = 0;
     uint64_t event_sequence = 0, coalesced_events = 0;
     std::optional<ckfe_job_preservation_report_v1> preservation;
+    // True only for a policy path that requires native inventory, staging
+    // qualification, ownership application and prepublication revalidation.
+    bool preservation_scope_checks_required = false;
 };
 
 namespace {
@@ -249,13 +252,15 @@ void run_job(ckfe_job &job) noexcept {
 
 template <class Start>
 ckfe_api_status start_job(Start &&start, ckfe_job **out, ckfe_error *error,
-    std::optional<ckfe_job_preservation_report_v1> preservation = {}) {
+    std::optional<ckfe_job_preservation_report_v1> preservation = {},
+    bool preservation_scope_checks_required = false) {
     clear_error(error);
     if (!out) return CKFE_API_INVALID_ARGUMENT;
     *out = nullptr;
     try {
         auto job = std::make_unique<ckfe_job>();
         job->preservation = preservation;
+        job->preservation_scope_checks_required = preservation_scope_checks_required;
         job->snapshot.state = CKFE_JOB_RUNNING;
         job->worker = std::jthread([raw = job.get(), begin = std::forward<Start>(start)](std::stop_token) mutable {
             try {
@@ -488,7 +493,7 @@ static ckfe_api_status start_copy_regular(ckfe_entry *source, ckfe_directory *de
             auto prepared = prepare_native_operation_journal_root(*request.journal_root);
             if (!prepared.value()) return Observation<CopyJob>::unavailable(prepared.state(), prepared.unavailable_detail()->error);
             return create_native_operation_copy_batch(std::move(request));
-        }, out, error, report);
+        }, out, error, report, !allow_metadata_loss && scope == RegularMetadataScope::OrdinaryCallerVisibleV1);
     } catch (...) { set_exception(error, "c_api.job_start_copy"); return CKFE_API_EXCEPTION; }
 }
 
@@ -594,11 +599,15 @@ ckfe_api_status ckfe_job_get_preservation_report_v1(ckfe_job *job,
                 CKFE_PRESERVED_ACCESS_TIME | CKFE_PRESERVED_MODIFIED_TIME;
 #ifndef _WIN32
             report->current_effective_uid_gid_applied =
-                report->requested_scope == CKFE_METADATA_ORDINARY_CALLER_VISIBLE_V1;
+                job->preservation_scope_checks_required;
 #else
             report->source_preserved_fields &= ~static_cast<uint64_t>(CKFE_PRESERVED_ORDINARY_MODE);
 #endif
-            report->provider_qualification = CKFE_OBSERVATION_AVAILABLE;
+            // Basic fields are individually applied/verified even with loss
+            // consent. That is not evidence that the requested provider scope
+            // was inventoried or qualified: loss-consenting paths bypass it.
+            if (job->preservation_scope_checks_required)
+                report->provider_qualification = CKFE_OBSERVATION_AVAILABLE;
         } else if (job->failure) report->provider_qualification = static_cast<ckfe_observation_state>(job->failure->state);
         return CKFE_API_OK;
     } catch (...) { set_exception(error, "c_api.job_preservation_report"); return CKFE_API_EXCEPTION; }

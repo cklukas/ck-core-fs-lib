@@ -47,3 +47,22 @@ Remaining execution gates include native plan receipts/tree execution,
 replacement/version retention, durable two-way session storage and overlapping
 root locking, baseline/journal commit recovery, full security replay and
 Trash/restore. The two-way codec/state machine alone supplies none of those.
+
+## Preservation-report correction
+
+The peer identified a real false qualification claim after this checkpoint.
+Completed loss-consenting jobs bypass native inventory and caller-ownership
+application. They now retain Unknown provider qualification and report no
+caller UID/GID application for both legacy Complete and explicit Ordinary scope.
+Individually applied/verified basic fields remain separate from scope coverage.
+Available scope qualification requires successful completion through the path
+that mandates inventory, staging qualification and prepublication checks.
+
+Changed-object lifecycle target build/test: 18:40:47–18:40:54 UTC, seven seconds
+(consistent with the recent incremental dependency scope). The threaded native
+lifecycle regression passed in 3.06 seconds, including both loss-consent scope
+variants. No app was launched; output path/configuration are unchanged.
+Compiled-input manifest SHA-256:
+`146d8729c3619abfc0e78daccc9c44e280fbce431598e40353019ff7d1f589f6`.
+Output SHA-256:
+`3e1e4fd99bc365fce320f2b7fa069eeedda6fb2260658cd99be560e22de40f96`.

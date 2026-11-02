@@ -61,6 +61,11 @@ explicit exclusions, unknowns and provider qualification without requiring UI
 code to parse diagnostic strings. Achieved fields are published only after
 successful completion. Ordinary copying never implicitly authorizes source
 deletion or retention of an old destination with excluded metadata.
+Successful loss-consenting jobs report individually verified basic fields but
+leave provider qualification Unknown and do not claim caller UID/GID application:
+those paths bypass inventory and ownership setup. Complete scope cannot become
+qualified through loss consent. Ordinary scope is qualified only when its
+required native inventory, staging and prepublication checks actually pass.
 
 Native journal setup and operation construction run on the job worker. Once
 arguments are accepted, a start may return OK and later report a typed terminal
