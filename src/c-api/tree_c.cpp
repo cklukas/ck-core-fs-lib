@@ -254,10 +254,12 @@ void progress(Shared& s, const ReviewedTreePlanJob& job) {
 }
 void worker_body(std::shared_ptr<Shared> s, ReviewedTreePlanRequest request) noexcept {
     try {
-        auto prepared = prepare_native_operation_journal_root(*request.journal_root);
-        if (!prepared.value()) {
-            std::lock_guard lock(s->mutex); s->set_failure(*prepared.unavailable_detail());
-            s->snapshot.state = CKFET_FAILED; s->terminal = true; s->publish(); return;
+        if(request.comparison.profile!=ComparisonProfile::Compare) {
+            auto prepared = prepare_native_operation_journal_root(*request.journal_root);
+            if (!prepared.value()) {
+                std::lock_guard lock(s->mutex); s->set_failure(*prepared.unavailable_detail());
+                s->snapshot.state = CKFET_FAILED; s->terminal = true; s->publish(); return;
+            }
         }
         auto made = ReviewedTreePlanJob::create(std::move(request));
         if (!made.value()) {

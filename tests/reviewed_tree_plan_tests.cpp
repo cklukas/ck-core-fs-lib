@@ -504,6 +504,76 @@ void test_retention_capabilities_and_incoming_copy() {
     CHECK(f.read("d/incoming-copy") == "incoming data");
     CHECK(take(job->page(0, 1)).items.front().resulting_name == name("incoming-copy"));
 }
+void test_compare_acknowledges_descriptive_choices() {
+    Fixture f; write_file(f.path("s/a"), "incoming"); write_file(f.path("d/a"), "existing");
+    write_file(f.path("s/new"), "new source"); write_file(f.path("d/other"), "target only");
+    auto request = f.request(ComparisonProfile::Compare);
+    request.copy_policy.allow_unhandled_metadata_loss = false;
+    request.copy_policy.metadata_scope = RegularMetadataScope::CompleteMetadataV1;
+    request.copy_policy.metadata_policy = MetadataReplayPolicy{};
+    request.journal_root.reset(); request.open_journal = {};
+    auto job = take(ReviewedTreePlanJob::create(std::move(request))); preview(*job);
+    auto ask = keep_rule(*job); ask.choice = ConflictChoice::Ask;
+    ask.protect_nonempty = true; ask.retain_replaced = true;
+    auto assessed = take(job->assess_rules(std::span(&ask, 1), 0, 32));
+    bool saw_ask = false;
+    for (const auto& item : assessed.items) {
+        CHECK(item.action == ReviewedTreeAction::Report && item.row.action == ComparisonAction::Report);
+        CHECK(!item.facts.retained_target_available);
+        if (item.facts.source_present && item.facts.destination_present) {
+            CHECK(item.decision && item.decision->state == ConflictRuleState::NeedsReview);
+            CHECK(item.decision->reason == ConflictRuleReason::AwaitingChoice); saw_ask = true;
+        }
+    }
+    CHECK(saw_ask);
+    auto receipt = take(job->review(std::span(&ask, 1)));
+    const auto frozen = take(job->reviewed_page(receipt, 0, 32));
+    CHECK(frozen.items.size() == assessed.items.size());
+    for (std::size_t i = 0; i < frozen.items.size(); ++i) {
+        CHECK(frozen.items[i].action == ReviewedTreeAction::Report);
+        CHECK(frozen.items[i].decision->state == assessed.items[i].decision->state);
+        CHECK(frozen.items[i].decision->reason == assessed.items[i].decision->reason);
+    }
+    // A mutation preference must also stay descriptive in Compare, with its
+    // factual retention refusal intact, never manufactured into availability.
+    auto replace = ask; replace.choice = ConflictChoice::UseSource;
+    auto mutation_preference = take(job->assess_rules(std::span(&replace, 1), 0, 32));
+    for (const auto& item : mutation_preference.items) {
+        CHECK(item.action == ReviewedTreeAction::Report && !item.facts.retained_target_available);
+        if (item.facts.source_present && item.facts.destination_present)
+            CHECK(item.decision->state == ConflictRuleState::NeedsReview && item.decision->reason == ConflictRuleReason::RetentionUnavailable);
+    }
+    CHECK(!job->begin_execution(receipt).value()); // changed rules revoked it
+    auto descriptive = take(job->review(std::span(&replace, 1)));
+    auto invalid = ask; invalid.kind = static_cast<ConflictClass>(999);
+    CHECK(!job->review(std::span(&invalid, 1)).value());
+    CHECK(!job->begin_execution(descriptive).value());
+    receipt = take(job->review(std::span(&ask, 1)));
+    for (auto profile : {ComparisonProfile::Copy, ComparisonProfile::Sync}) {
+        auto mutating_request = f.request(profile);
+        mutating_request.copy_policy.allow_unhandled_metadata_loss = false;
+        mutating_request.copy_policy.metadata_scope = RegularMetadataScope::CompleteMetadataV1;
+        mutating_request.journal_root.reset(); mutating_request.open_journal = {};
+        auto mutating = take(ReviewedTreePlanJob::create(std::move(mutating_request))); preview(*mutating);
+        CHECK(mutating->begin_execution(receipt).state() == ObservationState::Changed);
+        CHECK(!mutating->reviewed_page(receipt, 0, 32).value());
+        auto copy_ask = ask; copy_ask.plan = mutating->preview()->identity();
+        CHECK(!mutating->review(std::span(&copy_ask, 1)).value());
+    }
+    auto other_instance = f.job(ComparisonProfile::Compare); preview(*other_instance);
+    CHECK(other_instance->begin_execution(receipt).state() == ObservationState::Changed);
+    CHECK(take(job->begin_execution(receipt))); run(*job);
+    CHECK(job->state() == ReviewedTreeState::Complete);
+    CHECK(!job->progress().partial && !job->progress().recovery_required && job->progress().known_copy_bytes == 0);
+    CHECK(f.read("s/a") == "incoming" && f.read("d/a") == "existing");
+    CHECK(!f.exists("d/new") && f.read("d/other") == "target only");
+    for (const auto& item : take(job->page(0, 32)).items) {
+        CHECK(item.action == ReviewedTreeAction::Report);
+        CHECK(!item.journal_id && !item.retention_journal_id && !item.staging_name && !item.target_retained);
+    }
+    auto journals = take(f.parent->open_directory_child(name("journals")));
+    CHECK(journals->read(32).state == DirectoryReadState::End);
+}
 void test_profiles() {
     for (auto profile : {ComparisonProfile::Update, ComparisonProfile::MissingOnly, ComparisonProfile::Sync, ComparisonProfile::Mirror, ComparisonProfile::Compare}) {
         Fixture f; write_file(f.path("s/a"), "content");
@@ -528,8 +598,13 @@ void test_exact_names_links_and_fifo() {
 }
 #endif
 }
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--compare-review-only") {
+            test_compare_acknowledges_descriptive_choices();
+            std::printf("reviewed_tree_plan Compare review: %u checks passed\n", checks); return 0;
+        }
+        test_compare_acknowledges_descriptive_choices();
         test_copy(); test_copy(true); test_receipts_and_rules(); test_deletions_and_unsupported();
         test_changed_receipts(); test_overlap_collision_and_limits(); test_cancellation(); test_profiles();
         test_changes_during_execution(); test_parent_move_into_source(); test_assessment_and_receipt_revocation(); test_retention_capabilities_and_incoming_copy();

@@ -1,6 +1,7 @@
 """Native C tree contract: exact reviewed plan, stale proof, ownership/cancel."""
 from pathlib import Path
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -13,11 +14,12 @@ with tempfile.TemporaryDirectory(prefix="tree-c-", dir=scratch) as work:
     source, target, journal = (root / x for x in ("source", "target", "journals"))
     source.mkdir()
     target.mkdir()
-    journal.mkdir(mode=0o700)
+    journal.mkdir(mode=0o755 if mode == "compare" else 0o700)
+    journal_mode = stat.S_IMODE(journal.stat().st_mode)
     (source / "alpha").write_bytes(b"complete file data\0\xff" * 256)
     (source / "nested").mkdir()
     (source / "nested" / "beta").write_bytes(b"nested exact bytes\x80" * 128)
-    if mode == "keepboth":
+    if mode in ("keepboth", "compare"):
         (target / "alpha").write_bytes(b"original target remains")
     env = dict(os.environ, TMPDIR=str(root), TEMP=str(root), TMP=str(root))
     command = [binary, str(root), str(journal), mode]
@@ -30,7 +32,12 @@ with tempfile.TemporaryDirectory(prefix="tree-c-", dir=scratch) as work:
         assert list(target.iterdir()) == [], "stale plan mutated destination"
     else:
         subprocess.run(command, env=env, check=True, timeout=45)
-        if mode in ("copy", "keepboth"):
+        if mode == "compare":
+            assert (target / "alpha").read_bytes() == b"original target remains"
+            assert list(target.iterdir()) == [target / "alpha"]
+            assert list(journal.iterdir()) == [], "Compare created mutation journals"
+            assert stat.S_IMODE(journal.stat().st_mode) == journal_mode, "Compare changed journal-root permissions"
+        elif mode in ("copy", "keepboth"):
             if mode == "keepboth":
                 assert (target / "alpha").read_bytes() == b"original target remains"
                 assert (target / "alpha-incoming").read_bytes() == (source / "alpha").read_bytes()

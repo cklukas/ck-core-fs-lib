@@ -66,6 +66,8 @@ int main(int argc, char** argv) {
     ckfet_options_v1 o{}; ckfet_options_init_v1(&o);
     assert(o.version == CKFET_VERSION && o.struct_size == sizeof(o));
     o.profile = CKFSP_COPY; o.allow_metadata_loss = 1; o.operation_id[0] = 37;
+    const bool compare=mode=="compare";
+    if(compare) {o.profile=CKFSP_COMPARE;o.allow_metadata_loss=0;o.metadata_scope=CKFE_METADATA_COMPLETE_V1;}
 #ifdef _WIN32
     // Fixture arguments are UTF-8 from Python. Convert at the test boundary,
     // then exercise the exact UTF-16 native journal address API.
@@ -138,9 +140,14 @@ int main(int argc, char** argv) {
         choice.component = {incoming_name.data(),incoming_name.size(),CKFET_POSIX_BYTES,0};
 #endif
     }
+    if(compare) {
+        rule.version=CKFET_VERSION;rule.struct_size=sizeof(rule);rule.kind=CKFET_CONFLICT_EXISTING_REGULAR;
+        rule.choice=CKFET_ASK;rule.scope=CKFET_SCOPE_JOB;rule.protect_nonempty=1;rule.retain_replaced=1;
+        rule.plan_generation=s.plan_generation;
+    }
     std::uint64_t command = 999;
     assert(ckfet_review_v1(job, s.plan_generation + 1, nullptr, 0, nullptr, 0, &command) == CKFE_API_STALE_PLAN && command == 0);
-    auto submit = [&] { return ckfet_review_names_v1(job,s.plan_generation,keep_both ? &rule : nullptr,keep_both ? 1 : 0,
+    auto submit = [&] { return ckfet_review_names_v1(job,s.plan_generation,(keep_both||compare) ? &rule : nullptr,(keep_both||compare) ? 1 : 0,
         keep_both ? &choice : nullptr,keep_both ? 1 : 0,nullptr,0,&command); };
     if (keep_both) {
         assert(ckfet_review_v1(job,s.plan_generation,&rule,1,nullptr,0,&command) == CKFE_API_OK);

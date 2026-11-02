@@ -257,3 +257,22 @@ NTFS, two-way execution, or replacement content guards. Complete logical
 security coverage, macOS publication, native prefix resume, directory replay
 and full mixed-direction execution remain open. Frontend mutation enablement
 and a release tag remain blocked on those requirements.
+
+## Read-only Compare receipt correction
+
+Compare keeps every row a Report even when conflict rules request Ask,
+replacement retention, or nonempty-target protection. These preferences remain
+visible in the assessment; they cannot authorize mutations. Invalid rules,
+revoked receipts, foreign instances and reuse by Copy/Sync still refuse.
+The C worker does not prepare or change permissions on a mutation journal root
+for Compare.
+
+The isolated macOS incremental build took 14.21 seconds (only the reviewed-tree
+core, C worker and their tests changed). All five focused suites passed:
+`reviewed_tree_compare`, `tree_c_compare`, `tree_c_stale`, `tree_c_cancel`,
+and `tree_c_cancelreview`. The actual C worker exercised Complete + Ask +
+retain/protect, verified unchanged target bytes and journal-root permissions,
+and waited for worker drain. This qualifies read-only Compare only; it does
+not qualify Complete metadata preservation or mutation publication.
+Input hashes and build/test timestamps are recorded in
+`/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/compare-record.json`.

@@ -278,7 +278,7 @@ if(BUILD_TESTING)
   else()
     target_compile_options(ck_fs_tree_c_tests PRIVATE -UNDEBUG)
   endif()
-  foreach(tree_case copy stale cancel cancelreview keepboth)
+  foreach(tree_case copy stale cancel cancelreview keepboth compare)
     add_test(NAME tree_c_${tree_case} COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tree_c.py $<TARGET_FILE:ck_fs_tree_c_tests>
       ${CK_CORE_FS_NATIVE_TEST_ROOT} ${tree_case})
@@ -308,6 +308,9 @@ if(BUILD_TESTING)
     set_tests_properties(${native_suite} PROPERTIES TIMEOUT 180
       ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   endforeach()
+  add_test(NAME reviewed_tree_compare COMMAND ck_fs_reviewed_tree_plan_tests --compare-review-only)
+  set_tests_properties(reviewed_tree_compare PROPERTIES TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
 endif()
 
 set(CK_CORE_FS_INSTALL_TARGETS ck_core_fs_engine ck_files_platform ck_core_fs_native ck_file_engine_c)

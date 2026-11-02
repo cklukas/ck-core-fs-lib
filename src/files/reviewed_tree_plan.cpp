@@ -821,6 +821,7 @@ struct ReviewedTreePlanJob::Impl {
         update_rules(rules, names);
         if (last_assessment) return *last_assessment;
         auto resolved = items;
+        const bool reporting = request.comparison.profile == ComparisonProfile::Compare;
         bool invalid_selection = rules.size() > 100'000 || names.size() > items.size();
         std::map<std::uint64_t, const ReviewedTreeNameChoice*> chosen;
         for (const auto& name : names) {
@@ -859,7 +860,7 @@ struct ReviewedTreePlanJob::Impl {
                 const auto st = rounded(*item.facts.source_modified), dt = rounded(*item.facts.destination_modified);
                 facts.time_order = st > dt ? ConflictTimeOrder::SourceNewer : st < dt ? ConflictTimeOrder::TargetNewer : ConflictTimeOrder::Equal;
                 facts.equal_time = facts.time_order == ConflictTimeOrder::Equal;
-                if (facts.compatible_regular_files && request.journal_root && request.open_journal) {
+                if (!reporting && facts.compatible_regular_files && request.journal_root && request.open_journal) {
                     const auto qualified = qualify_namespace(*d->second.held->parent());
                     if (qualified.value() && *qualified.value() && d->second.metadata.link_count.value() && *d->second.metadata.link_count.value() == 1) {
                         // Provider rename support alone is not a content freeze.
@@ -896,7 +897,7 @@ struct ReviewedTreePlanJob::Impl {
             if (result.state == ConflictRuleState::NoMatch && item.row.requires_review) {
                 result.state = ConflictRuleState::NeedsReview; result.reason = ConflictRuleReason::NoMatchingRule;
             }
-            if (result.state == ConflictRuleState::Apply) {
+            if (!reporting && result.state == ConflictRuleState::Apply) {
                 switch (result.choice) {
                 case ConflictChoice::KeepTarget: case ConflictChoice::Skip: item.action = ReviewedTreeAction::Skip; break;
                 case ConflictChoice::UseSource: item.action = ReviewedTreeAction::Replace; break;
@@ -918,10 +919,13 @@ struct ReviewedTreePlanJob::Impl {
             }
             const bool needs_retention = item.action == ReviewedTreeAction::Replace ||
                 result.choice == ConflictChoice::UseSource || result.choice == ConflictChoice::KeepBothTarget;
-            if (needs_retention && !facts.retention_available &&
+            if (!reporting && needs_retention && !facts.retention_available &&
                 result.state != ConflictRuleState::Invalid && result.state != ConflictRuleState::Stale) {
                 result.state = ConflictRuleState::NeedsReview; result.reason = ConflictRuleReason::RetentionUnavailable;
             }
+            // A Compare rule remains descriptive evidence. Never turn its
+            // preference into a mutation or synthesize retention capability.
+            if (reporting && native) { result.state = ConflictRuleState::Invalid; result.reason = ConflictRuleReason::InvalidRule; }
             if (invalid_selection) { result.state = ConflictRuleState::Invalid; result.reason = ConflictRuleReason::InvalidRule; }
             item.decision = result;
         }
@@ -1230,9 +1234,16 @@ Observation<ReviewedTreeReceipt> ReviewedTreePlanJob::review(std::span<const Con
     if (deletion.state_ && deletion.state_->plan != impl_->plan->identity()) return invalid<ReviewedTreeReceipt>("reviewed_tree.foreign_deletion_receipt");
     if (!rules.empty() && impl_->items.empty()) return invalid<ReviewedTreeReceipt>("reviewed_tree.rules_without_rows");
     const auto& resolved = impl_->assessment(rules,names);
+    const bool report_only = impl_->request.comparison.profile == ComparisonProfile::Compare &&
+        std::all_of(resolved.begin(), resolved.end(), [](const auto& item) {
+            return item.action == ReviewedTreeAction::Report && item.row.action == ComparisonAction::Report;
+        });
+    if (impl_->request.comparison.profile == ComparisonProfile::Compare && !report_only)
+        return invalid<ReviewedTreeReceipt>("reviewed_tree.compare_requires_all_report");
     for (const auto& item : resolved) {
         if (removal(item.action) && !deletion.state_) return invalid<ReviewedTreeReceipt>("reviewed_tree.deletion_receipt_required");
-        if (item.decision && item.decision->state != ConflictRuleState::Apply && item.decision->state != ConflictRuleState::NoMatch)
+        if (item.decision && item.decision->state != ConflictRuleState::Apply && item.decision->state != ConflictRuleState::NoMatch &&
+            !(report_only && item.decision->state == ConflictRuleState::NeedsReview))
             return unavailable<ReviewedTreeReceipt>(error(AdapterError::ProviderReviewRequired, "reviewed_tree.unresolved_choice", ObservationState::Unsupported));
     }
     ReviewedTreeReceipt out;
@@ -1242,6 +1253,12 @@ Observation<ReviewedTreeReceipt> ReviewedTreePlanJob::review(std::span<const Con
 Observation<bool> ReviewedTreePlanJob::begin_execution(const ReviewedTreeReceipt& receipt) {
     if (state() != ReviewedTreeState::AwaitingReview || !receipt.state_ || receipt.state_->plan != impl_->plan->identity() || receipt.state_->revision != impl_->revision)
         return unavailable<bool>(error(AdapterError::PlanDecisionStale, "reviewed_tree.receipt", ObservationState::Changed));
+    // Compare acknowledgement is bound to this immutable plan instance and
+    // profile. Its descriptive unresolved choices grant no mutation authority.
+    if (impl_->request.comparison.profile == ComparisonProfile::Compare &&
+        std::any_of(receipt.state_->items.begin(), receipt.state_->items.end(), [](const auto& item) {
+            return item.action != ReviewedTreeAction::Report || item.row.action != ComparisonAction::Report;
+        })) return invalid<bool>("reviewed_tree.compare_requires_all_report");
     for (const auto& item : receipt.state_->items) {
         if (item.action == ReviewedTreeAction::Replace) {
             const auto s = impl_->source.nodes.find(item.row.relative_path), d = impl_->target.nodes.find(item.row.relative_path);
