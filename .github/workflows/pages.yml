@@ -16,11 +16,6 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
-env:
-  CKDOCS_REPOSITORY: cklukas/ck-git-hosting
-  CKDOCS_VERSION: 0.8.1
-  CKDOCS_SHA256: 054a447ca09f9602e926fea186b68c1848a75f7c95904cbfe6b32f64b4aecfe6
-
 jobs:
   build:
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
@@ -29,16 +24,24 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-      - name: Install ckdocs
+      - uses: actions/checkout@v5
+        with:
+          repository: cklukas/ck-git-hosting
+          ref: 7e3ee5eb57a2cef2e07f9e9fe5c4e2822502d322
+          path: .docs-tool
+          persist-credentials: false
+      - name: Build pinned ckdocs
         run: |
-          deb="$RUNNER_TEMP/ckdocs_${CKDOCS_VERSION}_amd64.deb"
-          curl --fail --location --silent --show-error --retry 3 --output "$deb" \
-            "https://github.com/$CKDOCS_REPOSITORY/releases/download/v$CKDOCS_VERSION/ckdocs_${CKDOCS_VERSION}_amd64.deb"
-          echo "$CKDOCS_SHA256  $deb" | sha256sum --check --strict
-          sudo dpkg --install "$deb"
-          ckdocs --version | grep -F "ckdocs $CKDOCS_VERSION"
+          work="$RUNNER_TEMP/ckdocs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$work/tmp" "$work/build"
+          export TMPDIR="$work/tmp"
+          make -j2 -C .docs-tool BUILD_ROOT="$work" BUILD_DIR="$work/build" \
+            CKGIT_BUILD_VERSION=0.10.1+g7e3ee5eb57a2 \
+            "$work/build/bin/ckdocs"
+          echo "CKDOCS=$work/build/bin/ckdocs" >> "$GITHUB_ENV"
       - name: Build the site
-        run: ckdocs build --root "$PWD" --out "$RUNNER_TEMP/site" --strict
+        run: |
+          "$CKDOCS" build --root "$PWD" --out "$RUNNER_TEMP/site" --strict
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:

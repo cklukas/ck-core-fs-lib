@@ -2,12 +2,24 @@
 version: 1
 site:
   title: ck-core-fs-lib
+  brand: ck-core-fs-lib
   description: Headless, cross-platform filesystem operations with a stable C ABI for ckUtilities, CDE, and other frontends.
+  url: https://cklukas.github.io/ck-core-fs-lib/
   footer: "© 2026 C. Klukas · GNU Lesser General Public License v2.0 or later"
   links:
     - title: GitHub
       url: https://github.com/cklukas/ck-core-fs-lib
       icon: github
+  selector:
+    links:
+      - title: CK Core CDE
+        url: https://cklukas.github.io/ck-core-cde/
+      - title: CK Core Apps
+        url: https://cklukas.github.io/ck-core-apps/
+      - title: CK Core Motif
+        url: https://cklukas.github.io/ck-core-motif/
+source: docs
+home: docs/index.md
 search: true
 nav:
   - title: Home
