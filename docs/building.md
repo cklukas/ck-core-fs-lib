@@ -1,5 +1,14 @@
 # Building and testing
 
+Native test fixtures default to `build/tasks`. Set
+`CK_CORE_FS_NATIVE_TEST_ROOT` to an explicit isolated directory when the build
+volume has different semantics from the provider being qualified. A macOS
+`noowners` mount cannot establish private journal or ownership-preservation
+guarantees. Keep build intermediates on an approved temporary volume and use
+an ownership-enforcing approved temporary volume for positive native fixtures;
+test `noowners` refusal separately. Do not change global mount settings to make
+a test pass.
+
 The library is a standalone CMake project:
 
 ```sh

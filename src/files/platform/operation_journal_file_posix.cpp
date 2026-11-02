@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "../operation_journal_file.hpp"
+#include "posix_private_storage.hpp"
 
 #include <cerrno>
 #include <fcntl.h>
@@ -47,26 +48,26 @@ bool valid_io(std::uint64_t offset, std::size_t count) {
 }
 
 Observation<bool> private_directory(int fd) {
-    struct stat info{};
-    if (fstat(fd, &info) != 0) return failure<bool>(errno, "journal_file.root_stat");
-    if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid() || (info.st_mode & 07777) != 0700)
-        return rejected<bool>(AdapterError::InvalidAccess, "journal_file.private_root", ObservationState::Denied);
-    return Observation<bool>::available(true);
+    return detail::qualify_posix_private_storage(fd,detail::PosixPrivateStorageKind::Directory);
 }
 
-Observation<bool> private_regular(int fd, bool newly_created) {
-    struct stat info{};
-    if (fstat(fd, &info) != 0) return failure<bool>(errno, "journal_file.file_stat");
-    if (!S_ISREG(info.st_mode) || info.st_uid != geteuid() || (info.st_mode & 07777) != 0600 ||
-        info.st_nlink != 1 || (newly_created && info.st_size != 0))
-        return rejected<bool>(AdapterError::InvalidAccess, "journal_file.private_file", ObservationState::Denied);
+Observation<bool> private_regular(int fd,bool newly_created) {
+    auto private_check=detail::qualify_posix_private_storage(fd,detail::PosixPrivateStorageKind::RegularFile);
+    if(!private_check.value()) return private_check;
+    if(newly_created) {
+        struct stat info{};
+        if(fstat(fd,&info)) return failure<bool>(errno,"journal_file.created_stat");
+        if(info.st_size!=0) return rejected<bool>(AdapterError::InvalidAccess,"journal_file.created_nonempty",ObservationState::Denied);
+    }
     return Observation<bool>::available(true);
 }
 
 class PosixOperationJournalFile final : public OperationJournalFile {
 public:
-    explicit PosixOperationJournalFile(int fd) noexcept : fd_(fd) {}
+    PosixOperationJournalFile(int fd,int directory) noexcept : fd_(fd),directory_(directory) {}
     Observation<std::uint64_t> size() override {
+        auto checked=revalidate();
+        if(!checked.value()) return Observation<std::uint64_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
         struct stat info{};
         if (fstat(fd_.value(), &info) != 0) return failure<std::uint64_t>(errno, "journal_file.fstat");
         if (!S_ISREG(info.st_mode) || info.st_size < 0 || info.st_nlink != 1)
@@ -75,24 +76,37 @@ public:
     }
     Observation<std::size_t> read_at(std::uint64_t offset, std::span<std::byte> bytes) override {
         if (!valid_io(offset, bytes.size())) return rejected<std::size_t>(AdapterError::InvalidLimit, "journal_file.read_range");
+        auto checked=revalidate();
+        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
         const auto count = std::min(bytes.size(), static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
         const auto result = pread(fd_.value(), bytes.data(), count, static_cast<off_t>(offset));
         if (result < 0) return failure<std::size_t>(errno, "journal_file.pread");
+        checked=revalidate();
+        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
         return Observation<std::size_t>::available(static_cast<std::size_t>(result));
     }
     Observation<std::size_t> write_at(std::uint64_t offset, std::span<const std::byte> bytes) override {
         if (!valid_io(offset, bytes.size())) return rejected<std::size_t>(AdapterError::InvalidLimit, "journal_file.write_range");
+        auto checked=revalidate();
+        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
         const auto count = std::min(bytes.size(), static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
         const auto result = pwrite(fd_.value(), bytes.data(), count, static_cast<off_t>(offset));
         if (result < 0) return failure<std::size_t>(errno, "journal_file.pwrite");
+        checked=revalidate();
+        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
         return Observation<std::size_t>::available(static_cast<std::size_t>(result));
     }
     Observation<bool> flush() override {
+        auto checked=revalidate();if(!checked.value()) return checked;
         if (fsync(fd_.value()) != 0) return failure<bool>(errno, "journal_file.fsync");
-        return Observation<bool>::available(true);
+        return revalidate();
     }
 private:
-    Fd fd_;
+    Observation<bool> revalidate() {
+        auto root=private_directory(directory_.value());if(!root.value()) return root;
+        return private_regular(fd_.value(),false);
+    }
+    Fd fd_,directory_;
 };
 }
 
@@ -104,11 +118,8 @@ Observation<bool> prepare_native_operation_journal_root(const NativeAbsolutePath
     Fd directory(open(host.value()->c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
     if (directory.value() < 0)
         return failure<bool>(errno, "journal_file.prepare_root.open");
-    struct stat info{};
-    if (fstat(directory.value(), &info) != 0)
-        return failure<bool>(errno, "journal_file.prepare_root.stat");
-    if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid())
-        return rejected<bool>(AdapterError::InvalidAccess, "journal_file.prepare_root.owner", ObservationState::Denied);
+    auto preflight=detail::qualify_posix_private_storage(directory.value(),detail::PosixPrivateStorageKind::Directory,false);
+    if(!preflight.value()) return preflight;
     if (fchmod(directory.value(), 0700) != 0)
         return failure<bool>(errno, "journal_file.prepare_root.mode");
     return private_directory(directory.value());
@@ -143,7 +154,11 @@ Observation<std::unique_ptr<OperationJournalFile>> open_native_operation_journal
         const auto& detail = *private_file.unavailable_detail();
         return Observation<Pointer>::unavailable(detail.state, detail.error);
     }
-    auto result = std::make_unique<PosixOperationJournalFile>(file.release());
+    auto final_root=private_directory(directory.value());
+    if(!final_root.value()) return Observation<Pointer>::unavailable(final_root.state(),final_root.unavailable_detail()->error);
+    // Allocate before relinquishing either native owner, including bad_alloc.
+    auto result = std::make_unique<PosixOperationJournalFile>(file.value(),directory.value());
+    file.release();directory.release();
     return Observation<Pointer>::available(std::move(result));
 }
 } // namespace ck::files

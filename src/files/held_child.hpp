@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #pragma once
 #include "directory_cursor.hpp"
+#include "metadata_replay.hpp"
 
 namespace ck::files {
 // An owning observation of one basename through one held directory. The child
@@ -34,6 +35,11 @@ public:
                                           std::stop_token stop = {}) const;
     // Worker-only native qualification on the exact retained object.
     Observation<bool> qualify_ordinary_regular_metadata() const;
+    Observation<MetadataReplaySnapshot> capture_metadata(MetadataReplayPolicy policy, std::stop_token stop = {}) const;
+    Observation<bool> verify_metadata_source(const MetadataReplaySnapshot&, std::stop_token stop = {}) const;
+    Observation<bool> qualify_stable_content() const;
+    Observation<bool> rename_noreplace(const DirectoryCursor& destination, const NativeName& destination_name,
+                                     std::stop_token stop = {}) const;
     const Observation<IdentityComparison>& previous_continuity() const noexcept { return previous_continuity_; }
     // A later live observation in the same unbroken held-object family, with
     // the same parent/basename. Reusing a cached snapshot is never a refresh.

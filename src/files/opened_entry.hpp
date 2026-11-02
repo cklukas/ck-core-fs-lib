@@ -23,6 +23,8 @@ namespace ck::files {
 
 class DirectoryCursor;
 class NativeName;
+struct MetadataReplayPolicy;
+struct MetadataReplaySnapshot;
 
 // Requested OS access only; never authority for mutation, loss or hydration.
 // Layout is an explicit regular-file query opt-in and can require data-read
@@ -33,14 +35,19 @@ enum class EntryAccess : unsigned {
     MetadataAndFullSecurity = 6, MetadataAndLayout = 8, MetadataAndInodeFlags = 16, ContentRead = 32,
     // Windows-only source exclusion for cross-filesystem moves. POSIX
     // adapters refuse this request rather than imply writer exclusion.
-    MoveSource = 64
+    MoveSource = 64,
+    // Windows rename guard: requests DELETE and denies WRITE/DELETE sharing.
+    // Only this exact held handle may rename the object. Sharing alone does
+    // not freeze preexisting writable mappings; qualify_stable_content must
+    // separately succeed before relying on a digest for retention.
+    RenameSource = 128
 };
 constexpr EntryAccess operator|(EntryAccess left, EntryAccess right) noexcept {
     return static_cast<EntryAccess>(static_cast<unsigned>(left) | static_cast<unsigned>(right));
 }
 constexpr bool valid_entry_access(EntryAccess access) noexcept {
     const auto bits = static_cast<unsigned>(access);
-    return (bits & ~127U) == 0 && ((bits & 4U) == 0 || (bits & 2U) != 0);
+    return (bits & ~255U) == 0 && ((bits & 4U) == 0 || (bits & 2U) != 0) && (bits & 192U) != 192U;
 }
 constexpr bool requests_attributes(EntryAccess access) noexcept { return (static_cast<unsigned>(access) & 1U) != 0; }
 constexpr bool requests_security(EntryAccess access) noexcept { return (static_cast<unsigned>(access) & 2U) != 0; }
@@ -48,6 +55,7 @@ constexpr bool requests_audit_security(EntryAccess access) noexcept { return (st
 constexpr bool requests_inode_flags(EntryAccess access) noexcept { return (static_cast<unsigned>(access) & 16U) != 0; }
 constexpr bool requests_content_read(EntryAccess access) noexcept { return (static_cast<unsigned>(access) & 32U) != 0; }
 constexpr bool requests_move_source(EntryAccess access) noexcept { return (static_cast<unsigned>(access) & 64U) != 0; }
+constexpr bool requests_rename_source(EntryAccess access) noexcept { return (static_cast<unsigned>(access) & 128U) != 0; }
 constexpr bool requests_layout(EntryAccess access) noexcept { return (static_cast<unsigned>(access) & 8U) != 0; }
 
 struct ContentReadLimits {
@@ -112,6 +120,11 @@ public:
     virtual Observation<std::size_t> write_content(std::uint64_t offset, std::span<const std::byte> bytes,
                                                     ContentWriteLimits limits = {}, std::stop_token stop = {});
     virtual Observation<bool> flush_content();
+    // Worker-only proof for the lifetime of this held guard, checked before
+    // and after data verification and immediately before mutation. Ordinary
+    // share exclusion does not qualify preexisting writable mappings. Default
+    // refuses; no provider or oplock-break proof may be inferred from an ID.
+    virtual Observation<bool> qualify_stable_content() const;
     // Strict ordinary-file qualification through this held object. Success
     // requires an audited local filesystem, caller-visible attribute inventory,
     // explicit ACL / known label/capability absence, ordinary storage flags and
@@ -133,11 +146,30 @@ public:
     // contract and are refused here; the caller must bind the value to its
     // reviewed source identity before invoking this worker-only boundary.
     virtual Observation<bool> apply_nonsecurity_attribute(const AttributeValue& source);
+    // Worker-only staging replay. Native adapters qualify provider coverage,
+    // never elevate, and retain native Denied/Unsupported results.
+    virtual Observation<bool> qualify_metadata_replay(const MetadataReplayPolicy&) const;
+    // Policy-specific read rights acquired through the retained native
+    // identity, never the source basename. A returned entry owns a per-capture
+    // query handle, avoiding shared mutable access state. Available(nullptr)
+    // explicitly uses the existing object (POSIX); denial never weakens capture.
+    virtual Observation<std::unique_ptr<OpenedEntry>> open_metadata_replay_view(const MetadataReplayPolicy&) const;
+    virtual Observation<bool> apply_replay_ownership(const BasicMetadata&, const MetadataReplayPolicy&);
+    virtual Observation<bool> apply_replay_attribute(const AttributeValue&, const MetadataReplayPolicy&);
+    virtual Observation<bool> remove_replay_attribute(const NativeFeatureIdentifier&, const MetadataReplayPolicy&);
+    virtual Observation<bool> apply_replay_security(const NativeSecurityValue&, const MetadataReplayPolicy&);
+    virtual Observation<bool> verify_replay_security(const NativeSecurityValue&, const MetadataReplayPolicy&) const;
+    virtual Observation<bool> apply_replay_basic(const BasicMetadata&, const MetadataReplayPolicy&);
     // Publish this worker-created staging object under a new destination name
     // relative to a held directory. The default refuses the operation; a
     // platform adapter must provide an atomic no-replace primitive and retain
     // an ambiguous native outcome for reconciliation.
     virtual Observation<bool> publish_noreplace(const DirectoryCursor& destination, const NativeName& name);
+    // Exact held-source rename, never a source-basename reopen. Requires a
+    // RenameSource handle and qualified source/destination adapters. Does not
+    // prove that the original parent/name still refers to this held inode.
+    virtual Observation<bool> rename_noreplace(const DirectoryCursor& source_parent,
+        const DirectoryCursor& destination, const NativeName& name) const;
 protected:
     OpenedEntry() = default;
 };

@@ -6,6 +6,7 @@
 #include "object_inventory_job.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -103,7 +104,6 @@ struct Fixture {
 void native_tests() {
     Fixture ordinary;
     ordinary.source();
-    require_review(ordinary.batch(false, "complete-unavailable", 42, RegularMetadataScope::CompleteMetadataV1));
     auto strict = ordinary.batch(false, "strict", 1);
     const bool native_qualified = strict.value() != nullptr;
     if (native_qualified) {
@@ -141,11 +141,38 @@ void native_tests() {
                           << " role=" << static_cast<int>(attribute.role) << " (name/role only)\n";
         require(!std::getenv("CK_REGULAR_REQUIRE_NATIVE_SUCCESS"), "mandatory scope-1 preserving gate FAILED");
     }
+    auto complete_scope=ordinary.batch(false,"complete",42,RegularMetadataScope::CompleteMetadataV1);
+#ifdef __APPLE__
+    require(complete_scope.value()!=nullptr,"Darwin complete metadata preflight refused");
+    Fixture::complete(**complete_scope.value());
+    struct stat complete_source{},complete_target{};
+    require(stat(ordinary.path("source").c_str(),&complete_source)==0&&stat(ordinary.path("complete").c_str(),&complete_target)==0,"complete stat");
+    require(complete_source.st_uid==complete_target.st_uid&&complete_source.st_gid==complete_target.st_gid&&
+        complete_source.st_birthtimespec.tv_sec==complete_target.st_birthtimespec.tv_sec&&
+        complete_source.st_birthtimespec.tv_nsec==complete_target.st_birthtimespec.tv_nsec,"complete ownership/birthtime mismatch");
+#else
+    require_review(complete_scope);
+#endif
     Fixture attributes;
     attributes.source();
     attributes.xattr();
-    require_review(attributes.batch(false, "denied", 3));
-    require(access(attributes.path("denied").c_str(), F_OK) != 0, "xattr-bearing source published");
+    auto preserved_attributes=attributes.batch(false,"preserved",3);
+    require(preserved_attributes.value()!=nullptr,"xattr-bearing source refused");
+    Fixture::complete(**preserved_attributes.value());
+    char source_value[128]{},target_value[128]{};
+#ifdef __APPLE__
+    const auto source_size=getxattr(attributes.path("source").c_str(),"user.ck_metadata_test",source_value,sizeof(source_value),0,0);
+    const auto target_size=getxattr(attributes.path("preserved").c_str(),"user.ck_metadata_test",target_value,sizeof(target_value),0,0);
+    char source_provenance[128]{},target_provenance[128]{};
+    const auto source_provenance_size=getxattr(attributes.path("source").c_str(),"com.apple.provenance",source_provenance,sizeof(source_provenance),0,0);
+    const auto target_provenance_size=getxattr(attributes.path("preserved").c_str(),"com.apple.provenance",target_provenance,sizeof(target_provenance),0,0);
+    require(source_provenance_size>=0&&source_provenance_size==target_provenance_size&&
+        std::memcmp(source_provenance,target_provenance,source_provenance_size)==0,"opaque provenance not preserved exactly");
+#else
+    const auto source_size=getxattr(attributes.path("source").c_str(),"user.ck_metadata_test",source_value,sizeof(source_value));
+    const auto target_size=getxattr(attributes.path("preserved").c_str(),"user.ck_metadata_test",target_value,sizeof(target_value));
+#endif
+    require(source_size>=0&&source_size==target_size&&std::memcmp(source_value,target_value,source_size)==0,"xattr bytes not preserved exactly");
     auto consent = attributes.batch(true, "consented", 4);
     require(consent.value() != nullptr, "explicit loss consent refused");
     Fixture::complete(**consent.value());
@@ -178,7 +205,11 @@ void native_tests() {
         32,0,0,0,255,255,255,255};
     require(setxattr(acl.path("source").c_str(), "system.posix_acl_access", acl_value, sizeof(acl_value), 0) == 0,
             "install access ACL fixture");
-    require_review(acl.batch(false, "denied", 9));
+    auto preserved_acl=acl.batch(false,"preserved",9);
+    require(preserved_acl.value()!=nullptr,"ACL-bearing source refused");Fixture::complete(**preserved_acl.value());
+    unsigned char copied_acl[sizeof(acl_value)]{};
+    require(getxattr(acl.path("preserved").c_str(),"system.posix_acl_access",copied_acl,sizeof(copied_acl))==sizeof(acl_value)&&
+        std::memcmp(copied_acl,acl_value,sizeof(acl_value))==0,"ACL bytes not preserved exactly");
     if (geteuid() == 0 && native_qualified) {
         Fixture ownership;
         ownership.source();
@@ -212,8 +243,8 @@ void native_tests() {
     close(flags_fd);
     require_review(flags.batch(false, "denied", 8));
 #endif
-    // Unsupported adapters (including Windows) retain a typed strict refusal.
-    std::cout << "scope-0 refusal, unsupported metadata refusal and explicit-consent checks passed\n";
+    // Unsupported metadata classes retain typed strict refusal.
+    std::cout << "versioned metadata scope, ACL/xattr replay and explicit-consent checks passed\n";
     if (native_qualified) std::cout << "scope-1 native ordinary preservation and source-mutation checks passed\n";
     else std::cout << "scope-1 preserving gate NOT PASSED; mutation/ownership cases requiring native success not run\n";
 }

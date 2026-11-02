@@ -126,3 +126,84 @@ passed, four preservation-success cases failed as Unsupported, and the raw-byte
 fixture skipped only on native EILSEQ. Both loss-report regressions passed. The
 ordinary/Complete preservation failures remain capability gaps; no broad native
 mutation or cancellation-latency qualification follows from these results.
+
+## 0.3 development integration snapshot
+
+The new native composition, metadata replay, durable sessions, and C action
+interfaces built together on macOS with unchanged inputs from
+19:40:40.972 to 19:43:08.909 UTC (147.937 seconds). The preceding comparable
+clean build took 136.088 seconds; logs show all new translation units and
+native suites compiled. This was a coherent build after rejecting an earlier
+run whose C++ result layouts changed during compilation. No sanitizer finding
+was suppressed and no mixed-layout run was counted as qualification.
+
+Source/include/tests/root-CMake snapshot SHA-256:
+`3e418f041d240be4f5d8c778aec5a623b51ee994d1387698bb61c35aa08612b1`.
+Library output:
+`/Volumes/S8T/tmp/ck-core-fs-lib-contract.rlIRSX/build/libck-core-fs-lib.0.3.0.dylib`.
+Output SHA-256:
+`a55c788e61008691e460e5d1b3c4dd7950106c64ed0f811efbd72fef616e22fa`.
+
+After two test-only corrections (earlier retention refusal and a unique
+per-run journal fixture), all 17 integrated suites passed in 5.22 seconds.
+The added suites cover native C copy/stale/cancel/keep-both, ACL/xattr replay,
+601 reviewed-tree checks, 2,351 session checks, action receipts/retries, and
+retention journal-flush fault boundaries. An installed C-only consumer also
+configured, built, and passed. The 13-page ckdocs site built strictly with no
+warnings.
+
+These are development results, not final qualification of 0.3. Subsequent
+static review identified Windows staging/mapping exclusion, Trash ancestry/
+inheritance/identity continuity, Darwin coordinator ACL/mount privacy,
+history-loss handling, and absence-proof budget issues. The affected paths
+require fixes and fresh qualification. Passing happy-path and injected-fault
+suites did not establish those missing guarantees.
+
+Remaining feature gates include directory-level two-way convergence, actual
+crash retry/resume authority, Windows additional data streams and some security
+metadata, and destructive POSIX operations without an object-conditional
+primitive. A typed refusal is recorded as a capability limit, not successful
+implementation of that feature. Development records live under the same
+temporary root as `frozen-build.json`, `checkpoint-tests.json`, and their logs.
+
+## Post-review native integration checkpoint
+
+The coherent macOS clean build ran 20:48:46–20:51:06 UTC (140 seconds),
+consistent with the preceding 148-second clean build. It compiled all changed
+native modules. Its first test run found one fixture assertion error: the
+negative NoOwners test rejected the approved `/Volumes/S8T/tmp` root itself
+while accepting its descendants. The corrected assertion still requires an
+approved volume and leaves ownership/ACL refusal checks intact.
+
+The subsequent worker-drained API and fixture changes were rebuilt and tested
+with unchanged inputs. Final verification ran 20:58:44–20:58:58 UTC: a
+4.667-second incremental build recompiled the session fixture; all 17 suites
+passed in 5.71 seconds. The worker-drained implementation and its C tests had
+already compiled in the immediately preceding changed-object build. All four
+native tree C cases passed with explicit shutdown-drain checks. The installed
+C-only smoke consumer passed, and the independent installed-C harness passed
+13 behavioral contracts with one raw-byte-name fixture skipped on native
+EILSEQ. Both ordinary and Complete preservation-success cases passed on these
+specific APFS fixtures. This does not establish every metadata namespace or
+provider. The 13-page documentation site also built strictly without warnings.
+
+Source/include/tests/cmake/tools/workflows manifest SHA-256:
+`7ef23fb381b6924659380a5969d3208b037cedd247d8621ff35b21335247cd2c`.
+Library SHA-256:
+`fb351e2df9f476f9d3d334c50df2ad7ba979cc62f87c75d64d8b3c887df08a2f`.
+Output is `post-hardening/build/libck-core-fs-lib.0.3.0.dylib` beneath the
+development evidence root above. Positive native fixtures used the
+ownership-enforcing PRO-BLADE volume; S8T's NoOwners mode was exercised only
+as a negative private-storage fixture. No mount setting was changed.
+
+This checkpoint adds reviewed native tree execution, strict metadata replay,
+durable session storage/locks/verified commits, and C action interfaces. It
+does **not** close all requested feature gates. Outstanding work includes
+native two-way execution composition, directory metadata convergence, actual
+copy retry/resume, Windows alternate streams and qualified immutable-content
+guards, safe POSIX publication/destructive primitives, and explicit reporting
+of delayed writable-handle/journal close failures. Worker-drained currently
+proves no remaining backend I/O; it does not repair destructor-only close-error
+reporting. Frontend execution remains gated pending these fixes and pinned
+cross-platform qualification. No release tag or blanket preservation claim
+is made from this checkpoint.

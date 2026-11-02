@@ -1,15 +1,23 @@
 # C API
 
-The public header is [`include/ck_file_engine.h`](../include/ck_file_engine.h).
-It is usable from C and C++ and contains no C++ types, exceptions, STL
+The entry header is [`include/ck_file_engine.h`](../include/ck_file_engine.h).
+`ck_fs_tree.h`, `ck_fs_actions.h`, and `ck_fs_session.h` expose native reviewed
+execution, action jobs, and durable sessions. All headers are usable from C and C++ and contain no C++ types, exceptions, STL
 containers, or frontend types.
 
 ## Ownership
 
 `ckfe_engine_create`, `ckfe_directory_open_*`, `ckfe_entry_open_*`, and job
 start functions return opaque handles owned by the caller. Destroy functions
-release them. Destroying a job requests cancellation and joins its worker
-before releasing native handles.
+release them. Legacy `ckfe_job_destroy` requests cancellation and joins its
+worker; call it on a worker/reaper. Tree release and action-job release are
+nonblocking: the worker retains its owners until it stops safely. Session
+open/verify/commit/close operations belong on a filesystem worker.
+
+For helper-process shutdown, keep the tree job alive and poll
+`ckfet_worker_drained_v1` until it returns OK with a nonzero result before
+release and process exit. A terminal snapshot can precede native-owner
+destruction. Drained is a lifetime guarantee, not an operation-success result.
 
 Initialize a `ckfe_error` with `ckfe_error_init`. Every API that accepts an
 error output clears it on entry and overwrites it on failure; call
@@ -20,7 +28,7 @@ runtime allocator.
 
 ## Jobs
 
-Library 0.2 exposes ABI minor 2 with additive policy, events and recovery
+Library 0.3 exposes ABI minor 3 with additive native execution and session
 interfaces. Existing handles and snapshot layouts are unchanged.
 
 Start functions return quickly. `CKFE_API_OK` means a non-null job handle was
@@ -45,15 +53,16 @@ turn unsupported security or provider metadata into a successful copy. A
 caller that explicitly accepts the declared loss may set the flag to nonzero.
 
 `ckfe_job_start_copy_regular_v1` accepts an exact version/size options object.
-Complete metadata scope retains the legacy strict capability gate. Ordinary
+Complete metadata scope requires qualified full replay. Ordinary
 caller-visible scope is an explicit narrower request: mode 0777, atime/mtime,
 and new-object effective UID/GID ownership (including correction of setgid-parent
 group inheritance). Source ownership, birth/ctime, special bits, arbitrary
-hidden xattrs and physical allocation identity are outside this scope. Known
-visible attributes, ACLs, labels/capabilities, sparse/flagged/provider-managed
-objects are currently refused when their preservation cannot be qualified;
-ordinary scope does not claim replay of them. Unsupported Windows security
-qualification remains a refusal. Exact timestamp/mode verification is required;
+hidden xattrs and physical allocation identity are outside this scope. Native
+replay captures and verifies visible xattr/EA values and ACL/security records.
+Privileged labels/capabilities and special bits require explicit opt-in through
+`ckfe_copy_options_v2`, independently of native access rights. Unknown coverage,
+additional streams, integrity/provider semantics, sparse/flagged representations,
+or missing rights remain refusals where not qualified. Exact timestamp/mode verification is required;
 there is no precision or umask fallback.
 
 `ckfe_job_get_preservation_report_v1` reports requested scope, achieved fields,
@@ -78,12 +87,13 @@ journal. Immutable summary/page calls report durable states and review actions,
 including untrusted tails/evidence. Inspection never authorizes automatic
 replay, deletion or source retirement.
 
-The next ABI slice will add opaque preview-plan and receipt handles. A plan
-will carry the selected action profile, comparison mode, filters, link and
-filesystem-boundary policy, and a stable decision token. Execution will accept
-only a matching receipt and will revalidate held identities before mutation.
-Unknown, unreadable, changed, or failed rows will remain typed review results;
-they cannot become `identical` or authorize mirror deletion.
+`ck_fs_tree.h` starts native inventory on held roots and returns bounded
+immutable preview facts and native names. Review produces a matching receipt;
+execution revalidates the frozen evidence. Each command outcome persists until
+acknowledged. Rules, manual native names, per-row eligibility, rejection reasons,
+retained names and recovery identifiers are backend results. Unknown or failed
+inventory cannot become `identical` or authorize mirror deletion. See
+[native contracts](native-contracts.md) for lifetime and platform limits.
 
 ## Comparison and policy headers
 
@@ -95,8 +105,8 @@ not invent provider capabilities or authorize replay.
 caller-supplied facts. It provides summary/page/path access and whole-input
 revalidation against plan-local tokens. It distinguishes incomplete inventory,
 quick size/time equality and complete stable digests. Input facts cannot become
-native operation authority through this interface. Native async inventory,
-review receipts and execution of these plans are separate remaining gates.
+native operation authority through this interface. `ck_fs_tree.h` owns a separate
+native inventory and receipt path; it does not promote caller-fact previews.
 
 ## Native encoding
 

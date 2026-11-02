@@ -7,6 +7,12 @@
 
 namespace ck::files {
 
+Observation<bool> DirectoryCursor::qualify_identity_bound_rename() const {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),
+         "directory.identity_bound_rename"});
+}
+
 Observation<AdapterScope> DirectoryCursor::source_scope() const {
     return Observation<AdapterScope>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "directory.source_scope"});

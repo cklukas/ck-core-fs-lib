@@ -10,10 +10,15 @@ if(NOT WIN32)
   target_compile_options(ckfe_consumer_contracts PRIVATE -Wall -Wextra -Werror)
 endif()
 enable_testing()
+set(CK_CORE_FS_NATIVE_TEST_ROOT "${CMAKE_CURRENT_BINARY_DIR}/fixtures" CACHE PATH
+  "Explicit isolated native contract fixtures on the provider being qualified")
+if(NOT IS_ABSOLUTE "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  message(FATAL_ERROR "CK_CORE_FS_NATIVE_TEST_ROOT must be absolute")
+endif()
 foreach(case invalid_outputs stale_error metadata_output invalid_job byte_names held_parent substitution final_link preserving_copy cancel_copy ordinary_copy ordinary_cancel complete_loss_report ordinary_loss_report)
   add_test(NAME consumer_${case} COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/run_contract.py $<TARGET_FILE:ckfe_consumer_contracts>
-    ${case} ${CMAKE_CURRENT_BINARY_DIR}/fixtures)
+    ${case} ${CK_CORE_FS_NATIVE_TEST_ROOT})
   set_tests_properties(consumer_${case} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
 set_tests_properties(consumer_preserving_copy consumer_cancel_copy consumer_ordinary_copy consumer_ordinary_cancel consumer_complete_loss_report consumer_ordinary_loss_report PROPERTIES PROCESSORS 2)

@@ -45,6 +45,13 @@ struct NativeOperationCopyRequest final {
     // Optional additional held-object metadata guard, run after application
     // and immediately before publication. The batch binds its strict policy.
     std::function<Observation<bool>(OpenedEntry&, std::stop_token)> verify_metadata_before_publication;
+    // Optional reviewed replacement preparation. Invoked only after the new
+    // staging content and metadata have been verified, inside the journaled
+    // publication boundary. It must durably retain the exact reviewed target
+    // (never delete it), and refuse before mutation if its native guarantee is
+    // unavailable. Once it succeeds publication is attempted even if a cancel
+    // request arrives; any failure preserves retained-target recovery evidence.
+    std::function<Observation<bool>(std::stop_token)> prepare_destination_before_publication;
 };
 
 // Worker-only native binding of OperationCopyJob and OperationCommitJob. Move
@@ -101,6 +108,9 @@ struct NativeOperationCopyBatchPolicy final {
     // Explicit subset selection is required for ordinary caller-visible
     // preservation. The default retains complete-scope typed refusal.
     RegularMetadataScope metadata_scope = RegularMetadataScope::CompleteMetadataV1;
+    // Explicit v1 replay policy, including original/current ownership and
+    // privileged security metadata consent. An absent value uses scope defaults.
+    std::optional<MetadataReplayPolicy> metadata_policy;
 };
 
 struct NativeOperationCopyBatchRequest final {

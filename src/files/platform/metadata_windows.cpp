@@ -1,6 +1,8 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_filesystem.hpp"
+#include "../native_trash.hpp"
+#include "metadata_replay.hpp"
 #include "windows_name.hpp"
 #include "windows_directory_record.hpp"
 #include "windows_stream_records.hpp"
@@ -13,6 +15,7 @@
 #include <winternl.h>
 #include <winioctl.h>
 #include <sddl.h>
+#include <aclapi.h>
 
 #include <bit>
 #include <set>
@@ -347,10 +350,10 @@ class WindowsOpenedEntry final : public OpenedEntry {
 public:
     WindowsOpenedEntry(OwnedHandle handle, AdapterScope scope, bool layout_access = false,
                        bool content_access = false, bool content_write_access = false,
-                       std::unique_ptr<WindowsPublicationContext> publication = {})
+                       std::unique_ptr<WindowsPublicationContext> publication = {}, bool rename_access = false)
         : handle_(std::move(handle)), scope_(std::move(scope)), layout_access_(layout_access),
           content_access_(content_access), content_write_access_(content_write_access),
-          publication_(std::move(publication)) {}
+          rename_access_(rename_access), publication_(std::move(publication)) {}
     Observation<ContentRead> read_content(ContentReadLimits limits = {}, std::uint64_t offset = 0,
                                           std::stop_token stop = {}) const override {
         using Result = Observation<ContentRead>;
@@ -439,6 +442,214 @@ public:
         if (!FlushFileBuffers(handle_.get())) return failure<bool>(GetLastError(), "content.FlushFileBuffers");
         return Observation<bool>::available(true);
     }
+    Observation<std::unique_ptr<OpenedEntry>> open_metadata_replay_view(const MetadataReplayPolicy& policy) const override {
+        using Result=Observation<std::unique_ptr<OpenedEntry>>;
+        if (!policy.valid()) return Result::unavailable(ObservationState::Failed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidIdentifier),"metadata_replay.query_policy"});
+        const DWORD rights=FILE_READ_EA|READ_CONTROL|
+            (policy.scope==RegularMetadataScope::CompleteMetadataV1 ? ACCESS_SYSTEM_SECURITY : 0);
+        auto opened=metadata_security_handle(rights);
+        if (!opened.value()) {const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        // The original handle remains alive. OpenFileById verifies this query
+        // handle against its retained identity; no source basename is reopened.
+        return Result::available(std::make_unique<WindowsOpenedEntry>(std::move(opened).take_value(),scope_));
+    }
+    Observation<bool> qualify_stable_content() const override {
+        // A share-denying open cannot invalidate a writable section that was
+        // created before that open. No qualified asynchronous oplock token is
+        // held here, so old-target digest retention remains unsupported.
+        return Observation<bool>::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),
+             "stable_content.windows_existing_mappings_unqualified"});
+    }
+    Observation<bool> qualify_metadata_replay(const MetadataReplayPolicy& policy) const override {
+        using Result=Observation<bool>;
+        const auto refuse=[](const char* op){return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),op});};
+        if (!policy.valid()) return refuse("metadata_replay.policy");
+        const auto basic=inspect_basic();
+        if (!basic.value()) {const auto& e=*basic.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if (!basic.value()->kind.value() || *basic.value()->kind.value()!=ObjectKind::RegularFile ||
+            !basic.value()->link_count.value() || *basic.value()->link_count.value()!=1 || !basic.value()->windows_attributes.value())
+            return refuse("metadata_replay.windows_kind_links");
+        if (const auto guard=provider_guard(*basic.value())) return Result::unavailable(guard->state,guard->error);
+        constexpr DWORD supported=FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM|
+            FILE_ATTRIBUTE_ARCHIVE|FILE_ATTRIBUTE_NORMAL|FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+        if ((*basic.value()->windows_attributes.value() & ~supported)!=0)
+            return refuse("metadata_replay.windows_storage_provider");
+        DWORD flags=0;WCHAR filesystem[32]{};
+        if (!GetVolumeInformationByHandleW(handle_.get(),nullptr,0,nullptr,nullptr,&flags,filesystem,32))
+            return failure<bool>(GetLastError(),"metadata_replay.GetVolumeInformationByHandleW");
+        if ((std::wstring_view(filesystem)!=L"NTFS" && std::wstring_view(filesystem)!=L"ReFS") || (flags&FILE_PERSISTENT_ACLS)==0)
+            return refuse("metadata_replay.windows_unaudited_filesystem");
+        using QueryVolume=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,ULONG);
+        const auto query_address=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryVolumeInformationFile");
+        if (!query_address) return refuse("metadata_replay.windows_device_query");
+        struct DeviceInformation {ULONG type,characteristics;} device{};IO_STATUS_BLOCK io{};
+        const auto status=std::bit_cast<QueryVolume>(query_address)(handle_.get(),&io,&device,sizeof(device),4);
+        if (status!=0) return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
+            {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"metadata_replay.windows_device"});
+        if (io.Information!=sizeof(device) || (device.characteristics&0x10U)!=0)
+            return refuse("metadata_replay.windows_remote_provider_unqualified");
+        const auto channels=inspect_data_channels(policy.limits);
+        if (!channels.value()) {const auto& e=*channels.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if (channels.value()->coverage!=DataChannelCoverage::WindowsFileStreamInfo)
+            return refuse("metadata_replay.windows_stream_coverage");
+        for (const auto& channel:channels.value()->channels)
+            if (channel.kind!=DataChannelKind::MainData) return refuse("metadata_replay.windows_named_stream_unimplemented");
+        if (policy.scope==RegularMetadataScope::CompleteMetadataV1 && !policy.allow_privilege_metadata)
+            return refuse("metadata_replay.full_windows_security_requires_optin");
+        return Result::available(true);
+    }
+    Observation<bool> apply_replay_ownership(const BasicMetadata&, const MetadataReplayPolicy& policy) override {
+        using Result=Observation<bool>;
+        if (!policy.valid() || !content_write_access_ || !publication_)
+            return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_ownership");
+        if (policy.ownership==MetadataOwnership::Original) return Result::available(true); // descriptor phase sets original SIDs
+        HANDLE raw=nullptr;
+        if (!OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,TRUE,&raw)) {
+            if (GetLastError()!=ERROR_NO_TOKEN || !OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw))
+                return failure<bool>(GetLastError(),"metadata_replay.caller_token");
+        }
+        OwnedHandle token(raw);
+        const auto query=[&](TOKEN_INFORMATION_CLASS info)->Observation<NativeBytes> {
+            DWORD size=0;GetTokenInformation(token.get(),info,nullptr,0,&size);
+            if (!size || GetLastError()!=ERROR_INSUFFICIENT_BUFFER) return failure<NativeBytes>(GetLastError(),"metadata_replay.token_size");
+            NativeBytes data(size);
+            if (!GetTokenInformation(token.get(),info,data.data(),size,&size)) return failure<NativeBytes>(GetLastError(),"metadata_replay.token_query");
+            return Observation<NativeBytes>::available(std::move(data));
+        };
+        const auto owner=query(TokenOwner),group=query(TokenPrimaryGroup);
+        if (!owner.value() || !group.value()) {const auto& e=*(owner.value()?group:owner).unavailable_detail();return Result::unavailable(e.state,e.error);}
+        auto opened=metadata_security_handle(WRITE_OWNER|READ_CONTROL);
+        if (!opened.value()) {const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        const auto code=SetSecurityInfo(opened.value()->get(),SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION,
+            reinterpret_cast<const TOKEN_OWNER*>(owner.value()->data())->Owner,
+            reinterpret_cast<const TOKEN_PRIMARY_GROUP*>(group.value()->data())->PrimaryGroup,nullptr,nullptr);
+        if (code!=ERROR_SUCCESS) return failure<bool>(code,"metadata_replay.caller_SetSecurityInfo");
+        security_handle_=std::move(opened).take_value();
+        const auto captured=read_security(SecurityPart::WindowsAccess,policy.limits);
+        if (!captured.value()) {const auto& e=*captured.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        caller_security_=*captured.value();
+        return Result::available(true);
+    }
+    Observation<bool> apply_replay_attribute(const AttributeValue& value, const MetadataReplayPolicy& policy) override {
+        if (!policy.valid() || !publication_) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_attribute");
+        // Windows zero-sized EAs encode deletion, not a present empty value.
+        if (value.bytes.empty()) return Observation<bool>::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"metadata_replay.empty_windows_ea"});
+        return apply_nonsecurity_attribute(value);
+    }
+    Observation<bool> remove_replay_attribute(const NativeFeatureIdentifier& id, const MetadataReplayPolicy& policy) override {
+        if (!policy.valid() || !publication_) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_remove_attribute");
+        const auto basic=inspect_basic();
+        if (!basic.value()) {const auto& e=*basic.unavailable_detail();return Observation<bool>::unavailable(e.state,e.error);}
+        return apply_nonsecurity_attribute({id,{},basic.value()->identity,Observation<std::uint32_t>::available(0)});
+    }
+    Observation<bool> apply_replay_basic(const BasicMetadata& value, const MetadataReplayPolicy& policy) override {
+        if (!policy.valid() || !publication_) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_basic");
+        return apply_portable_basic_metadata(value);
+    }
+    Observation<bool> apply_replay_security(const NativeSecurityValue& source, const MetadataReplayPolicy& policy) override {
+        using Result=Observation<bool>;
+        if (!policy.valid() || !content_write_access_ || !publication_ || source.encoding!=SecurityEncoding::WindowsRelativeDescriptor ||
+            source.presence!=SecurityPresence::Present || !source.owner.value())
+            return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_security");
+        const auto checked=detail::validate_windows_descriptor(source.bytes,policy.limits);
+        if (!checked.value()) {const auto& e=*checked.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        SECURITY_INFORMATION mask=0;DWORD rights=READ_CONTROL;
+        switch(source.part) {
+        case SecurityPart::WindowsAccess:
+            mask=DACL_SECURITY_INFORMATION;rights|=WRITE_DAC;
+            if (policy.ownership==MetadataOwnership::Original) {mask|=OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION;rights|=WRITE_OWNER;}
+            break;
+        case SecurityPart::WindowsIntegrity:
+            // An unchanged label needs no privilege-affecting mutation.
+            if (!policy.allow_privilege_metadata) return verify_replay_security(source,policy);
+            mask=LABEL_SECURITY_INFORMATION;rights|=WRITE_OWNER;break;
+        case SecurityPart::WindowsFullDescriptor:
+            if (!policy.allow_privilege_metadata) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.full_security_optin");
+            mask=DACL_SECURITY_INFORMATION|SACL_SECURITY_INFORMATION|
+                LABEL_SECURITY_INFORMATION|ATTRIBUTE_SECURITY_INFORMATION|SCOPE_SECURITY_INFORMATION|
+                PROCESS_TRUST_LABEL_SECURITY_INFORMATION|ACCESS_FILTER_SECURITY_INFORMATION;
+            rights|=WRITE_DAC|WRITE_OWNER|ACCESS_SYSTEM_SECURITY;
+            if (policy.ownership==MetadataOwnership::Original) mask|=OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION;
+            break;
+        default:return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::NotApplicable),"metadata_replay.security_model"});
+        }
+        auto* descriptor=const_cast<std::byte*>(source.bytes.data());
+        PSID owner=nullptr,group=nullptr;PACL dacl=nullptr,sacl=nullptr;BOOL present=FALSE,defaulted=FALSE;
+        SECURITY_DESCRIPTOR_CONTROL control=0;DWORD revision=0;
+        if (!GetSecurityDescriptorControl(descriptor,&control,&revision) ||
+            !GetSecurityDescriptorOwner(descriptor,&owner,&defaulted) || !GetSecurityDescriptorGroup(descriptor,&group,&defaulted) ||
+            !GetSecurityDescriptorDacl(descriptor,&present,&dacl,&defaulted) || !GetSecurityDescriptorSacl(descriptor,&present,&sacl,&defaulted))
+            return failure<bool>(GetLastError(),"metadata_replay.descriptor_fields");
+        if (mask&DACL_SECURITY_INFORMATION) mask|=(control&SE_DACL_PROTECTED)?PROTECTED_DACL_SECURITY_INFORMATION:UNPROTECTED_DACL_SECURITY_INFORMATION;
+        if (mask&SACL_SECURITY_INFORMATION) mask|=(control&SE_SACL_PROTECTED)?PROTECTED_SACL_SECURITY_INFORMATION:UNPROTECTED_SACL_SECURITY_INFORMATION;
+        auto opened=metadata_security_handle(rights);
+        if (!opened.value()) {const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        // SetSecurityInfo reapplies parent inheritance, which can add ACEs
+        // to this already inventoried ACL. Replay the validated descriptor on
+        // the exact held staging object using the native security boundary.
+        using SetSecurity=NTSTATUS(NTAPI*)(HANDLE,SECURITY_INFORMATION,PSECURITY_DESCRIPTOR);
+        const auto address=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtSetSecurityObject");
+        if (!address) return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"metadata_replay.NtSetSecurityObject.resolve"});
+        const auto status=std::bit_cast<SetSecurity>(address)(opened.value()->get(),mask,descriptor);
+        if (status!=0) return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
+            {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"metadata_replay.NtSetSecurityObject"});
+        security_handle_=std::move(opened).take_value();
+        return verify_replay_security(source,policy);
+    }
+    Observation<bool> verify_replay_security(const NativeSecurityValue& source, const MetadataReplayPolicy& policy) const override {
+        using Result=Observation<bool>;
+        auto actual=read_security(source.part,policy.limits);
+        if (!actual.value()) {const auto& e=*actual.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        const auto mismatch=[](const char* operation) {return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),operation});};
+        auto* a=const_cast<std::byte*>(source.bytes.data());auto* b=const_cast<std::byte*>(actual.value()->bytes.data());
+        if (!detail::validate_windows_descriptor(source.bytes,policy.limits).value() || source.part!=actual.value()->part ||
+            source.native_query_mask!=actual.value()->native_query_mask) return mismatch("metadata_replay.windows_security_structure");
+        const auto same_sid=[](PSECURITY_DESCRIPTOR x,PSECURITY_DESCRIPTOR y,bool owner) {
+            PSID xs=nullptr,ys=nullptr;BOOL xd=FALSE,yd=FALSE;
+            const auto ok=owner?(GetSecurityDescriptorOwner(x,&xs,&xd)&&GetSecurityDescriptorOwner(y,&ys,&yd)):
+                (GetSecurityDescriptorGroup(x,&xs,&xd)&&GetSecurityDescriptorGroup(y,&ys,&yd));
+            return ok && xd==yd && ((!xs&&!ys)||(xs&&ys&&EqualSid(xs,ys)));
+        };
+        const auto acl_mismatch=[](PSECURITY_DESCRIPTOR x,PSECURITY_DESCRIPTOR y,bool dacl)->const char* {
+            PACL xs=nullptr,ys=nullptr;BOOL xp=FALSE,yp=FALSE,xd=FALSE,yd=FALSE;
+            const auto ok=dacl?(GetSecurityDescriptorDacl(x,&xp,&xs,&xd)&&GetSecurityDescriptorDacl(y,&yp,&ys,&yd)):
+                (GetSecurityDescriptorSacl(x,&xp,&xs,&xd)&&GetSecurityDescriptorSacl(y,&yp,&ys,&yd));
+            if (!ok) return "metadata_replay.windows_acl_query";
+            if (xp!=yp) return "metadata_replay.windows_acl_presence";
+            if (xd!=yd) return "metadata_replay.windows_acl_defaulted";
+            if (!xs!=!ys) return "metadata_replay.windows_acl_nullness";
+            if (!xs) return nullptr;
+            if (xs->AclRevision!=ys->AclRevision) return "metadata_replay.windows_acl_revision";
+            if (xs->AceCount!=ys->AceCount) return "metadata_replay.windows_acl_count";
+            if (xs->AclSize!=ys->AclSize) return "metadata_replay.windows_acl_allocation_size";
+            return std::memcmp(xs,ys,xs->AclSize)==0?nullptr:"metadata_replay.windows_acl_bytes";
+        };
+        if (source.part!=SecurityPart::WindowsIntegrity) {
+            auto* desired=policy.ownership==MetadataOwnership::Original?a:
+                caller_security_?const_cast<std::byte*>(caller_security_->bytes.data()):nullptr;
+            if (!desired) return mismatch("metadata_replay.windows_security_caller_missing");
+            if (!same_sid(desired,b,true)) return mismatch("metadata_replay.windows_security_owner");
+            if (!same_sid(desired,b,false)) return mismatch("metadata_replay.windows_security_group");
+            if (const auto* error=acl_mismatch(a,b,true)) return mismatch(error);
+        }
+        if (source.part!=SecurityPart::WindowsAccess) if (const auto* error=acl_mismatch(a,b,false)) return mismatch(error);
+        SECURITY_DESCRIPTOR_CONTROL ac=0,bc=0;DWORD ar=0,br=0;
+        if (!GetSecurityDescriptorControl(a,&ac,&ar)||!GetSecurityDescriptorControl(b,&bc,&br)) return mismatch("metadata_replay.windows_security_control_query");
+        const auto bits=source.part==SecurityPart::WindowsAccess ? SE_DACL_PROTECTED|SE_DACL_AUTO_INHERITED|SE_DACL_AUTO_INHERIT_REQ :
+            source.part==SecurityPart::WindowsIntegrity ? 0 : SE_DACL_PROTECTED|SE_DACL_AUTO_INHERITED|SE_DACL_AUTO_INHERIT_REQ|
+                SE_SACL_PROTECTED|SE_SACL_AUTO_INHERITED|SE_SACL_AUTO_INHERIT_REQ;
+        if ((ac&bits)!=(bc&bits)) return mismatch("metadata_replay.windows_security_control_bits");
+        return Result::available(true);
+    }
+    Observation<bool> rename_noreplace(const DirectoryCursor& source_parent, const DirectoryCursor& destination,
+                                     const NativeName& name) const override;
     Observation<bool> apply_portable_basic_metadata(const BasicMetadata& source) override {
         using Result = Observation<bool>;
         if (!content_write_access_)
@@ -817,7 +1028,7 @@ public:
         // remain native denial, not an empty descriptor or silently weaker query.
         auto bytes = detail::read_attribute_bytes([&](std::span<std::byte> buffer) -> detail::BufferReply {
             DWORD needed = 0;
-            const bool success = GetKernelObjectSecurity(handle_.get(), mask,
+            const bool success = GetKernelObjectSecurity(security_handle_ ? security_handle_.get() : handle_.get(), mask,
                 buffer.empty() ? nullptr : buffer.data(), static_cast<DWORD>(buffer.size()), &needed) != 0;
             const DWORD code = GetLastError();
             if (success) return static_cast<std::size_t>(needed);
@@ -866,11 +1077,34 @@ private:
             capacity = capacity > limits.max_native_bytes / 2 ? limits.max_native_bytes : capacity * 2;
         }
     }
+    Observation<OwnedHandle> metadata_security_handle(DWORD rights) const {
+        using Result=Observation<OwnedHandle>;
+        const auto held=identity(handle_.get(),scope_);
+        if (!held.value()) {const auto& e=*held.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        FILE_ID_DESCRIPTOR id{};id.dwSize=sizeof(id);
+        if (held.value()->scheme==IdentityScheme::WindowsFileId128) {
+            id.Type=ExtendedFileIdType;std::memcpy(id.ExtendedFileId.Identifier,held.value()->object.bytes.data(),16);
+        } else if (held.value()->scheme==IdentityScheme::WindowsFileIndex64) {
+            id.Type=FileIdType;std::memcpy(&id.FileId.QuadPart,held.value()->object.bytes.data(),8);
+        } else return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"metadata_replay.windows_id_scheme"});
+        OwnedHandle opened(OpenFileById(handle_.get(),&id,rights|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+            nullptr,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+        if (!opened || opened.get()==INVALID_HANDLE_VALUE) return failure<OwnedHandle>(GetLastError(),"metadata_replay.OpenFileById.security");
+        const auto checked=identity(opened.get(),scope_);
+        if (!checked.value() || compare_identity(*held.value(),*checked.value())!=IdentityComparison::Same)
+            return Result::unavailable(ObservationState::Changed,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_replay.security_handle_identity"});
+        return Result::available(std::move(opened));
+    }
+    OwnedHandle security_handle_;
+    std::optional<NativeSecurityValue> caller_security_;
     OwnedHandle handle_;
     AdapterScope scope_;
     bool layout_access_;
     bool content_access_ = false;
     bool content_write_access_ = false;
+    bool rename_access_ = false;
     std::unique_ptr<WindowsPublicationContext> publication_;
 };
 
@@ -977,10 +1211,18 @@ Observation<VolumeSpaceCounters> volume_space(HANDLE handle) {
 }
 
 class WindowsDirectoryCursor final : public DirectoryCursor {
+    friend class WindowsOpenedEntry;
 public:
     WindowsDirectoryCursor(OwnedHandle handle, Observation<ObjectIdentity> native_identity, AdapterScope scope)
         : DirectoryCursor(std::move(native_identity)), handle_(std::move(handle)), scope_(std::move(scope)) {}
     Observation<AdapterScope> source_scope() const override { return Observation<AdapterScope>::available(scope_); }
+    Observation<WindowsTrashHandle> duplicate_trash_parent() const {
+        HANDLE raw=nullptr;
+        if(!DuplicateHandle(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+            return Observation<WindowsTrashHandle>::unavailable(error_state(GetLastError()),
+                {ErrorDomain::Win32,GetLastError(),"trash.duplicate_parent"});
+        return Observation<WindowsTrashHandle>::available(WindowsTrashHandle(raw));
+    }
     Observation<BasicMetadata> inspect_basic() const override { return handle_metadata(handle_.get(), scope_); }
     Observation<std::unique_ptr<OpenedEntry>> open_parent_directory() const override { return open_windows_parent(handle_.get(), scope_); }
     Observation<std::unique_ptr<OpenedEntry>> create_child_file(const NativeName& name) const override {
@@ -1015,7 +1257,10 @@ public:
         HANDLE raw = nullptr;
         const NTSTATUS status = NtCreateFile(&raw, FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | DELETE,
             &attributes, &io, nullptr, FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE,
+            // Exclusion starts atomically with creation. No external writer
+            // or DELETE-bearing opener can race staged data/metadata or the
+            // held-handle publication; the original handle already has DELETE.
+            FILE_SHARE_READ, FILE_CREATE,
             FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_WRITE_THROUGH,
             nullptr, 0);
         OwnedHandle opened(raw);
@@ -1452,6 +1697,38 @@ public:
                 {ErrorDomain::Win32, GetLastError(), "trash_child.directory_flush"});
         return Result::available(true);
     }
+    Observation<bool> qualify_identity_bound_rename() const override {
+        using Result=Observation<bool>;
+        const auto refuse=[](const char* op) {return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),op});};
+        const auto basic=inspect_basic();
+        if (!basic.value()) {const auto& e=*basic.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if (!basic.value()->kind.value() || *basic.value()->kind.value()!=ObjectKind::Directory ||
+            !basic.value()->identity.value() || basic.value()->identity.value()->scheme!=IdentityScheme::WindowsFileId128 ||
+            compare_identity(*basic.value()->identity.value(),*basic.value()->identity.value())!=IdentityComparison::Same)
+            return refuse("rename.identity_bound.directory_identity");
+        const auto provider=provider_review_required(*basic.value(),StorageModel::WindowsHandleAttributes);
+        if (!provider.value()) {const auto& e=*provider.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if (*provider.value()) return refuse("rename.identity_bound.provider");
+        DWORD flags=0;WCHAR filesystem[32]{};
+        if (!GetVolumeInformationByHandleW(handle_.get(),nullptr,0,nullptr,nullptr,&flags,filesystem,32))
+            return failure<bool>(GetLastError(),"rename.identity_bound.volume");
+        if (std::wstring_view(filesystem)!=L"NTFS" && std::wstring_view(filesystem)!=L"ReFS") return refuse("rename.identity_bound.filesystem");
+        using QueryVolume=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,ULONG);
+        const auto address=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryVolumeInformationFile");
+        if (!address) return refuse("rename.identity_bound.device_query");
+        struct DeviceInformation {ULONG type,characteristics;} device{};
+        IO_STATUS_BLOCK io{};
+        // Documented FileFsDeviceInformation=4; FILE_REMOTE_DEVICE=0x10.
+        const auto status=std::bit_cast<QueryVolume>(address)(handle_.get(),&io,&device,sizeof(device),4);
+        if (status!=0) return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
+            {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"rename.identity_bound.device"});
+        if (io.Information!=sizeof(device) || (device.characteristics&0x10U)!=0)
+            return refuse("rename.identity_bound.remote_provider");
+        auto writable=open_namespace_write_handle();
+        if (!writable.value()) {const auto& e=*writable.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        return Result::available(true);
+    }
     Observation<bool> rename_child_noreplace(const NativeName& name, const ObjectIdentity& expected_identity,
                                               const DirectoryCursor& destination,
                                               const NativeName& destination_name) const override {
@@ -1847,17 +2124,18 @@ private:
     Observation<std::unique_ptr<OpenedEntry>> open_component(const NativeName& name, EntryAccess access, ChildLookupMode mode) const {
         if (!valid_entry_access(access)) return Observation<std::unique_ptr<OpenedEntry>>::unavailable(ObservationState::Failed,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidAccess), "open_child.access"});
-        const auto rights = FILE_READ_ATTRIBUTES | SYNCHRONIZE | (requests_content_read(access) ? FILE_READ_DATA : 0) |
+        const auto rights = FILE_READ_ATTRIBUTES | SYNCHRONIZE | ((requests_content_read(access) || (requests_rename_source(access) && requests_layout(access))) ? FILE_READ_DATA : 0) |
             (requests_attributes(access) ? FILE_READ_EA : 0) |
-            (requests_security(access) ? READ_CONTROL : 0) | (requests_audit_security(access) ? ACCESS_SYSTEM_SECURITY : 0);
-        auto result = open_native_component(name, rights, mode, requests_move_source(access));
+            (requests_security(access) ? READ_CONTROL : 0) | (requests_audit_security(access) ? ACCESS_SYSTEM_SECURITY : 0) |
+            (requests_rename_source(access) ? DELETE : 0);
+        auto result = open_native_component(name, rights, mode, requests_move_source(access), requests_rename_source(access));
         if (!result.value()) {
             const auto& error = *result.unavailable_detail();
             return Observation<std::unique_ptr<OpenedEntry>>::unavailable(error.state, error.error);
         }
         using Result = Observation<std::unique_ptr<OpenedEntry>>;
-        auto original = std::make_unique<WindowsOpenedEntry>(std::move(result).take_value(), scope_, false,
-                                                             requests_content_read(access));
+        auto original = std::make_unique<WindowsOpenedEntry>(std::move(result).take_value(), scope_, requests_rename_source(access) && requests_layout(access),
+                                                             requests_content_read(access), false, nullptr, requests_rename_source(access));
         if (!requests_layout(access)) return Result::available(std::move(original));
         const auto before = original->inspect_basic();
         if (!before.value()) { const auto& e = *before.unavailable_detail(); return Result::unavailable(e.state, e.error); }
@@ -1866,6 +2144,16 @@ private:
         const auto* id = before.value()->identity.value();
         if (!id || compare_identity(*id, *id) != IdentityComparison::Same) return Result::unavailable(ObservationState::Unknown,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity), "layout.open_identity"});
+        if (requests_rename_source(access)) {
+            // A second DELETE-bearing open would conflict with this guard's
+            // deny-DELETE sharing. Layout query rights were requested on the
+            // original handle; keep that exact handle for queries and rename.
+            const auto after=original->inspect_basic();
+            if (!after.value()) {const auto& e=*after.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            const auto checked=detail::data_layout_metadata_unchanged(*before.value(),*after.value());
+            if (!checked.value()) {const auto& e=*checked.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            return Result::available(std::move(original));
+        }
         FILE_ID_DESCRIPTOR descriptor{}; descriptor.dwSize = sizeof(descriptor);
         if (id->scheme == IdentityScheme::WindowsFileId128) {
             descriptor.Type = ExtendedFileIdType; std::memcpy(descriptor.ExtendedFileId.Identifier, id->object.bytes.data(), 16);
@@ -1877,10 +2165,11 @@ private:
         // reuse. Native identity open avoids a basename-replacement race. No
         // backup privilege, elevation, name fallback or content read is used.
         OwnedHandle readable(OpenFileById(original->handle_.get(), &descriptor, rights | FILE_READ_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL));
+            requests_rename_source(access) ? FILE_SHARE_READ :
+            requests_move_source(access) ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL));
         if (readable.get() == nullptr || readable.get() == INVALID_HANDLE_VALUE) return failure<std::unique_ptr<OpenedEntry>>(GetLastError(), "OpenFileById.layout");
         auto opened = std::make_unique<WindowsOpenedEntry>(std::move(readable), scope_, true,
-                                                           requests_content_read(access));
+                                                           requests_content_read(access), false, nullptr, requests_rename_source(access));
         const auto after = opened->inspect_basic();
         if (!after.value()) { const auto& e = *after.unavailable_detail(); return Result::unavailable(e.state, e.error); }
         const auto checked = detail::data_layout_metadata_unchanged(*before.value(), *after.value());
@@ -1926,7 +2215,7 @@ private:
         return Result::available(std::move(opened));
     }
     Observation<OwnedHandle> open_native_component(const NativeName& name, ACCESS_MASK rights, ChildLookupMode mode,
-                                                   bool exclusive = false) const {
+                                                   bool exclusive = false, bool rename_guard = false) const {
         using Result = Observation<OwnedHandle>;
         const auto* units = name.windows_units();
         if (!units || !name.is_valid() || units->find(u':') != std::u16string::npos ||
@@ -1952,7 +2241,8 @@ private:
         attributes.Attributes=mode==ChildLookupMode::WindowsIgnoreCase?OBJ_CASE_INSENSITIVE:0;
         IO_STATUS_BLOCK io{};
         HANDLE raw = nullptr;
-        const auto sharing = exclusive ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        const auto sharing = rename_guard ? FILE_SHARE_READ :
+            exclusive ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         const NTSTATUS status = NtCreateFile(&raw, rights, &attributes, &io, nullptr, 0,
             sharing, FILE_OPEN,
             FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
@@ -1999,6 +2289,44 @@ private:
     std::optional<std::size_t> offset_;
     bool started_ = false;
 };
+
+Observation<bool> WindowsOpenedEntry::rename_noreplace(const DirectoryCursor& source_parent,
+    const DirectoryCursor& destination, const NativeName& name) const {
+    using Result=Observation<bool>;
+    if (!rename_access_) return failure<bool>(ERROR_ACCESS_DENIED,"rename_noreplace.held_guard_required");
+    const auto* from=dynamic_cast<const WindowsDirectoryCursor*>(&source_parent);
+    const auto* to=dynamic_cast<const WindowsDirectoryCursor*>(&destination);
+    if (!from || !to) return OpenedEntry::rename_noreplace(source_parent,destination,name);
+    for (const auto* cursor:{from,to}) {
+        auto qualified=cursor->qualify_identity_bound_rename();
+        if (!qualified.value() || !*qualified.value()) return qualified;
+    }
+    const auto held=inspect_basic();
+    if (!held.value()) {const auto& e=*held.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    if (!held.value()->identity.value() || !held.value()->kind.value() || *held.value()->kind.value()!=ObjectKind::RegularFile ||
+        !held.value()->link_count.value() || *held.value()->link_count.value()!=1 ||
+        held.value()->identity.value()->scheme!=IdentityScheme::WindowsFileId128)
+        return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"rename_noreplace.held_kind_identity_links"});
+    const auto source_id=from->identity(),destination_id=to->identity();
+    if (!source_id.value() || !destination_id.value() ||
+        source_id.value()->scope!=scope_ || destination_id.value()->scope!=scope_ ||
+        source_id.value()->volume!=held.value()->identity.value()->volume ||
+        destination_id.value()->volume!=held.value()->identity.value()->volume)
+        return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"rename_noreplace.held_volume"});
+    const auto provider=provider_review_required(*held.value(),StorageModel::WindowsHandleAttributes);
+    if (!provider.value()) {const auto& e=*provider.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    if (*provider.value()) return Result::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"rename_noreplace.held_provider"});
+    auto source_flush=from->open_namespace_write_handle();
+    if (!source_flush.value()) {const auto& e=*source_flush.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    auto renamed=to->publish_noreplace(handle_.get(),name);
+    if (!renamed.value() || !*renamed.value()) return renamed;
+    if (!FlushFileBuffers(source_flush.value()->get())) return Result::unavailable(ObservationState::Unknown,
+        {ErrorDomain::Win32,GetLastError(),"rename_noreplace.held_source_directory_flush"});
+    return Result::available(true);
+}
 
 Observation<bool> WindowsOpenedEntry::publish_noreplace(const DirectoryCursor& destination, const NativeName& name) {
     using Result = Observation<bool>;
@@ -2091,4 +2419,11 @@ Observation<std::unique_ptr<DirectoryCursor>> NativeFileSystem::open_directory(
     auto native_identity = identity(handle.get(), scope_);
     return Result::available(std::make_unique<WindowsDirectoryCursor>(std::move(handle), std::move(native_identity), scope_));
 }
+Observation<WindowsTrashHandle> duplicate_windows_trash_parent(const DirectoryCursor& cursor) {
+    const auto* native=dynamic_cast<const WindowsDirectoryCursor*>(&cursor);
+    if (!native) return Observation<WindowsTrashHandle>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::UnsupportedQuery),"trash.native_parent"});
+    return native->duplicate_trash_parent();
+}
+
 } // namespace ck::files

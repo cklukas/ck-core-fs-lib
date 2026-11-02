@@ -238,6 +238,12 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
             !same(*metadata.value()->identity.value(), state->request.source_identity) ||
             *metadata.value()->kind.value() != ObjectKind::RegularFile)
             return Observation<bool>::available(false);
+        if (state->request.operation == FileOperation::Move) {
+            const auto stable = (*opened.value())->qualify_stable_content();
+            if (!stable.value()) return unavailable_bool(*stable.unavailable_detail());
+            if (!*stable.value()) return rejected<bool>(AdapterError::ProviderReviewRequired,
+                "native_operation_copy.move_stable_content",ObservationState::Unsupported);
+        }
         state->source = std::move(opened).take_value();
         state->source_exclusion = state->request.operation == FileOperation::Move;
         return Observation<bool>::available(true);
@@ -346,9 +352,23 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
                 auto verified = state->request.verify_metadata_before_publication(*state->staging, stop);
                 if (!verified.value() || !*verified.value()) return verified;
             }
+            bool retained_target = false;
+            if (state->request.prepare_destination_before_publication) {
+                auto prepared = state->request.prepare_destination_before_publication(stop);
+                if (!prepared.value() || !*prepared.value()) return prepared;
+                retained_target = true;
+            }
             auto published = state->staging->publish_noreplace(*state->request.destination,
                                                                 state->request.destination_name);
-            if (!published.value()) return unavailable_bool(*published.unavailable_detail());
+            if (!published.value()) {
+                if (retained_target) return Observation<bool>::unavailable(ObservationState::Unknown,
+                    published.unavailable_detail()->error);
+                return unavailable_bool(*published.unavailable_detail());
+            }
+            if (retained_target && !*published.value())
+                return Observation<bool>::unavailable(ObservationState::Unknown,
+                    {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidNativeResult),
+                     "native_operation_copy.retained_target_publication"});
             return Observation<bool>::available(*published.value());
         };
         if (state->request.operation == FileOperation::Move) {
@@ -357,12 +377,21 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
                     return Observation<SourceStabilityGuarantee>::unavailable(ObservationState::Unsupported,
                         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery),
                          "native_operation_copy.source_exclusion"});
+                const auto stable = state->source->qualify_stable_content();
+                if (!stable.value()) return Observation<SourceStabilityGuarantee>::unavailable(stable.state(),stable.unavailable_detail()->error);
+                if (!*stable.value()) return Observation<SourceStabilityGuarantee>::unavailable(ObservationState::Unsupported,
+                    {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),
+                     "native_operation_copy.move_stable_content"});
                 return Observation<SourceStabilityGuarantee>::available(SourceStabilityGuarantee::EnforcedExclusion);
             };
             commit.retire_source = [state](std::stop_token) {
                 if (!state->source || !state->request.source_parent)
                     return rejected<bool>(AdapterError::InvalidNativeResult,
                                           "native_operation_copy.retire_source_handle");
+                const auto stable = state->source->qualify_stable_content();
+                if (!stable.value()) return unavailable_bool(*stable.unavailable_detail());
+                if (!*stable.value()) return rejected<bool>(AdapterError::ProviderReviewRequired,
+                    "native_operation_copy.move_stable_content",ObservationState::Unsupported);
                 auto retired = state->request.source_parent->retire_child(
                     state->request.source_name, state->request.source_identity);
                 if (!retired.value())
@@ -455,8 +484,9 @@ Observation<OperationBatchJob::Pointer> create_native_operation_copy_batch(
             return rejected<OperationBatchJob::Pointer>(AdapterError::UnqualifiedIdentity,
                                                          "native_operation_copy_batch.source_identity");
 
-        auto preservation = RegularMetadataPreservation::create(
-            source, request.policy.allow_unhandled_metadata_loss, request.policy.metadata_scope);
+        auto preservation = request.policy.metadata_policy ? RegularMetadataPreservation::create_with_policy(
+            source,request.policy.allow_unhandled_metadata_loss,*request.policy.metadata_policy) :
+            RegularMetadataPreservation::create(source, request.policy.allow_unhandled_metadata_loss, request.policy.metadata_scope);
         if (!preservation.value())
             return Observation<OperationBatchJob::Pointer>::unavailable(
                 preservation.unavailable_detail()->state, preservation.unavailable_detail()->error);

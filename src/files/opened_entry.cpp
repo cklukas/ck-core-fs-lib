@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "opened_entry.hpp"
+#include "metadata_replay.hpp"
 #include "native_name.hpp"
 
 namespace ck::files {
@@ -80,6 +81,16 @@ Observation<bool> OpenedEntry::flush_content() {
     return Observation<bool>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "content.flush_native_query"});
 }
+Observation<bool> OpenedEntry::qualify_stable_content() const {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),
+         "stable_content.native_freeze_unqualified"});
+}
+Observation<std::unique_ptr<OpenedEntry>> OpenedEntry::open_metadata_replay_view(const MetadataReplayPolicy&) const {
+    // POSIX adapters query the existing fd/verified fd proxy. Windows must
+    // explicitly acquire its additional EA and security query rights.
+    return Observation<std::unique_ptr<OpenedEntry>>::available(nullptr);
+}
 Observation<bool> OpenedEntry::qualify_ordinary_regular_metadata() const {
     return Observation<bool>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),
@@ -100,11 +111,49 @@ Observation<bool> OpenedEntry::apply_nonsecurity_attribute(const AttributeValue&
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery),
          "attributes.nonsecurity_native_query"});
 }
+Observation<bool> OpenedEntry::qualify_metadata_replay(const MetadataReplayPolicy&) const {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::ProviderReviewRequired), "metadata_replay.native_coverage"});
+}
+Observation<bool> OpenedEntry::apply_replay_ownership(const BasicMetadata&, const MetadataReplayPolicy&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "metadata_replay.native_ownership"});
+}
+Observation<bool> OpenedEntry::apply_replay_attribute(const AttributeValue&, const MetadataReplayPolicy&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "metadata_replay.native_attribute"});
+}
+Observation<bool> OpenedEntry::remove_replay_attribute(const NativeFeatureIdentifier&, const MetadataReplayPolicy&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "metadata_replay.native_remove_attribute"});
+}
+Observation<bool> OpenedEntry::apply_replay_security(const NativeSecurityValue&, const MetadataReplayPolicy&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "metadata_replay.native_security"});
+}
+Observation<bool> OpenedEntry::verify_replay_security(const NativeSecurityValue& source, const MetadataReplayPolicy& policy) const {
+    auto actual=read_security(source.part,policy.limits);
+    if(!actual.value()) { const auto& e=*actual.unavailable_detail(); return Observation<bool>::unavailable(e.state,e.error); }
+    const auto& a=*actual.value();
+    if(a.part!=source.part || a.encoding!=source.encoding || a.presence!=source.presence ||
+       a.bytes!=source.bytes || a.native_query_mask!=source.native_query_mask)
+        return Observation<bool>::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "metadata_replay.security_bytes"});
+    return Observation<bool>::available(true);
+}
+Observation<bool> OpenedEntry::apply_replay_basic(const BasicMetadata&, const MetadataReplayPolicy&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "metadata_replay.native_basic"});
+}
 Observation<bool> OpenedEntry::publish_noreplace(const DirectoryCursor&, const NativeName& name) {
     if (!name.is_valid())
         return Observation<bool>::unavailable(ObservationState::Failed,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidIdentifier), "publish_noreplace.name"});
     return Observation<bool>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "publish_noreplace.native_query"});
+}
+Observation<bool> OpenedEntry::rename_noreplace(const DirectoryCursor&, const DirectoryCursor&, const NativeName&) const {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "rename_noreplace.held_source_native"});
 }
 } // namespace ck::files

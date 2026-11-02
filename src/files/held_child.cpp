@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "held_child.hpp"
+#include "metadata_replay.hpp"
 #include <limits>
 
 namespace ck::files {
@@ -82,7 +83,24 @@ bool HeldChild::continues(const HeldChild& previous) const noexcept {
 Observation<bool> HeldChild::qualify_ordinary_regular_metadata() const {
     return child_->qualify_ordinary_regular_metadata();
 }
+Observation<MetadataReplaySnapshot> HeldChild::capture_metadata(MetadataReplayPolicy policy, std::stop_token stop) const {
+    return capture_metadata_replay(*child_, policy, stop);
+}
+Observation<bool> HeldChild::verify_metadata_source(const MetadataReplaySnapshot& snapshot, std::stop_token stop) const {
+    return verify_metadata_replay_source(*child_, snapshot, stop);
+}
 Observation<BasicMetadata> HeldChild::inspect_basic() const { return child_->inspect_basic(); }
+Observation<bool> HeldChild::qualify_stable_content() const {
+    return child_->qualify_stable_content();
+}
+Observation<bool> HeldChild::rename_noreplace(const DirectoryCursor& destination, const NativeName& name,
+                                             std::stop_token stop) const {
+    if (stop.stop_requested()) return Observation<bool>::unavailable(ObservationState::Unknown,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InterruptedRead), "held_child.rename_cancelled"});
+    if (!requests_rename_source(access_)) return Observation<bool>::unavailable(ObservationState::Denied,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidAccess), "held_child.rename_access"});
+    return child_->rename_noreplace(*parent_,destination,name);
+}
 Observation<LinkMetadata> HeldChild::read_link_metadata(InventoryLimits limits) const {
     return child_->read_link_metadata(limits);
 }

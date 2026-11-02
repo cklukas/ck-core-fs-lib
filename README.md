@@ -5,16 +5,21 @@ frontends. The project has no ckVision, terminal, Motif, or UI dependency.
 
 The public boundary is the exception-free opaque-handle C API in
 `include/ck_file_engine.h`. C++ consumers use the same native implementation
-through the exported `ck::ck_core_fs_engine`/`ck_files_platform` targets while
+through the exported `ck::ck_core_fs_engine`, `ck_files_platform`, and
+`ck_core_fs_native` targets while
 the C ABI provides stable ownership, polling, cancellation, structured
 metadata, and terminal job states.
 
-The first consumable revision exposes held-handle directory/entry inspection
-and journaled regular-file copy and move jobs. The planned operation model is
+The C ABI includes held-handle inspection, journaled regular-file jobs,
+native reviewed-tree workers, action jobs, and durable session contracts.
+The implemented scopes and their provider limits are described in
+[`docs/native-contracts.md`](docs/native-contracts.md). Qualification is tracked
+per revision; enum values and safe refusals do not establish feature readiness.
+The operation model is
 documented in [`docs/operation-planning.md`](docs/operation-planning.md):
 versioned preservation policy, bounded comparison/planning, reviewed conflict
 receipts, recursive update/sync/mirror execution, rename/delete/Trash adapters,
-events, and recovery. These remain explicit extensions; the implementation
+events, and recovery. The implementation
 must not collapse them into frontend policy or shell out to another tool.
 
 Windows code must retain wide/native handle boundaries and extended-length

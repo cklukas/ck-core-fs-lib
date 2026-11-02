@@ -5,6 +5,7 @@
 #endif
 #include "native_filesystem.hpp"
 #include "native_home.hpp"
+#include "metadata_replay.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -32,6 +33,7 @@
 #include <sys/xattr.h>
 #if defined(__APPLE__)
 #include <sys/acl.h>
+#include <libkern/OSByteOrder.h>
 #include <sys/attr.h>
 #include <sys/mount.h>
 #include <sys/stdio.h>
@@ -42,6 +44,7 @@
 #include <sys/vfs.h>
 #include <linux/magic.h>
 #include <linux/fs.h>
+#include <linux/capability.h>
 #if __has_include(<linux/fscrypt.h>)
 #include <linux/fscrypt.h>
 #endif
@@ -567,6 +570,8 @@ public:
         if (!content_write_access_ || !publication_)
             return Result::unavailable(ObservationState::Denied,
                 adapter_error(AdapterError::InvalidAccess, "regular_metadata.ownership_staging_only"));
+        const auto ownership=qualify_ownership_semantics();
+        if (!ownership.value()) {const auto& e=*ownership.unavailable_detail();return Result::unavailable(e.state,e.error);}
         struct stat native{};
         if (fstat(descriptor_.get(), &native) != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "regular_metadata.ownership_before"});
@@ -592,6 +597,8 @@ public:
             return Result::unavailable(ObservationState::Unsupported,
                 adapter_error(AdapterError::ProviderReviewRequired, operation));
         };
+        const auto ownership=qualify_ownership_semantics();
+        if (!ownership.value()) {const auto& e=*ownership.unavailable_detail();return Result::unavailable(e.state,e.error);}
         auto before = inspect_basic();
         if (!before.value()) return refuse("regular_metadata.basic_coverage");
         const auto& basic = *before.value();
@@ -654,6 +661,120 @@ public:
         const auto acl = read_security(SecurityPart::DarwinExtendedAcl);
         if (!acl.value() || acl.value()->presence != SecurityPresence::Absent)
             return refuse("regular_metadata.required_security_name");
+#endif
+        PosixOpenedEntry query(std::move(readable), scope_, true);
+        const auto layout = query.inspect_data_layout();
+        if (!layout.value() || !basic.logical_size.value() ||
+            layout.value()->logical_size != *basic.logical_size.value())
+            return refuse("regular_metadata.layout_coverage");
+        const auto& ranges = layout.value()->ranges;
+        const auto size = *basic.logical_size.value();
+        if ((size == 0 && !ranges.empty()) || (size != 0 &&
+            (ranges.size() != 1 || ranges.front().offset != 0 || ranges.front().length != size)))
+            return refuse("regular_metadata.sparse_layout");
+        const auto after = inspect_basic();
+        if (!after.value()) return refuse("regular_metadata.final_basic_coverage");
+        auto unchanged = detail::data_layout_metadata_unchanged(basic, *after.value());
+        if (!unchanged.value() || !*unchanged.value()) return refuse("regular_metadata.changed_during_qualification");
+        return Result::available(true);
+    }
+    Observation<bool> qualify_metadata_replay(const MetadataReplayPolicy& policy) const override {
+        using Result = Observation<bool>;
+        const auto refuse = [](const char* operation) {
+            return Result::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::ProviderReviewRequired, operation));
+        };
+        if (!policy.valid()) return refuse("metadata_replay.policy");
+        const auto ownership=qualify_ownership_semantics();
+        if (!ownership.value()) {const auto& e=*ownership.unavailable_detail();return Result::unavailable(e.state,e.error);}
+#if defined(__linux__)
+        if (policy.scope == RegularMetadataScope::CompleteMetadataV1) {
+            // trusted.* enumeration needs effective CAP_SYS_ADMIN in the
+            // initial user namespace, not merely uid 0 in a container.
+            __user_cap_header_struct header{};header.version=_LINUX_CAPABILITY_VERSION_3;
+            __user_cap_data_struct capabilities[2]{};
+            if (syscall(SYS_capget,&header,capabilities)!=0)
+                return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.capget"});
+            if ((capabilities[CAP_SYS_ADMIN/32].effective & (1U<<(CAP_SYS_ADMIN%32)))==0)
+                return refuse("metadata_replay.complete_requires_initial_sys_admin");
+            OwnedDescriptor mapping(open("/proc/self/uid_map",O_RDONLY|O_CLOEXEC));
+            if (mapping.get()<0) return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.uid_map"});
+            struct statfs mapfs{};
+            if (fstatfs(mapping.get(),&mapfs)!=0 || static_cast<unsigned long>(mapfs.f_type)!=static_cast<unsigned long>(PROC_SUPER_MAGIC))
+                return refuse("metadata_replay.initial_user_namespace_unqualified");
+            char bytes[128]{};const auto count=read(mapping.get(),bytes,sizeof(bytes)-1);
+            if (count<0) return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.uid_map_read"});
+            std::istringstream parsed(std::string(bytes,static_cast<std::size_t>(count)));
+            std::uint64_t inside=1,outside=1,length=0;std::string trailing;
+            if (!(parsed>>inside>>outside>>length) || inside!=0 || outside!=0 || length!=4294967295ULL || (parsed>>trailing))
+                return refuse("metadata_replay.initial_user_namespace_unqualified");
+        }
+#endif
+        auto before = inspect_basic();
+        if (!before.value()) return refuse("regular_metadata.basic_coverage");
+        const auto& basic = *before.value();
+        if (!basic.kind.value() || *basic.kind.value() != ObjectKind::RegularFile ||
+            !basic.posix_permissions.value() ||
+            !basic.link_count.value() || *basic.link_count.value() != 1)
+            return refuse("regular_metadata.kind_mode_links");
+#if defined(__linux__)
+        if (policy.scope==RegularMetadataScope::CompleteMetadataV1 && basic.created.value())
+            return refuse("metadata_replay.ext4_birthtime_setter_unavailable");
+#endif
+        const auto storage = inspect_storage();
+        if (!storage.value() || !storage.value()->flags.value() || storage.value()->flags.value()->value != 0)
+            return refuse("regular_metadata.storage_flags");
+        OwnedDescriptor readable(-1);
+#if defined(__linux__)
+        struct statfs filesystem{};
+        if (fstatfs(descriptor_.get(), &filesystem) != 0 || filesystem.f_type != EXT4_SUPER_MAGIC)
+            return refuse("regular_metadata.unaudited_linux_filesystem");
+        // Acquire metadata-query read rights from the verified held-fd proxy,
+        // never the original basename, and without privilege/elevation.
+        const auto proxy = attribute_proxy();
+        if (!proxy.value()) return refuse("regular_metadata.held_descriptor_proxy");
+        readable = OwnedDescriptor(open(proxy.value()->c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC));
+        if (readable.get() < 0) return refuse("regular_metadata.held_descriptor_read_access");
+        struct stat original{}, reopened{};
+        if (fstat(descriptor_.get(), &original) != 0 || fstat(readable.get(), &reopened) != 0 ||
+            original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino || !S_ISREG(reopened.st_mode))
+            return refuse("regular_metadata.held_handle_identity");
+        int flags = 0;
+        // EXTENTS is an ordinary ext4 representation, not replayable policy.
+        // All other flags, including unknown bits, require separate review.
+        if (ioctl(readable.get(), FS_IOC_GETFLAGS, &flags) != 0 ||
+            (static_cast<unsigned>(flags) & ~static_cast<unsigned>(FS_EXTENT_FL)) != 0)
+            return refuse("regular_metadata.inode_flags");
+        struct fsxattr extended{};
+        if (ioctl(readable.get(), FS_IOC_FSGETXATTR, &extended) != 0 || extended.fsx_xflags != 0 ||
+            extended.fsx_projid != 0 || extended.fsx_extsize != 0 || extended.fsx_cowextsize != 0)
+            return refuse("regular_metadata.project_storage_policy");
+
+#else
+        struct statfs filesystem{};
+        if (fstatfs(descriptor_.get(), &filesystem) != 0 ||
+            (std::strcmp(filesystem.f_fstypename, "apfs") != 0 && std::strcmp(filesystem.f_fstypename, "hfs") != 0))
+            return refuse("regular_metadata.unaudited_darwin_filesystem");
+        readable = OwnedDescriptor(fcntl(descriptor_.get(), F_DUPFD_CLOEXEC, 0));
+        if (readable.get() < 0) return refuse("regular_metadata.held_descriptor");
+
+#endif
+#if defined(__linux__)
+        const auto catalog=inspect_attributes(policy.limits);
+        if (!catalog.value()) {const auto& e=*catalog.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        for (const auto* security_name:{"security.capability","security.selinux","security.SMACK64","security.SMACK64EXEC",
+            "security.SMACK64MMAP","security.SMACK64TRANSMUTE","security.SMACK64IPIN","security.SMACK64IPOUT","security.ima","security.evm"}) {
+            const auto id=*NativeFeatureIdentifier::from_posix(security_name);
+            const auto probe=read_attribute(id,policy.limits);
+            if (!probe.value()) {
+                const auto& e=*probe.unavailable_detail();
+                if (e.error.domain==ErrorDomain::Posix && e.error.code==ENODATA) continue;
+                return Result::unavailable(e.state,e.error);
+            }
+            if (std::none_of(catalog.value()->attributes.begin(),catalog.value()->attributes.end(),
+                [&](const auto& attribute){return attribute.identifier==id;}))
+                return refuse("metadata_replay.linux_unlisted_security_attribute");
+        }
 #endif
         PosixOpenedEntry query(std::move(readable), scope_, true);
         const auto layout = query.inspect_data_layout();
@@ -781,6 +902,158 @@ public:
             compare_identity(*before.value()->identity.value(), *after.value()->identity.value()) != IdentityComparison::Same)
             return Result::unavailable(ObservationState::Changed,
                 adapter_error(AdapterError::MetadataChanged, "attributes.nonsecurity.identity"));
+        return Result::available(true);
+    }
+    Observation<bool> apply_replay_ownership(const BasicMetadata& source, const MetadataReplayPolicy& policy) override {
+        using Result = Observation<bool>;
+        if (!policy.valid() || !content_write_access_ || !publication_)
+            return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess, "metadata_replay.staging_ownership"));
+        const auto ownership=qualify_ownership_semantics();
+        if (!ownership.value()) {const auto& e=*ownership.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if (policy.ownership == MetadataOwnership::CurrentCaller) return apply_current_caller_ownership();
+        if (!source.posix_uid.value() || !source.posix_gid.value() ||
+            *source.posix_uid.value() >= std::numeric_limits<uid_t>::max() ||
+            *source.posix_gid.value() >= std::numeric_limits<gid_t>::max())
+            return Result::unavailable(ObservationState::Unsupported, adapter_error(AdapterError::UnsupportedQuery, "metadata_replay.original_owner_range"));
+        if (fchown(descriptor_.get(), static_cast<uid_t>(*source.posix_uid.value()), static_cast<gid_t>(*source.posix_gid.value())) != 0)
+            return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "metadata_replay.fchown_original"});
+        return Result::available(true);
+    }
+    Observation<bool> apply_replay_attribute(const AttributeValue& value, const MetadataReplayPolicy& policy) override {
+        using Result = Observation<bool>;
+        const auto* name = value.identifier.posix_bytes();
+        if (!policy.valid() || !content_write_access_ || !publication_ || !name || !NativeFeatureIdentifier::from_posix(*name))
+            return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess, "metadata_replay.staging_attribute"));
+        if (value.bytes.size() > policy.limits.max_native_bytes || !value.owner.value() ||
+            compare_identity(*value.owner.value(), *value.owner.value()) != IdentityComparison::Same)
+            return Result::unavailable(ObservationState::Failed, adapter_error(AdapterError::InvalidIdentifier, "metadata_replay.attribute_value"));
+        if ((name->starts_with("security.") || *name == "com.apple.macl" || *name == "com.apple.rootless" || name->starts_with("trusted.")) && !policy.allow_privilege_metadata)
+            return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess, "metadata_replay.attribute_optin"));
+        if (attribute_role(value.identifier) == AttributeRole::StorageRepresentation)
+            return Result::unavailable(ObservationState::Unsupported, adapter_error(AdapterError::ProviderReviewRequired, "metadata_replay.storage_attribute"));
+#if defined(__linux__)
+        if (fsetxattr(descriptor_.get(), name->c_str(), value.bytes.data(), value.bytes.size(), 0) != 0)
+#else
+        // Opaque com.apple.provenance is replayed byte-for-byte, like every
+        // inventoried native xattr. Never filtered by copyfile export policy.
+        if (fsetxattr(descriptor_.get(), name->c_str(), value.bytes.data(), value.bytes.size(), 0, 0) != 0)
+#endif
+            return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "metadata_replay.fsetxattr"});
+        return Result::available(true);
+    }
+    Observation<bool> remove_replay_attribute(const NativeFeatureIdentifier& id, const MetadataReplayPolicy& policy) override {
+        using Result = Observation<bool>;
+        const auto* name=id.posix_bytes();
+        if (!policy.valid() || !content_write_access_ || !publication_ || !name || !NativeFeatureIdentifier::from_posix(*name))
+            return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess,"metadata_replay.staging_remove_attribute"));
+        if ((name->starts_with("security.") || *name == "com.apple.macl" || *name == "com.apple.rootless" || name->starts_with("trusted.")) && !policy.allow_privilege_metadata)
+            return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess,"metadata_replay.remove_attribute_optin"));
+#if defined(__linux__)
+        if (fremovexattr(descriptor_.get(),name->c_str()) != 0 && errno != ENODATA)
+#else
+        if (fremovexattr(descriptor_.get(),name->c_str(),0) != 0 && errno != ENOATTR)
+#endif
+            return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.fremovexattr"});
+        return Result::available(true);
+    }
+    Observation<bool> apply_replay_security(const NativeSecurityValue& value, const MetadataReplayPolicy& policy) override {
+        using Result = Observation<bool>;
+        if (!policy.valid() || !content_write_access_ || !publication_ || !value.owner.value() ||
+            value.bytes.size() > policy.limits.max_native_bytes ||
+            (value.presence != SecurityPresence::Present && value.presence != SecurityPresence::Absent) ||
+            (value.presence == SecurityPresence::Absent && !value.bytes.empty()))
+            return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess,"metadata_replay.staging_security"));
+        const auto ownership=qualify_ownership_semantics();
+        if (!ownership.value()) {const auto& e=*ownership.unavailable_detail();return Result::unavailable(e.state,e.error);}
+#if defined(__linux__)
+        if (value.part != SecurityPart::LinuxAccessAcl || value.encoding != SecurityEncoding::LinuxPosixAclXattrV2)
+            return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::NotApplicable,"metadata_replay.acl_model"));
+        const auto id=*NativeFeatureIdentifier::from_posix("system.posix_acl_access");
+        if (value.presence == SecurityPresence::Absent) return remove_replay_attribute(id,policy);
+        const auto valid=detail::validate_linux_acl(value.bytes,policy.limits);
+        if (!valid.value()) {const auto& e=*valid.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        return apply_replay_attribute({id,value.bytes,value.owner,{}},policy);
+#else
+        if (value.part != SecurityPart::DarwinExtendedAcl || value.encoding != SecurityEncoding::DarwinExternalAcl)
+            return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::NotApplicable,"metadata_replay.acl_model"));
+        int result=0;
+        if (value.presence == SecurityPresence::Absent) {
+            const auto current=read_security(value.part,policy.limits);
+            if (!current.value()) {const auto& e=*current.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            if (current.value()->presence == SecurityPresence::Absent) return Result::available(true);
+            result=acl_set_fd_np(descriptor_.get(),static_cast<acl_t>(_FILESEC_REMOVE_ACL),ACL_TYPE_EXTENDED);
+        } else {
+            // acl_copy_int has no length parameter: first bound and validate
+            // Darwin's external representation header and exact record count.
+            constexpr auto header=offsetof(kauth_filesec,fsec_ace);
+            if (value.bytes.size()<header)
+                return Result::unavailable(ObservationState::Failed,adapter_error(AdapterError::InvalidNativeResult,"metadata_replay.acl_header"));
+            std::uint32_t magic=0,count=0;
+            std::memcpy(&magic,value.bytes.data()+offsetof(kauth_filesec,fsec_magic),sizeof(magic));
+            std::memcpy(&count,value.bytes.data()+offsetof(kauth_filesec,fsec_acl)+offsetof(kauth_acl,acl_entrycount),sizeof(count));
+            count=OSSwapBigToHostInt32(count);
+            if (OSSwapBigToHostInt32(magic)!=KAUTH_FILESEC_MAGIC || count>ACL_MAX_ENTRIES ||
+                count>policy.limits.max_records || value.bytes.size()!=header+count*sizeof(kauth_ace))
+                return Result::unavailable(ObservationState::Failed,adapter_error(AdapterError::InvalidNativeResult,"metadata_replay.acl_record_count"));
+            acl_t acl=acl_copy_int(value.bytes.data());
+            if (!acl) return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.acl_copy_int"});
+            if (acl_valid(acl)!=0 || acl_size(acl)!=static_cast<ssize_t>(value.bytes.size())) {
+                acl_free(acl);return Result::unavailable(ObservationState::Failed,adapter_error(AdapterError::InvalidNativeResult,"metadata_replay.acl_size"));
+            }
+            result=acl_set_fd_np(descriptor_.get(),acl,ACL_TYPE_EXTENDED);
+            const int code=errno;acl_free(acl);errno=code;
+        }
+        if (result!=0) return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.set_acl"});
+        return Result::available(true);
+#endif
+    }
+    Observation<bool> verify_replay_security(const NativeSecurityValue& value, const MetadataReplayPolicy& policy) const override {
+        const auto ownership=qualify_ownership_semantics();
+        if (!ownership.value()) return ownership;
+        return OpenedEntry::verify_replay_security(value,policy);
+    }
+    Observation<bool> apply_replay_basic(const BasicMetadata& source, const MetadataReplayPolicy& policy) override {
+        using Result=Observation<bool>;
+        if (!policy.valid() || !content_write_access_ || !publication_ || !source.posix_permissions.value())
+            return Result::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"metadata_replay.staging_basic"));
+        if ((*source.posix_permissions.value() & 07000U) && !policy.allow_privilege_metadata)
+            return Result::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"metadata_replay.mode_optin"));
+        const auto target=inspect_basic();
+        if (!target.value()) {const auto& e=*target.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if (!source.accessed.value() || !source.modified.value() || !target.value()->posix_permissions.value() ||
+            !target.value()->kind.value() || *target.value()->kind.value()!=ObjectKind::RegularFile)
+            return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::UnsupportedQuery,"metadata_replay.basic_fields"));
+        const auto mode=*source.posix_permissions.value() & 07777U;
+        // The initial mode is established before ACL/capability replay. Final
+        // timestamp phases must not chmod an already exact mode: chmod can
+        // rewrite the POSIX ACL mask and must not disturb security metadata.
+        if (*target.value()->posix_permissions.value()!=mode && fchmod(descriptor_.get(),static_cast<mode_t>(mode))!=0)
+            return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.fchmod"});
+        timespec times[2]{};
+        const FileTimestamp* values[]{source.accessed.value(),source.modified.value()};
+        for (int i=0;i<2;++i) {
+            const auto seconds=values[i]->seconds();
+            if constexpr (std::numeric_limits<time_t>::is_signed) {
+                if (seconds<static_cast<std::int64_t>(std::numeric_limits<time_t>::min()) || seconds>static_cast<std::int64_t>(std::numeric_limits<time_t>::max()))
+                    return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::UnsupportedQuery,"metadata_replay.time_range"));
+            } else if (seconds<0 || static_cast<std::uint64_t>(seconds)>std::numeric_limits<time_t>::max())
+                return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::UnsupportedQuery,"metadata_replay.time_range"));
+            times[i]={static_cast<time_t>(seconds),static_cast<long>(values[i]->nanoseconds())};
+        }
+        if ((!target.value()->accessed.value() || *target.value()->accessed.value()!=*source.accessed.value() ||
+             !target.value()->modified.value() || *target.value()->modified.value()!=*source.modified.value()) &&
+            futimens(descriptor_.get(),times)!=0)
+            return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.futimens"});
+#if defined(__APPLE__)
+        if (policy.scope==RegularMetadataScope::CompleteMetadataV1) {
+            if (!source.created.value()) return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::UnsupportedQuery,"metadata_replay.birthtime_missing"));
+            struct attrlist attributes{};attributes.bitmapcount=ATTR_BIT_MAP_COUNT;attributes.commonattr=ATTR_CMN_CRTIME;
+            timespec birth{static_cast<time_t>(source.created.value()->seconds()),static_cast<long>(source.created.value()->nanoseconds())};
+            if ((!target.value()->created.value() || *target.value()->created.value()!=*source.created.value()) &&
+                fsetattrlist(descriptor_.get(),&attributes,&birth,sizeof(birth),0)!=0)
+                return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.fsetattrlist_birth"});
+        }
+#endif
         return Result::available(true);
     }
     Observation<bool> publish_noreplace(const DirectoryCursor& destination, const NativeName& name) override;
@@ -1089,6 +1362,19 @@ public:
 #endif
     }
 private:
+    Observation<bool> qualify_ownership_semantics() const {
+#if defined(__APPLE__)
+        struct statfs filesystem{};
+        if (fstatfs(descriptor_.get(),&filesystem)!=0)
+            return Observation<bool>::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.fstatfs_ownership"});
+        // noowners virtualizes uid/gid and bypasses ownership enforcement.
+        // Matching fstat values or ACL bytes cannot qualify these semantics.
+        if ((filesystem.f_flags & MNT_IGNORE_OWNERSHIP)!=0)
+            return Observation<bool>::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::ProviderReviewRequired,"metadata_replay.ignored_ownership_mount"));
+#endif
+        return Observation<bool>::available(true);
+    }
     friend class PosixDirectoryCursor;
 #if defined(__APPLE__)
     static std::optional<UnavailableObservation> provider_guard(const BasicMetadata& metadata) {
@@ -1966,7 +2252,7 @@ public:
     Observation<std::unique_ptr<OpenedEntry>> open_child(const NativeName& name, EntryAccess access = EntryAccess::MetadataOnly) const override {
         if (!valid_entry_access(access)) return Observation<std::unique_ptr<OpenedEntry>>::unavailable(ObservationState::Failed,
             adapter_error(AdapterError::InvalidAccess, "open_child.access"));
-        if (requests_move_source(access))
+        if (requests_move_source(access) || requests_rename_source(access))
             return Observation<std::unique_ptr<OpenedEntry>>::unavailable(ObservationState::Unsupported,
                 adapter_error(AdapterError::UnsupportedQuery, "open_child.move_source_exclusion"));
         using Result = Observation<std::unique_ptr<OpenedEntry>>;

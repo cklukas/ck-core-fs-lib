@@ -6,6 +6,8 @@ The installed C++ targets separate filesystem mechanisms from browser policy:
   and reusable directory-index record encoding and storage primitives.
 - `ck::ck_files_platform` links the engine and adds native metadata, index-file,
   journal-file, and home-directory adapters.
+- `ck::ck_core_fs_native` links the platform boundary and composes reviewed
+  tree execution, retained-target publication, and native action workers.
 - `ck::ck_core_fs_browser` is an optional higher-level library that links the
   engine publicly. It provides pane models, commands, acquisition, refresh,
   paging, ordering and filtering, plus indexed panes and their listing, sorting,
@@ -20,7 +22,7 @@ These aliases are for `add_subdirectory` consumers and are not installed.
 `CK_CORE_FS_BUILD_BROWSER` defaults to `ON`. Set it to `OFF` for a standalone
 engine/C ABI build; the browser target, its compatibility alias, archive and
 export are then omitted. The C ABI target `ck_file_engine_c` (installed as
-`ck::ck_file_engine_c`) links only platform and engine code. It never compiles
+`ck::ck_file_engine_c`) links native composition, platform and engine code. It never compiles
 or links browser policy, even when the browser library is enabled. Consumers
 using native platform factories alongside browser models should link both
 `ck::ck_core_fs_browser` and `ck::ck_files_platform`.

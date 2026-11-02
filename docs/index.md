@@ -53,11 +53,11 @@ The project exposes two layers over the same implementation:
 - an exception-free opaque-handle C ABI for CDE, other languages, and stable
   frontend adapters.
 
-The current consumable revision includes held-handle directory and entry
-inspection plus journaled regular-file copy and move jobs with polling and
-cooperative cancellation. The lower-level backend already contains the
-identity, recovery, recursive inventory, and deletion primitives needed for
-the next ABI slices.
+The C ABI includes held-handle inspection, journaled regular-file jobs,
+native reviewed-tree workers, action jobs, and durable session contracts.
+Read [native contracts](native-contracts.md) for implemented scopes, lifetime
+rules and explicit provider limits. See the revision-specific validation
+record before enabling a capability in a frontend.
 
 See [architecture](architecture.md) for the ownership boundary, [safety](safety.md)
 for the non-negotiable filesystem rules, and [the C API](c-api.md) for the

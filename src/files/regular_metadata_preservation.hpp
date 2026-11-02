@@ -7,37 +7,35 @@
 
 namespace ck::files {
 
-// Versioned requested scope, independent of blanket metadata-loss consent.
-// CompleteMetadataV1 remains refused until every relevant namespace/class can
-// be qualified. OrdinaryCallerVisibleV1 explicitly excludes arbitrary hidden
-// xattr namespaces, birth/ctime, original ownership, physical allocation/clone
-// identity and provider semantics outside the audited local-file adapter.
-// It requires absent visible attributes and explicit absent ACL / known Linux
-// labels, integrity xattrs and file capabilities, plus ordinary dense storage.
-enum class RegularMetadataScope : std::uint32_t {
-    CompleteMetadataV1 = 0,
-    OrdinaryCallerVisibleV1 = 1
-};
 struct RegularMetadataScopeReport final {
     std::uint32_t version = 1;
     RegularMetadataScope requested = RegularMetadataScope::CompleteMetadataV1;
     // Unknown remains unknown even after successful ordinary-subset copying.
     ObservationState arbitrary_hidden_attributes = ObservationState::Unknown;
+    MetadataOwnership ownership_policy = MetadataOwnership::Original;
+    bool privilege_metadata_opted_in = false;
+    ObservationState attributes_captured = ObservationState::Unknown;
+    ObservationState security_captured = ObservationState::Unknown;
 };
 
 
-// Worker-owned, deliberately narrow preservation contract: ordinary regular
-// files, mode 0777, atime/mtime, and explicitly current-caller ownership.
-// Birth/ctime, hard-link topology, physical allocation/clone identity and
-// arbitrary provider semantics are not represented by this contract. Known
-// unsupported metadata and insufficient query coverage refuse strict copies.
-// A held object is not a snapshot or writer exclusion.
+// Held-source capture, staged replay and final pre-publication verification.
+// Explicit loss consent is a separate portable-basic-only operation and never
+// establishes complete metadata preservation. No native privilege escalation.
 class RegularMetadataPreservation final : public std::enable_shared_from_this<RegularMetadataPreservation> {
 public:
     using Pointer = std::shared_ptr<RegularMetadataPreservation>;
     static Observation<Pointer> create(HeldChild::Pointer source, bool allow_unhandled_metadata_loss,
         RegularMetadataScope scope = RegularMetadataScope::CompleteMetadataV1, std::stop_token stop = {});
-    RegularMetadataScopeReport scope_report() const noexcept { return {1, scope_, ObservationState::Unknown}; }
+    static Observation<Pointer> create_with_policy(HeldChild::Pointer source, bool allow_unhandled_metadata_loss,
+        MetadataReplayPolicy policy, std::stop_token stop = {});
+    RegularMetadataScopeReport scope_report() const noexcept {
+        return {1, scope_, !allow_loss_ && scope_ == RegularMetadataScope::CompleteMetadataV1 ?
+            ObservationState::Available : ObservationState::Unknown, policy_.ownership,
+            policy_.allow_privilege_metadata, replay_ ? ObservationState::Available : ObservationState::Unknown,
+            replay_ ? ObservationState::Available : ObservationState::Unknown};
+    }
+    const MetadataReplaySnapshot* captured_metadata() const noexcept { return replay_ ? &*replay_ : nullptr; }
     Observation<OperationMetadataJob::Pointer> prepare(OpenedEntry& staging, std::stop_token stop = {});
     Observation<bool> verify(OpenedEntry& staging, std::stop_token stop = {}) const;
 private:
@@ -48,6 +46,8 @@ private:
     bool allow_loss_ = false;
     RegularMetadataScope scope_ = RegularMetadataScope::CompleteMetadataV1;
     std::optional<BasicMetadata> applied_;
+    std::optional<MetadataReplaySnapshot> replay_;
+    MetadataReplayPolicy policy_;
 };
 
 } // namespace ck::files

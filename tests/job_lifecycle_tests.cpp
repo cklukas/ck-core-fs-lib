@@ -415,6 +415,48 @@ void completed_copy(Fixture &fixture, bool concurrent_drain) {
         static_cast<unsigned long long>(events.count), static_cast<unsigned long long>(events.lost),
         static_cast<unsigned long long>(terminal.processed_bytes));
 }
+void explicit_replay_policy(Fixture& fixture) {
+    Error error;
+#ifndef _WIN32
+    // Non-executable source exercises actual setuid-bit replay without making
+    // a runnable privileged fixture. It is confined to the task-owned tree.
+    assert(chmod((fixture.source_path + "/payload.bin").c_str(),04600) == 0);
+#endif
+    const ckfe_copy_options_v2 options{2,sizeof(ckfe_copy_options_v2),CKFE_METADATA_ORDINARY_CALLER_VISIBLE_V1,
+        0,CKFE_OWNERSHIP_ORIGINAL,1,{0,0,0,0}};
+    ckfe_job* job = nullptr;
+    ok(ckfe_job_start_copy_regular_v2(fixture.source,fixture.destination,"explicit-replay.bin",fixture.journal.c_str(),
+        &options,&job,&error.value),error);
+    const auto terminal = wait(job,nullptr);
+    ckfe_job_preservation_report_v1 report{};
+    ok(ckfe_job_get_preservation_report_v1(job,&report,sizeof(report),&error.value),error);
+    if (terminal.state == CKFE_JOB_COMPLETED) {
+        assert(report.provider_qualification == CKFE_OBSERVATION_AVAILABLE);
+        assert((report.source_preserved_fields & CKFE_PRESERVED_SOURCE_OWNER) != 0);
+        assert((report.explicitly_excluded_fields & CKFE_PRESERVED_SOURCE_OWNER) == 0);
+        assert(report.current_effective_uid_gid_applied == 0);
+#ifndef _WIN32
+        assert((report.source_preserved_fields & CKFE_PRESERVED_PRIVILEGE_BITS) != 0);
+        assert((report.explicitly_excluded_fields & CKFE_PRESERVED_PRIVILEGE_BITS) == 0);
+        struct stat info{};
+        assert(lstat((fixture.destination_path + "/explicit-replay.bin").c_str(),&info) == 0 && (info.st_mode & 07777) == 04600);
+#else
+        assert((report.explicitly_excluded_fields & CKFE_PRESERVED_PRIVILEGE_BITS) != 0);
+#endif
+        verify_contents(fixture.destination_path + "/explicit-replay.bin");
+        std::puts("C v2 original-owner/privilege replay and achieved-field report verified");
+    } else {
+        assert(terminal.state == CKFE_JOB_UNSUPPORTED || terminal.state == CKFE_JOB_DENIED);
+        assert(report.source_preserved_fields == 0 && report.current_effective_uid_gid_applied == 0);
+        assert(!std::getenv("CK_METADATA_REPLAY_REQUIRE_NATIVE_SUCCESS"));
+        std::printf("C v2 strict replay remains unavailable on this provider: state=%s\n",ckfe_job_state_name(terminal.state));
+    }
+    ckfe_job_destroy(job);
+#ifndef _WIN32
+    assert(chmod((fixture.source_path + "/payload.bin").c_str(),0600) == 0);
+#endif
+    fixture.verify_source();
+}
 void cancelled_copy(Fixture &fixture) {
     auto *job = fixture.start("cancelled.bin");
     assert(active(poll(job).state));
@@ -445,6 +487,7 @@ int main(int argc, char **argv) {
     Fixture fixture(argv[1]); // Parent is explicitly created by CMake under build/tasks.
     completed_copy(fixture, false);
     completed_copy(fixture, true);
+    explicit_replay_policy(fixture);
     cancelled_copy(fixture);
     destroy_running(fixture);
     std::puts("native copy, progress, events, cancellation, and worker teardown passed");

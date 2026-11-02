@@ -27,4 +27,6 @@ and dtfile:
    suites for every new boundary.
 
 The project name and install namespace are fixed as `ck-core-fs-lib` so the
-future GitHub repository and downstream references remain stable.
+GitHub repository and downstream references remain stable. See
+[native contracts](native-contracts.md) and the revision-specific validation
+record for implemented slices and remaining gates.

@@ -30,7 +30,11 @@ typedef enum ckfe_api_status {
     CKFE_API_INVALID_ARGUMENT = 1,
     CKFE_API_OUT_OF_MEMORY = 2,
     CKFE_API_EXCEPTION = 3,
-    CKFE_API_OPERATION_UNAVAILABLE = 4
+    CKFE_API_OPERATION_UNAVAILABLE = 4,
+    CKFE_API_BUFFER_TOO_SMALL = 5,
+    CKFE_API_BUSY = 6,
+    CKFE_API_STALE_PLAN = 7,
+    CKFE_API_NOT_READY = 8
 } ckfe_api_status;
 
 typedef enum ckfe_observation_state {
@@ -173,6 +177,14 @@ typedef struct ckfe_copy_options_v1 {
     uint32_t allow_metadata_loss;
     uint32_t reserved[4];
 } ckfe_copy_options_v1;
+enum { CKFE_OWNERSHIP_ORIGINAL = 0, CKFE_OWNERSHIP_CURRENT_CALLER = 1 };
+typedef struct ckfe_copy_options_v2 {
+    uint32_t version; /* 2 */
+    uint32_t struct_size;
+    uint32_t metadata_scope, allow_metadata_loss;
+    uint32_t ownership, allow_privilege_metadata;
+    uint32_t reserved[4];
+} ckfe_copy_options_v2;
 
 enum {
     CKFE_PRESERVED_ORDINARY_MODE = 1u << 0,
@@ -244,15 +256,22 @@ CK_FILE_ENGINE_API ckfe_api_status ckfe_job_start_copy_regular(
     ckfe_entry *source, ckfe_directory *destination, const char *destination_name_utf8,
     const char *journal_root_utf8, int allow_metadata_loss,
     ckfe_job **out_job, ckfe_error *error);
-// Versioned explicit requested scope. COMPLETE retains the legacy strict gate.
+// Versioned explicit requested scope. COMPLETE requires qualified full replay.
 // ORDINARY_CALLER_VISIBLE requests mode0777, atime/mtime and current caller
-// ownership, with qualified visible metadata/ACL/known-security checks. It
+// ownership, with native visible metadata/ACL/security replay and verification. It
 // excludes arbitrary hidden namespaces, original ownership, birth/ctime and
 // physical storage representation: they remain unknown/unpreserved. Unsupported
 // providers refuse the request. This is not a complete-metadata-copy profile.
 CK_FILE_ENGINE_API ckfe_api_status ckfe_job_start_copy_regular_v1(
     ckfe_entry *source, ckfe_directory *destination, const char *destination_name_utf8,
     const char *journal_root_utf8, const ckfe_copy_options_v1 *options,
+    ckfe_job **out_job, ckfe_error *error);
+/* Explicit security/ownership policy. Privileged ACL/label/capability replay
+ * requires opt-in AND actual native rights; this API never elevates. Missing
+ * inventory coverage or a failed exact replay refuses strict publication. */
+CK_FILE_ENGINE_API ckfe_api_status ckfe_job_start_copy_regular_v2(
+    ckfe_entry *source, ckfe_directory *destination, const char *destination_name_utf8,
+    const char *journal_root_utf8, const ckfe_copy_options_v2 *options,
     ckfe_job **out_job, ckfe_error *error);
 CK_FILE_ENGINE_API ckfe_api_status ckfe_job_start_move_regular(
     ckfe_entry *source, ckfe_directory *destination, const char *destination_name_utf8,

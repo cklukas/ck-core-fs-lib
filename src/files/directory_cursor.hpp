@@ -114,6 +114,11 @@ public:
                                                       const ObjectIdentity& expected_identity,
                                                       const DirectoryCursor& destination,
                                                       const NativeName& destination_name) const;
+    // A provider-qualified source-object conditional rename, including an
+    // adversarial writer of the source parent. Advisory/cooperative locks and
+    // pre/post-name checks do not qualify. Available(false) is not support.
+    // Executors must still use rename_child_noreplace with the held identity.
+    virtual Observation<bool> qualify_identity_bound_rename() const;
     // Worker-only case-only rename within this held directory. The adapter
     // must prove that the destination's native lookup resolves to the same
     // source object, reject hard-link ambiguity, use a native rename and

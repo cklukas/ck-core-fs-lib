@@ -29,6 +29,7 @@ nav:
       - docs/architecture.md
       - docs/operations.md
       - docs/operation-planning.md
+      - docs/native-contracts.md
       - docs/conflict-resolution.md
       - docs/safety.md
   - title: API

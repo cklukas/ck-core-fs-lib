@@ -8,6 +8,7 @@
 #include "name_mapping.hpp"
 #include "operation_journal_file.hpp"
 #include "operation_recovery.hpp"
+#include "native_handles.hpp"
 
 #include <atomic>
 #include <array>
@@ -26,11 +27,6 @@
 #include <variant>
 
 using namespace ck::files;
-
-struct ckfe_engine { NativeFileSystem filesystem; };
-struct ckfe_directory { std::shared_ptr<const DirectoryCursor> cursor; };
-struct ckfe_entry { HeldChild::Pointer child; };
-struct ckfe_recovery { NativeOperationRecoveryInspection inspection; };
 
 using CopyJob = OperationBatchJob::Pointer;
 using MoveJob = NativeOperationMoveBatchJob::Pointer;
@@ -115,7 +111,7 @@ Observation<NativeName> native_name_utf8(const char *text, NameEncoding encoding
 }
 
 Observation<NativeName> native_name_utf16(const uint16_t *text, size_t units) {
-    if (!text || units == 0) return Observation<NativeName>::unavailable(ObservationState::Failed,
+    if (!text || units == 0 || units > 32767) return Observation<NativeName>::unavailable(ObservationState::Failed,
         {ErrorDomain::Adapter, static_cast<int64_t>(AdapterError::InvalidIdentifier), "c_api.name.null"});
     std::u16string value;
     value.reserve(units);
@@ -289,11 +285,11 @@ ckfe_api_status start_job(Start &&start, ckfe_job **out, ckfe_error *error,
 
 extern "C" {
 
-const char *ckfe_version(void) { return "0.2.0"; }
+const char *ckfe_version(void) { return "0.3.0"; }
 
 uint32_t ckfe_abi_version_major(void) { return 0; }
 
-uint32_t ckfe_abi_version_minor(void) { return 2; }
+uint32_t ckfe_abi_version_minor(void) { return 3; }
 
 const char *ckfe_api_status_name(ckfe_api_status status) {
     switch (status) {
@@ -302,6 +298,10 @@ const char *ckfe_api_status_name(ckfe_api_status status) {
     case CKFE_API_OUT_OF_MEMORY: return "out_of_memory";
     case CKFE_API_EXCEPTION: return "exception";
     case CKFE_API_OPERATION_UNAVAILABLE: return "operation_unavailable";
+    case CKFE_API_BUFFER_TOO_SMALL: return "buffer_too_small";
+    case CKFE_API_BUSY: return "busy";
+    case CKFE_API_STALE_PLAN: return "stale_plan";
+    case CKFE_API_NOT_READY: return "not_ready";
     }
     return "unknown";
 }
@@ -349,7 +349,9 @@ ckfe_api_status ckfe_directory_open_utf8(ckfe_engine *engine, const char *path, 
         auto opened = engine->filesystem.open_directory(*host,
             follow ? DirectoryLinkPolicy::FollowFinalLink : DirectoryLinkPolicy::RejectFinalLink);
         if (!opened.value()) { set_error(error, *opened.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
-        *out = new ckfe_directory{std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value())};
+        auto address = NativeAbsolutePath::from_host(*host);
+        *out = new ckfe_directory{std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value()),
+            address.value() ? std::optional<NativeAbsolutePath>(*address.value()) : std::nullopt};
         return CKFE_API_OK;
     } catch (const std::bad_alloc &) { return CKFE_API_OUT_OF_MEMORY; }
     catch (...) { set_exception(error, "c_api.directory_open"); return CKFE_API_EXCEPTION; }
@@ -359,7 +361,8 @@ ckfe_api_status ckfe_directory_open_utf16(ckfe_engine *engine, const uint16_t *p
                                           int follow, ckfe_directory **out, ckfe_error *error) {
     clear_error(error);
     if (out) *out = nullptr;
-    if (!engine || !out || !path || units == 0) return CKFE_API_INVALID_ARGUMENT;
+    if (!engine || !out || !path || units == 0 || units > NativePathLimits{}.max_native_bytes / sizeof(uint16_t))
+        return CKFE_API_INVALID_ARGUMENT;
     try {
         std::u16string value;
         value.reserve(units);
@@ -371,7 +374,7 @@ ckfe_api_status ckfe_directory_open_utf16(ckfe_engine *engine, const uint16_t *p
         auto opened = engine->filesystem.open_directory(*host.value(),
             follow ? DirectoryLinkPolicy::FollowFinalLink : DirectoryLinkPolicy::RejectFinalLink);
         if (!opened.value()) { set_error(error, *opened.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
-        *out = new ckfe_directory{std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value())};
+        *out = new ckfe_directory{std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value()),*address.value()};
         return CKFE_API_OK;
     } catch (const std::bad_alloc &) { return CKFE_API_OUT_OF_MEMORY; }
     catch (...) { set_exception(error, "c_api.directory_open_utf16"); return CKFE_API_EXCEPTION; }
@@ -394,7 +397,12 @@ ckfe_api_status ckfe_entry_open_utf8(ckfe_directory *directory, const char *name
         if (!native.value()) { set_error(error, *native.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         auto child = HeldChild::observe_with_access(directory->cursor, std::move(native).take_value(), EntryAccess::ContentRead);
         if (!child.value()) { set_error(error, *child.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
-        *out = new ckfe_entry{std::move(child).take_value()};
+        std::optional<NativeAbsolutePath> address;
+        if (directory->address) {
+            auto value = directory->address->child_address((*child.value())->name());
+            if (value.value()) address = *value.value();
+        }
+        *out = new ckfe_entry{std::move(child).take_value(),std::move(address)};
         return CKFE_API_OK;
     } catch (const std::bad_alloc &) { return CKFE_API_OUT_OF_MEMORY; }
     catch (...) { set_exception(error, "c_api.entry_open"); return CKFE_API_EXCEPTION; }
@@ -404,13 +412,18 @@ ckfe_api_status ckfe_entry_open_utf16(ckfe_directory *directory, const uint16_t 
                                       ckfe_entry **out, ckfe_error *error) {
     clear_error(error);
     if (out) *out = nullptr;
-    if (!directory || !out) return CKFE_API_INVALID_ARGUMENT;
+    if (!directory || !out || !name || !units || units > 32767) return CKFE_API_INVALID_ARGUMENT;
     try {
         auto native = native_name_utf16(name, units);
         if (!native.value()) { set_error(error, *native.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         auto child = HeldChild::observe_with_access(directory->cursor, std::move(native).take_value(), EntryAccess::ContentRead);
         if (!child.value()) { set_error(error, *child.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
-        *out = new ckfe_entry{std::move(child).take_value()};
+        std::optional<NativeAbsolutePath> address;
+        if (directory->address) {
+            auto value = directory->address->child_address((*child.value())->name());
+            if (value.value()) address = *value.value();
+        }
+        *out = new ckfe_entry{std::move(child).take_value(),std::move(address)};
         return CKFE_API_OK;
     } catch (const std::bad_alloc &) { return CKFE_API_OUT_OF_MEMORY; }
     catch (...) { set_exception(error, "c_api.entry_open_utf16"); return CKFE_API_EXCEPTION; }
@@ -454,7 +467,8 @@ ckfe_api_status ckfe_entry_metadata(const ckfe_entry *entry, ckfe_metadata *meta
 static ckfe_api_status start_copy_regular(ckfe_entry *source, ckfe_directory *destination,
                                             const char *destination_name, const char *journal_root,
                                             int allow_metadata_loss, RegularMetadataScope scope,
-                                            ckfe_job **out, ckfe_error *error) {
+                                            ckfe_job **out, ckfe_error *error,
+                                            std::optional<MetadataReplayPolicy> metadata_policy = {}) {
     clear_error(error);
     if (out) *out = nullptr;
     if (!source || !destination || !out) return CKFE_API_INVALID_ARGUMENT;
@@ -470,12 +484,14 @@ static ckfe_api_status start_copy_regular(ckfe_entry *source, ckfe_directory *de
         if (!root.value()) { set_error(error, *root.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
         NativeOperationCopyBatchRequest request;
         request.sources = {source->child}; request.destination = destination->cursor;
+        request.destination_address = destination->address;
         request.destination_names = {std::move(name).take_value()}; request.journal_root = std::move(root).take_value();
         request.journal_id = next_id(); request.policy.journal_limits = {1, 32, 4096};
         request.policy.copy_limits.chunk_bytes = 1024 * 1024;
         request.policy.copy_limits.max_bytes = StreamCopyLimits::hard_max_bytes;
         request.policy.allow_unhandled_metadata_loss = allow_metadata_loss != 0;
         request.policy.metadata_scope = scope;
+        request.policy.metadata_policy = metadata_policy;
         request.open_journal = [](const NativeAbsolutePath &path, const NativeName &basename, bool create_new) {
             return open_native_operation_journal_file(path, basename, create_new);
         };
@@ -486,14 +502,27 @@ static ckfe_api_status start_copy_regular(ckfe_entry *source, ckfe_directory *de
         report.provider_qualification = CKFE_OBSERVATION_UNKNOWN;
         report.unknown_fields = CKFE_PRESERVED_ACL | CKFE_PRESERVED_XATTRS |
             CKFE_PRESERVED_LABELS_CAPABILITIES | CKFE_PRESERVED_STORAGE_REPRESENTATION;
+        report.explicitly_excluded_fields = CKFE_PRESERVED_BIRTH_CHANGE_TIMES | CKFE_PRESERVED_STORAGE_REPRESENTATION;
+#ifdef _WIN32
+        report.explicitly_excluded_fields |= CKFE_PRESERVED_PRIVILEGE_BITS;
+#endif
         if (scope == RegularMetadataScope::OrdinaryCallerVisibleV1 || allow_metadata_loss)
             report.explicitly_excluded_fields = CKFE_PRESERVED_SOURCE_OWNER | CKFE_PRESERVED_PRIVILEGE_BITS |
                 CKFE_PRESERVED_BIRTH_CHANGE_TIMES | CKFE_PRESERVED_STORAGE_REPRESENTATION;
+        if (metadata_policy && !allow_metadata_loss) {
+            if (metadata_policy->ownership == MetadataOwnership::Original)
+                report.explicitly_excluded_fields &= ~static_cast<uint64_t>(CKFE_PRESERVED_SOURCE_OWNER);
+            else report.explicitly_excluded_fields |= CKFE_PRESERVED_SOURCE_OWNER;
+#ifndef _WIN32
+            if (metadata_policy->allow_privilege_metadata)
+                report.explicitly_excluded_fields &= ~static_cast<uint64_t>(CKFE_PRESERVED_PRIVILEGE_BITS);
+#endif
+        }
         return start_job([request = std::move(request)]() mutable {
             auto prepared = prepare_native_operation_journal_root(*request.journal_root);
             if (!prepared.value()) return Observation<CopyJob>::unavailable(prepared.state(), prepared.unavailable_detail()->error);
             return create_native_operation_copy_batch(std::move(request));
-        }, out, error, report, !allow_metadata_loss && scope == RegularMetadataScope::OrdinaryCallerVisibleV1);
+        }, out, error, report, !allow_metadata_loss);
     } catch (...) { set_exception(error, "c_api.job_start_copy"); return CKFE_API_EXCEPTION; }
 }
 
@@ -514,6 +543,22 @@ ckfe_api_status ckfe_job_start_copy_regular_v1(ckfe_entry *source, ckfe_director
     for (auto reserved : options->reserved) if (reserved) return CKFE_API_INVALID_ARGUMENT;
     return start_copy_regular(source, destination, name, root, options->allow_metadata_loss,
         static_cast<RegularMetadataScope>(options->metadata_scope), out, error);
+}
+
+ckfe_api_status ckfe_job_start_copy_regular_v2(ckfe_entry* source, ckfe_directory* destination,
+    const char* name, const char* root, const ckfe_copy_options_v2* options,
+    ckfe_job** out, ckfe_error* error) {
+    clear_error(error); if (out) *out = nullptr;
+    if (!options || options->version != 2 || options->struct_size != sizeof(*options) ||
+        options->metadata_scope > CKFE_METADATA_ORDINARY_CALLER_VISIBLE_V1 || options->allow_metadata_loss > 1 ||
+        options->ownership > CKFE_OWNERSHIP_CURRENT_CALLER || options->allow_privilege_metadata > 1)
+        return CKFE_API_INVALID_ARGUMENT;
+    for (auto reserved : options->reserved) if (reserved) return CKFE_API_INVALID_ARGUMENT;
+    MetadataReplayPolicy policy;
+    policy.scope = static_cast<RegularMetadataScope>(options->metadata_scope);
+    policy.ownership = static_cast<MetadataOwnership>(options->ownership);
+    policy.allow_privilege_metadata = options->allow_privilege_metadata;
+    return start_copy_regular(source,destination,name,root,options->allow_metadata_loss,policy.scope,out,error,policy);
 }
 
 ckfe_api_status ckfe_job_start_move_regular(ckfe_entry *source, ckfe_directory *destination,
@@ -599,15 +644,29 @@ ckfe_api_status ckfe_job_get_preservation_report_v1(ckfe_job *job,
                 CKFE_PRESERVED_ACCESS_TIME | CKFE_PRESERVED_MODIFIED_TIME;
 #ifndef _WIN32
             report->current_effective_uid_gid_applied =
-                job->preservation_scope_checks_required;
+                job->preservation_scope_checks_required &&
+                (report->explicitly_excluded_fields & CKFE_PRESERVED_SOURCE_OWNER) != 0;
 #else
             report->source_preserved_fields &= ~static_cast<uint64_t>(CKFE_PRESERVED_ORDINARY_MODE);
 #endif
             // Basic fields are individually applied/verified even with loss
             // consent. That is not evidence that the requested provider scope
             // was inventoried or qualified: loss-consenting paths bypass it.
-            if (job->preservation_scope_checks_required)
+            if (job->preservation_scope_checks_required) {
                 report->provider_qualification = CKFE_OBSERVATION_AVAILABLE;
+                report->source_preserved_fields |= CKFE_PRESERVED_ACL;
+                report->unknown_fields &= ~static_cast<uint64_t>(CKFE_PRESERVED_ACL);
+                if (report->requested_scope == CKFE_METADATA_COMPLETE_V1) {
+                    report->source_preserved_fields |= CKFE_PRESERVED_XATTRS;
+                    report->unknown_fields &= ~static_cast<uint64_t>(CKFE_PRESERVED_XATTRS);
+                }
+                if (!(report->explicitly_excluded_fields & CKFE_PRESERVED_SOURCE_OWNER))
+                    report->source_preserved_fields |= CKFE_PRESERVED_SOURCE_OWNER;
+#ifndef _WIN32
+                if (!(report->explicitly_excluded_fields & CKFE_PRESERVED_PRIVILEGE_BITS))
+                    report->source_preserved_fields |= CKFE_PRESERVED_PRIVILEGE_BITS;
+#endif
+            }
         } else if (job->failure) report->provider_qualification = static_cast<ckfe_observation_state>(job->failure->state);
         return CKFE_API_OK;
     } catch (...) { set_exception(error, "c_api.job_preservation_report"); return CKFE_API_EXCEPTION; }
