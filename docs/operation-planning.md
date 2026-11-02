@@ -18,6 +18,9 @@ Every tree operation follows one worker-owned sequence:
    an `identical` decision or a destination deletion.
 3. Present the plan for review. Conflict and loss decisions are scoped to this
    plan and are never inferred from a second scan or from display text.
+   Normal changes follow the selected operation profile; a user can review a
+   representative conflict and apply a reusable rule to matching rows, a subtree
+   or the job. See [conflict resolution](conflict-resolution.md).
 4. Execute only after revalidating the same identities, policies, and decision
    token. A changed plan returns to review; it does not silently re-plan.
 5. Publish through journaled staging, verify the published identity/content,
