@@ -1,3 +1,44 @@
+---
+title: ck-core-fs-lib
+description: Headless, cross-platform filesystem operations with a stable C ABI.
+layout: home
+hero:
+  name: ck-core-fs-lib
+  text: Safe filesystem operations for native clients
+  tagline: >
+    A headless, cross-platform engine for native file identity, byte-native
+    names, journaled mutation, recovery evidence and stable C integration.
+  actions:
+    - text: Explore the architecture
+      link: architecture.md
+      theme: brand
+    - text: Read the C API
+      link: c-api.md
+    - text: Build the library
+      link: building.md
+features:
+  - icon: ":shield:"
+    title: Safety-first operations
+    details: Held handles, explicit identity, journaled mutation and recovery evidence keep filesystem changes inspectable.
+    link: safety.md
+  - icon: ":link:"
+    title: Stable native interfaces
+    details: C++ and exception-free opaque-handle C APIs expose the same headless engine without UI dependencies.
+    link: integration.md
+  - icon: ":desktop_computer:"
+    title: CK Core CDE
+    details: Explore the maintained desktop environment that can consume the filesystem library through its stable C boundary.
+    link: https://cklukas.github.io/ck-core-cde/
+  - icon: ":toolbox:"
+    title: CK Core Apps
+    details: Explore native desktop applications built for the maintained CDE and Motif stack.
+    link: https://cklukas.github.io/ck-core-apps/
+  - icon: "🏗️"
+    title: CK Core Motif
+    details: Explore the maintained native Xt toolkit used by CK Core desktop clients.
+    link: https://cklukas.github.io/ck-core-motif/
+---
+
 # ck-core-fs-lib
 
 `ck-core-fs-lib` is the headless filesystem engine shared by the ckUtilities
