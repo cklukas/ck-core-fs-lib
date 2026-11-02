@@ -19,6 +19,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <variant>
 
@@ -85,7 +86,10 @@ std::optional<std::filesystem::path> host_path(const char *text) {
     // This conversion is lexical validation only. NativeFileSystem performs
     // the final open through its platform boundary; no filesystem operation
     // is performed through std::filesystem here.
-    auto path = std::filesystem::u8path(std::string(text));
+    const std::string_view input(text);
+    std::u8string utf8(input.size(), u8'\0');
+    std::memcpy(utf8.data(), input.data(), input.size());
+    auto path = std::filesystem::path(utf8);
     auto address = NativeAbsolutePath::from_host(path);
     if (!address.value() || !path.is_absolute()) return std::nullopt;
     return path;
@@ -204,6 +208,7 @@ void run_job(ckfe_job &job) noexcept {
 
 template <class Start>
 ckfe_api_status start_job(Start &&start, ckfe_job **out, ckfe_error *error) {
+    clear_error(error);
     if (!out) return CKFE_API_INVALID_ARGUMENT;
     *out = nullptr;
     try {
@@ -272,8 +277,9 @@ void ckfe_engine_destroy(ckfe_engine *engine) { delete engine; }
 
 ckfe_api_status ckfe_directory_open_utf8(ckfe_engine *engine, const char *path, int follow,
                                          ckfe_directory **out, ckfe_error *error) {
+    clear_error(error);
+    if (out) *out = nullptr;
     if (!engine || !out) return CKFE_API_INVALID_ARGUMENT;
-    *out = nullptr;
     try {
         const auto host = host_path(path);
         if (!host) { set_exception(error, "c_api.directory_path"); return CKFE_API_INVALID_ARGUMENT; }
@@ -288,6 +294,8 @@ ckfe_api_status ckfe_directory_open_utf8(ckfe_engine *engine, const char *path, 
 
 ckfe_api_status ckfe_directory_open_utf16(ckfe_engine *engine, const uint16_t *path, size_t units,
                                           int follow, ckfe_directory **out, ckfe_error *error) {
+    clear_error(error);
+    if (out) *out = nullptr;
     if (!engine || !out || !path || units == 0) return CKFE_API_INVALID_ARGUMENT;
     try {
         std::u16string value;
@@ -310,8 +318,9 @@ void ckfe_directory_destroy(ckfe_directory *directory) { delete directory; }
 
 ckfe_api_status ckfe_entry_open_utf8(ckfe_directory *directory, const char *name,
                                      ckfe_entry **out, ckfe_error *error) {
+    clear_error(error);
+    if (out) *out = nullptr;
     if (!directory || !out) return CKFE_API_INVALID_ARGUMENT;
-    *out = nullptr;
     try {
 #if defined(_WIN32)
         const auto encoding = NameEncoding::WindowsUtf16;
@@ -330,8 +339,9 @@ ckfe_api_status ckfe_entry_open_utf8(ckfe_directory *directory, const char *name
 
 ckfe_api_status ckfe_entry_open_utf16(ckfe_directory *directory, const uint16_t *name, size_t units,
                                       ckfe_entry **out, ckfe_error *error) {
+    clear_error(error);
+    if (out) *out = nullptr;
     if (!directory || !out) return CKFE_API_INVALID_ARGUMENT;
-    *out = nullptr;
     try {
         auto native = native_name_utf16(name, units);
         if (!native.value()) { set_error(error, *native.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
@@ -346,8 +356,9 @@ ckfe_api_status ckfe_entry_open_utf16(ckfe_directory *directory, const uint16_t 
 void ckfe_entry_destroy(ckfe_entry *entry) { delete entry; }
 
 ckfe_api_status ckfe_entry_metadata(const ckfe_entry *entry, ckfe_metadata *metadata, ckfe_error *error) {
+    clear_error(error);
+    if (metadata) std::memset(metadata, 0, sizeof(*metadata));
     if (!entry || !metadata) return CKFE_API_INVALID_ARGUMENT;
-    std::memset(metadata, 0, sizeof(*metadata));
     try {
         auto value = entry->child->inspect_basic();
         if (!value.value()) { set_error(error, *value.unavailable_detail()); return CKFE_API_OPERATION_UNAVAILABLE; }
@@ -380,6 +391,8 @@ ckfe_api_status ckfe_entry_metadata(const ckfe_entry *entry, ckfe_metadata *meta
 ckfe_api_status ckfe_job_start_copy_regular(ckfe_entry *source, ckfe_directory *destination,
                                             const char *destination_name, const char *journal_root,
                                             int allow_metadata_loss, ckfe_job **out, ckfe_error *error) {
+    clear_error(error);
+    if (out) *out = nullptr;
     if (!source || !destination || !out) return CKFE_API_INVALID_ARGUMENT;
     try {
 #if defined(_WIN32)
@@ -397,7 +410,8 @@ ckfe_api_status ckfe_job_start_copy_regular(ckfe_entry *source, ckfe_directory *
         request.sources = {source->child}; request.destination = destination->cursor;
         request.destination_names = {std::move(name).take_value()}; request.journal_root = std::move(root).take_value();
         request.journal_id = next_id(); request.policy.journal_limits = {1, 32, 4096};
-        request.policy.copy_limits.chunk_bytes = 1024 * 1024; request.policy.copy_limits.max_bytes = UINT64_MAX;
+        request.policy.copy_limits.chunk_bytes = 1024 * 1024;
+        request.policy.copy_limits.max_bytes = StreamCopyLimits::hard_max_bytes;
         request.policy.allow_unhandled_metadata_loss = allow_metadata_loss != 0;
         request.open_journal = [](const NativeAbsolutePath &path, const NativeName &basename, bool create_new) {
             return open_native_operation_journal_file(path, basename, create_new);
@@ -409,6 +423,8 @@ ckfe_api_status ckfe_job_start_copy_regular(ckfe_entry *source, ckfe_directory *
 ckfe_api_status ckfe_job_start_move_regular(ckfe_entry *source, ckfe_directory *destination,
                                             const char *destination_name, const char *journal_root,
                                             int allow_metadata_loss, ckfe_job **out, ckfe_error *error) {
+    clear_error(error);
+    if (out) *out = nullptr;
     if (!source || !destination || !out) return CKFE_API_INVALID_ARGUMENT;
     try {
 #if defined(_WIN32)
@@ -426,7 +442,8 @@ ckfe_api_status ckfe_job_start_move_regular(ckfe_entry *source, ckfe_directory *
         request.sources = {source->child}; request.destination = destination->cursor;
         request.destination_names = {std::move(name).take_value()}; request.journal_root = std::move(root).take_value();
         request.journal_id = next_id(); request.journal_limits = {1, 32, 4096};
-        request.copy_limits.chunk_bytes = 1024 * 1024; request.copy_limits.max_bytes = UINT64_MAX;
+        request.copy_limits.chunk_bytes = 1024 * 1024;
+        request.copy_limits.max_bytes = StreamCopyLimits::hard_max_bytes;
         request.allow_unhandled_metadata_loss = allow_metadata_loss != 0;
         request.open_journal = [](const NativeAbsolutePath &path, const NativeName &basename, bool create_new) {
             return open_native_operation_journal_file(path, basename, create_new);
@@ -438,6 +455,7 @@ ckfe_api_status ckfe_job_start_move_regular(ckfe_entry *source, ckfe_directory *
 void ckfe_job_cancel(ckfe_job *job) { if (job) job->stop.request_stop(); }
 
 ckfe_api_status ckfe_job_poll(ckfe_job *job, ckfe_job_snapshot *snapshot, ckfe_error *error) {
+    clear_error(error);
     if (!job || !snapshot) return CKFE_API_INVALID_ARGUMENT;
     std::lock_guard lock(job->mutex);
     *snapshot = job->snapshot;

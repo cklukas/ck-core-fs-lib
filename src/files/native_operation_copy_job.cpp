@@ -121,23 +121,39 @@ struct NativeOperationCopyJob::State final {
 
 Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
     NativeOperationCopyRequest request) {
-    if (!request.journal || !request.journal_file || request.item >= request.journal->limits().max_items ||
-        (request.operation != FileOperation::Copy && request.operation != FileOperation::Move) ||
-        request.journal->operation() != request.operation ||
-        request.journal->state(request.item) != OperationJournalState::Planned ||
-        !request.source_parent || !request.destination || !request.source_name.is_valid() ||
-        !request.staging_name.is_valid() ||
-        !request.source_parent_identity.scope.is_valid() ||
-        !request.destination_name.is_valid() || !request.source_identity.scope.is_valid() ||
-        request.source_identity.scheme == IdentityScheme::Unknown ||
-        !request.destination_identity.scope.is_valid() ||
-        request.destination_identity.scheme == IdentityScheme::Unknown ||
-        (request.destination_address && !request.destination_address->is_valid()) ||
-        !NativeDurableIdentity::from_live(request.source_parent_identity) ||
+    if (!request.journal || !request.journal_file)
+        return rejected<Pointer>(AdapterError::PlanInvalid, "native_operation_copy.journal");
+    if (request.item >= request.journal->limits().max_items)
+        return rejected<Pointer>(AdapterError::PlanInvalid, "native_operation_copy.item");
+    if (request.operation != FileOperation::Copy && request.operation != FileOperation::Move)
+        return rejected<Pointer>(AdapterError::PlanInvalid, "native_operation_copy.operation");
+    if (request.journal->operation() != request.operation ||
+        request.journal->state(request.item) != OperationJournalState::Planned)
+        return rejected<Pointer>(AdapterError::PlanDecisionStale, "native_operation_copy.journal_state",
+                                ObservationState::Changed);
+    if (!request.source_parent || !request.destination)
+        return rejected<Pointer>(AdapterError::PlanInvalid, "native_operation_copy.owner");
+    if (!request.source_name.is_valid() || !request.staging_name.is_valid() || !request.destination_name.is_valid())
+        return rejected<Pointer>(AdapterError::InvalidIdentifier, "native_operation_copy.name");
+    if (!request.source_parent_identity.scope.is_valid() || !request.source_identity.scope.is_valid() ||
+        !request.destination_identity.scope.is_valid())
+        return rejected<Pointer>(AdapterError::UnqualifiedIdentity, "native_operation_copy.scope",
+                                ObservationState::Unknown);
+    if (request.source_identity.scheme == IdentityScheme::Unknown ||
+        request.destination_identity.scheme == IdentityScheme::Unknown)
+        return rejected<Pointer>(AdapterError::UnqualifiedIdentity, "native_operation_copy.identity",
+                                ObservationState::Unknown);
+    if (request.destination_address && !request.destination_address->is_valid())
+        return rejected<Pointer>(AdapterError::InvalidPath, "native_operation_copy.destination_address");
+    if (!NativeDurableIdentity::from_live(request.source_parent_identity) ||
         !NativeDurableIdentity::from_live(request.source_identity) ||
-        !NativeDurableIdentity::from_live(request.destination_identity) ||
-        !request.prepare_metadata || !request.copy_limits.valid())
-        return rejected<Pointer>(AdapterError::PlanInvalid, "native_operation_copy.request");
+        !NativeDurableIdentity::from_live(request.destination_identity))
+        return rejected<Pointer>(AdapterError::UnqualifiedIdentity, "native_operation_copy.durable_identity",
+                                ObservationState::Unknown);
+    if (!request.prepare_metadata)
+        return rejected<Pointer>(AdapterError::InvalidAccess, "native_operation_copy.metadata_adapter");
+    if (!request.copy_limits.valid())
+        return rejected<Pointer>(AdapterError::InvalidLimit, "native_operation_copy.copy_limits");
     const auto source_parent_identity = request.source_parent->identity();
     const auto destination_identity = request.destination->identity();
     if (!source_parent_identity.value() || !destination_identity.value() ||
@@ -381,12 +397,27 @@ Observation<OperationBatchJob::Pointer> create_native_operation_copy_batch(
 
 Observation<OperationBatchJob::Pointer> create_native_operation_copy_batch(
     NativeOperationCopyBatchRequest request) {
-    if (request.sources.empty() || request.sources.size() != request.destination_names.size() ||
-        request.sources.size() > request.policy.journal_limits.max_items || !request.destination ||
-        !request.open_journal || !request.journal_root ||
-        !request.journal_root->is_valid() || !request.policy.copy_limits.valid())
+    if (request.sources.empty())
         return rejected<OperationBatchJob::Pointer>(AdapterError::PlanInvalid,
-                                                     "native_operation_copy_batch.request");
+                                                     "native_operation_copy_batch.sources_empty");
+    if (request.sources.size() != request.destination_names.size())
+        return rejected<OperationBatchJob::Pointer>(AdapterError::PlanInvalid,
+                                                     "native_operation_copy_batch.name_count");
+    if (request.sources.size() > request.policy.journal_limits.max_items)
+        return rejected<OperationBatchJob::Pointer>(AdapterError::InvalidLimit,
+                                                     "native_operation_copy_batch.item_limit");
+    if (!request.destination)
+        return rejected<OperationBatchJob::Pointer>(AdapterError::PlanInvalid,
+                                                     "native_operation_copy_batch.destination");
+    if (!request.open_journal)
+        return rejected<OperationBatchJob::Pointer>(AdapterError::InvalidAccess,
+                                                     "native_operation_copy_batch.journal_adapter");
+    if (!request.journal_root || !request.journal_root->is_valid())
+        return rejected<OperationBatchJob::Pointer>(AdapterError::InvalidPath,
+                                                     "native_operation_copy_batch.journal_root");
+    if (!request.policy.copy_limits.valid())
+        return rejected<OperationBatchJob::Pointer>(AdapterError::InvalidLimit,
+                                                     "native_operation_copy_batch.copy_limits");
 
     const auto destination_identity = request.destination->identity();
     if (!destination_identity.value() || !NativeDurableIdentity::from_live(*destination_identity.value()))

@@ -136,17 +136,22 @@ CK_FILE_ENGINE_API uint32_t ckfe_abi_version_major(void);
 CK_FILE_ENGINE_API uint32_t ckfe_abi_version_minor(void);
 CK_FILE_ENGINE_API const char *ckfe_api_status_name(ckfe_api_status status);
 CK_FILE_ENGINE_API const char *ckfe_job_state_name(ckfe_job_state state);
-// Initialize before first use. Every successful API call overwrites an error;
-// ckfe_error_free releases the operation string owned by the caller.
+// Initialize before first use. APIs accepting an error output clear it on
+// entry and overwrite it on failure; ckfe_error_free releases the operation
+// string owned by the caller. Failed APIs also reset caller-provided output
+// handles/metadata to their empty value when those output pointers are nonnull.
 CK_FILE_ENGINE_API void ckfe_error_init(ckfe_error *error);
 CK_FILE_ENGINE_API void ckfe_error_free(ckfe_error *error);
 
 CK_FILE_ENGINE_API ckfe_api_status ckfe_engine_create(ckfe_engine **out_engine);
 CK_FILE_ENGINE_API void ckfe_engine_destroy(ckfe_engine *engine);
 
-// Paths are absolute UTF-8 lexical addresses. The native adapter performs the
-// final open using its platform-native wide/handle boundary; paths are never
-// reopened from display text during a job.
+// UTF-8 paths/names are absolute UTF-8 lexical addresses on Windows. On POSIX
+// the *_utf8 entry points preserve every non-NUL byte verbatim, including
+// byte sequences that are not valid UTF-8. Use the UTF-16 entry points for
+// exact Windows UTF-16 names. The native adapter performs the final open
+// using its platform-native wide/handle boundary; paths are never reopened
+// from display text during a job.
 CK_FILE_ENGINE_API ckfe_api_status ckfe_directory_open_utf8(
     ckfe_engine *engine, const char *absolute_path_utf8, int follow_final_link,
     ckfe_directory **out_directory, ckfe_error *error);

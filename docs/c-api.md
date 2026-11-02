@@ -12,7 +12,9 @@ release them. Destroying a job requests cancellation and joins its worker
 before releasing native handles.
 
 Initialize a `ckfe_error` with `ckfe_error_init`. Every API that accepts an
-error output overwrites it; call `ckfe_error_free` when done. The operation
+error output clears it on entry and overwrites it on failure; call
+`ckfe_error_free` when done. Failed calls reset non-null output handles and
+metadata to their empty values. The operation
 string is allocated by the library and must never be freed with a language
 runtime allocator.
 
@@ -31,6 +33,13 @@ For regular-file copy, `processed_bytes` is updated from the bounded native
 copy state machine and `total_bytes_known` is true only when a stable source
 size observation is available. A frontend must display indeterminate progress
 when the flag is false.
+
+The regular-file operation also requires an explicit metadata-loss policy. A
+request with `allow_metadata_loss` set to zero is rejected or finishes with a
+structured `ProviderReviewRequired` failure when the platform cannot preserve
+all metadata that the operation contract requires. The C ABI does not silently
+turn unsupported security or provider metadata into a successful copy. A
+caller that explicitly accepts the declared loss may set the flag to nonzero.
 
 ## Encoding
 
