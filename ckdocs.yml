@@ -1,0 +1,28 @@
+# Documentation site built by ckdocs and published by .github/workflows/pages.yml.
+version: 1
+site:
+  title: ck-core-fs-lib
+  description: Headless, cross-platform filesystem operations with a stable C ABI for ckUtilities, CDE, and other frontends.
+  footer: "© 2026 C. Klukas · GNU Lesser General Public License v2.0 or later"
+  links:
+    - title: GitHub
+      url: https://github.com/cklukas/ck-core-fs-lib
+      icon: github
+search: true
+nav:
+  - title: Home
+    page: docs/index.md
+  - title: Concepts
+    pages:
+      - docs/architecture.md
+      - docs/operations.md
+      - docs/safety.md
+  - title: API
+    pages:
+      - docs/c-api.md
+      - docs/cpp-api.md
+  - title: Integration
+    pages:
+      - docs/integration.md
+      - docs/building.md
+      - docs/roadmap.md
