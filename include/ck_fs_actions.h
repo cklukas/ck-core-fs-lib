@@ -120,6 +120,9 @@ CK_FILE_ENGINE_API void ckfea_restore_item_init(ckfea_restore_item*) CKFEA_NOEXC
 CK_FILE_ENGINE_API ckfea_status ckfea_restore_job_create(const ckfea_restore_request*, ckfea_job**) CKFEA_NOEXCEPT;
 CK_FILE_ENGINE_API ckfea_status ckfea_job_trash_receipt(const ckfea_job*, uint32_t item, ckfea_trash_receipt**) CKFEA_NOEXCEPT;
 CK_FILE_ENGINE_API ckfea_status ckfea_trash_receipt_info(const ckfea_trash_receipt*, ckfea_trash_info*) CKFEA_NOEXCEPT;
+/* Returns CKFE_OBJECT_REGULAR_FILE or CKFE_OBJECT_DIRECTORY, without I/O.
+ * Directory receipts do not claim a recursively measured byte total. */
+CK_FILE_ENGINE_API ckfea_status ckfea_trash_receipt_get_kind(const ckfea_trash_receipt*, uint32_t *out_kind) CKFEA_NOEXCEPT;
 // Native bytes only, no terminator; required size returned on BUFFER_TOO_SMALL.
 CK_FILE_ENGINE_API ckfea_status ckfea_trash_receipt_copy_name(const ckfea_trash_receipt*, uint32_t which,
     void *buffer, uint64_t capacity, uint64_t *out_required) CKFEA_NOEXCEPT;
@@ -153,8 +156,9 @@ CK_FILE_ENGINE_API ckfea_status ckfea_job_wait(ckfea_job*, uint32_t milliseconds
 // permanent delete, source retirement, shell call or blind recovery replay.
 // POSIX source-name rename races are gated Unsupported. Windows uses a verified
 // source handle. Windows Trash/restore support qualified local NTFS ordinary
-// single-link files with explicit capability opt-in and durable journals.
-// POSIX, UNC/provider/reparse objects and directory Trash remain Unsupported.
+// single-link files and directories with explicit capability opt-in and durable
+// journals. Directory Trash moves one held object; it never recursively erases.
+// POSIX and UNC/provider/reparse objects remain Unsupported.
 // Use ckfea_restore_job_create for receipt-bound restore; CKFEA_RESTORE in the
 // older general request lacks a native receipt and cannot authorize restore.
 // No untrusted trashinfo path is parsed. Trash/restore are never retried.

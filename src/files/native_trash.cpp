@@ -41,9 +41,12 @@ Observation<std::vector<std::byte>> windows_trash_metadata(std::u16string_view p
 }
 Observation<std::vector<std::byte>> encode_native_trash_receipt(const NativeTrashReceipt& r) {
     using R=Observation<std::vector<std::byte>>;
-    if(r.metadata_bytes.size()>65564) return unsupported<std::vector<std::byte>>("trash.evidence_limit");
+    if(r.metadata_bytes.size()>65564 || (r.object_kind!=ObjectKind::RegularFile && r.object_kind!=ObjectKind::Directory))
+        return unsupported<std::vector<std::byte>>("trash.evidence_limit_or_kind");
     std::vector<std::byte> out; out.reserve(r.metadata_bytes.size()+512);
-    for(unsigned char c:std::string_view("CKTR\1",5)) put(out,c,1);
+    for(unsigned char c:std::string_view("CKTR\2",5)) put(out,c,1);
+    put(out,r.object_kind==ObjectKind::Directory?1:0,1);
+    put(out,r.metadata_retired?1:0,1);
     if(!append_name(out,r.original_name)||!append_name(out,r.data_name)||!append_name(out,r.metadata_name)||!append_name(out,r.user_sid)||
         !append_id(out,r.original_parent)||!append_id(out,r.object)||!append_id(out,r.recycle_parent))
         return R::unavailable(ObservationState::Failed,{ErrorDomain::Adapter,

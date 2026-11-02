@@ -110,6 +110,13 @@ never imports authority from serialized Trash metadata. Destroying a job is a
 nonblocking cancellation/release. A terminal action state follows journal
 finalization and release of the operation's native input owners; separately
 retained Trash receipts keep read-only identity pins until their own disposal.
+`ckfea_trash_receipt_get_kind` distinguishes regular files and directories
+without changing the existing receipt-info layout. A directory move carries its
+whole native object; it does not recursively erase or report an invented byte
+total. Restore removes the verified native `$I` entry even while an old receipt
+still pins its identity. Original-path text can use an extended volume GUID
+when the local volume has no DOS letter; that text never selects the restore
+destination.
 
 `ck_fs_session.h` provides worker-only durable baseline sessions and verified
 commit receipts. Open retains both root locks, including overlap protection;

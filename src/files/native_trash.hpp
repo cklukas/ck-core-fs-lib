@@ -19,6 +19,8 @@ struct NativeTrashReceipt final {
     std::optional<NativeDurableIdentity> metadata_identity;
     std::vector<std::byte> metadata_bytes;
     std::shared_ptr<const NativeTrashIdentityOwner> continuity;
+    ObjectKind object_kind = ObjectKind::RegularFile;
+    bool metadata_retired = false;
 };
 using NativeTrashJournal = std::function<Observation<bool>(OperationJournalState, const NativeTrashReceipt&)>;
 class NativeTrashTransaction {
@@ -34,7 +36,9 @@ class NativeTrashBackend {
 public:
     virtual ~NativeTrashBackend() = default;
     // May provision the native per-user bin, but never moves the source or
-    // creates a metadata record until commit. Only qualified ordinary files.
+    // creates a metadata record until commit. Only qualified ordinary files
+    // and directories; directory Trash moves the entire held object, never a
+    // recursive permanent-delete fallback.
     virtual Observation<std::unique_ptr<NativeTrashTransaction>> prepare_trash(HeldChild::Pointer, std::stop_token) const = 0;
     virtual Observation<std::unique_ptr<NativeTrashTransaction>> prepare_restore(const NativeTrashReceipt&,
         std::shared_ptr<const DirectoryCursor> original_parent, std::stop_token) const = 0;
@@ -56,6 +60,7 @@ public:
     WindowsTrashHandle(const WindowsTrashHandle&) = delete;
     WindowsTrashHandle& operator=(const WindowsTrashHandle&) = delete;
     void* get() const noexcept { return value_; }
+    void* release() noexcept;
 private:
     void* value_;
 };

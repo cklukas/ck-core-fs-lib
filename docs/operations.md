@@ -10,14 +10,14 @@
 | Reviewed trees | Native inventory, immutable pages and facts, assessment, receipt-bound execution, stale receipt rejection, pause/resume/cancel and explicit worker drain | Each provider must qualify publication, metadata and source retirement; unsupported primitives cannot become success |
 | Retained replacement | Journaled old-target retention and explicit retained names before incoming publication | Requires stable old-object content and an object-bound native rename; unknown coverage refuses replacement |
 | Batch rename | Exception-free C jobs, exact native names, duplicate/cycle/collision review, reverse dependency order, one-use approval and bounded verified retry | Windows qualified native handle rename; POSIX source-name mutation remains refused |
-| Native Trash/restore | Explicit capability opt-in, private native metadata, live opaque receipt, held original-parent identity and no-overwrite restore | Qualified local Windows NTFS regular files; directories and other providers need their own positive qualification |
+| Native Trash/restore | Explicit capability opt-in, private native metadata, live opaque receipt, held original-parent identity and no-overwrite restore | Qualified local Windows NTFS regular files and directories, including volumes without DOS drive letters; other providers remain conditional/refused |
 | Preservation | Versioned policy assessment, ordinary-scope native checks, mode/time verification and special-bit stripping | Complete preservation remains unavailable; opaque attributes and unsupported security are refused |
 | Job lifecycle | Worker-side setup, cancellation, bounded/coalesced events, retained terminal byte progress, explicit reconciliation outcomes | Cross-platform CI and installed-consumer checks qualify each revision |
 | Recovery | Private journal inspection and immutable C summary/pages | Read-only; no automatic replay authority |
 | Browser models | Optional C++ browser target | Separate from C ABI engine/platform dependencies |
 
 Full ACL/xattr/security replay, complete mixed-direction hierarchical execution,
-provider-owned durable private-root capabilities, directory Trash and verified
+provider-owned durable private-root capabilities and verified
 prefix resume remain delivery gates. Implemented interfaces and a passing
 planning suite do not establish a platform's mutation capabilities. Consult the
 [revision-specific evidence](validation-2026-11-02.md): the macOS strong

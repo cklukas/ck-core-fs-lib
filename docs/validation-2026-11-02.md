@@ -282,3 +282,38 @@ operation ID, without parsing or validating either mutation-only field. The
 same five suites passed again; the C test additionally proves Copy and Sync
 reject both missing IDs and missing journal roots. Evidence is
 `/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/compare-no-journal-record.json`.
+
+## Windows directory Trash and restore checkpoint
+
+An isolated Windows snapshot built the native directory adapter and actual C
+action jobs with the v143 toolset on V:. Seven NTFS round trips passed: ordinary
+files, raw UTF-16 names, occupied-target refusal followed by safe restore,
+directories with nested data, directory collisions, and paths beyond MAX_PATH.
+Directory descendants retained their native identities and exact bytes;
+owner/group/DACL, integrity descriptor, creation/modification times and Windows
+attributes matched before and after each round trip. A live old receipt did
+not defer `$I` namespace removal, and repeated restore was refused.
+
+Additional native checks passed for bin-ancestor substitution, inherited public
+ACE rejection, private protected `$I` descriptors, forged receipt fields,
+receipt lifetime across job destruction, and deleted/recreated original-parent
+rejection. Filesystem mutations remained bound to held handles. Destination
+collisions never became overwrite or recursive permanent deletion.
+
+The first run found a real drive-letter assumption: GetFinalPathNameByHandleW
+with VOLUME_NAME_DOS fails for a local volume without a drive letter, including
+one reached through a junction. The adapter now obtains that held parent's
+extended volume GUID address for informational `$I` text. It never reopens the
+text or uses it to choose a restore destination. The native API behavior is
+documented by [Microsoft](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew).
+
+The final incremental build took 11.37 seconds and native tests 0.89 seconds.
+Exact input hashes, executable hash/timestamp, start/end times and fixture are
+recorded in
+`/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/directory-trash/security-20261103-f-record.json`.
+A separate pure-C executable also linked and ran against the real Windows DLL
+to check the additive receipt-kind export and invalid-argument outputs. Its
+DLL SHA-256 was
+`82fd8dc637a5478a643cb0b3c34c0d50bf2255c43cf54436e631035749c6f017`.
+These focused results do not qualify unintegrated root capabilities, full
+Complete-copy preservation, macOS publication, or the full Windows tree suite.

@@ -8,6 +8,10 @@
 #include <string.h>
 
 int main(void) {
+    uint32_t trash_kind=UINT32_MAX;
+    assert(ckfea_trash_receipt_get_kind(NULL,&trash_kind)==CKFEA_INVALID_ARGUMENT);
+    assert(trash_kind==CKFE_OBJECT_UNKNOWN);
+    assert(ckfea_trash_receipt_get_kind(NULL,NULL)==CKFEA_INVALID_ARGUMENT);
     ckfe_error error;
     ckfe_error_init(&error);
     assert(strcmp(ckfe_version(), "0.3.0") == 0);

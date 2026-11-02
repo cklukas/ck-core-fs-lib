@@ -517,24 +517,53 @@ void execute_c(ckfea_job* job) {
     auto receipt=output<ckfea_receipt>();assert(ckfea_job_receipt(job,&receipt)==CKFEA_OK);
     assert(ckfea_job_execute(job,&receipt)==CKFEA_OK);wait_c(job);
 }
-void windows_native_trash_case(std::shared_ptr<const DirectoryCursor> cursor,const NativeName& source,bool collision) {
+std::wstring test_volume_root(const DirectoryCursor&);
+std::wstring test_current_sid();
+void windows_native_trash_case(std::shared_ptr<const DirectoryCursor> cursor,const NativeName& source,bool collision,bool directory=false) {
     static unsigned sequence=0;const auto suffix=std::to_string(++sequence);
+    std::fprintf(stderr,"native Trash case=%u directory=%u collision=%u native_units=%zu\n",sequence,unsigned(directory),unsigned(collision),source.windows_units()->size());
     const auto journal=*NativeName::from_windows(std::u16string(u"trash-")+std::u16string(suffix.begin(),suffix.end()));
-    auto created=cursor->create_child_file(source);assert(created.value());
     const std::array<std::byte,5> content{std::byte{1},std::byte{0xff},std::byte{3},std::byte{0},std::byte{7}};
+    std::shared_ptr<const DirectoryCursor> content_parent=cursor;
+    const auto nested_name=*NativeName::from_windows(std::u16string(u"nested-猫-")+char16_t(0xd800));
+    const auto leaf_name=*NativeName::from_windows(u"payload. ");
+    std::optional<ObjectIdentity> nested_identity,leaf_identity;
+    if(directory) {
+        auto made=cursor->create_child_directory(source);assert(made.value());
+        std::shared_ptr<const DirectoryCursor> folder(std::move(made).take_value());
+        auto nested=folder->create_child_directory(nested_name);assert(nested.value());
+        content_parent=std::shared_ptr<const DirectoryCursor>(std::move(nested).take_value());
+        nested_identity=*content_parent->identity().value();
+    }
+    auto created=content_parent->create_child_file(directory?leaf_name:source);assert(created.value());
     auto write=(*created.value())->write_content(0,content);assert(write.value()&&*write.value()==content.size());
-    assert((*created.value())->flush_content().value());created=Observation<std::unique_ptr<OpenedEntry>>{};
+    assert((*created.value())->flush_content().value());
+    leaf_identity=*(*created.value())->inspect_basic().value()->identity.value();
+    assert((*created.value())->finish_content_writes().value());created=Observation<std::unique_ptr<OpenedEntry>>{};
+    content_parent.reset();
     auto observed=HeldChild::observe(cursor,source);assert(observed.value());const auto identity=*(*observed.value())->metadata().identity.value();
+    auto security_entry=cursor->open_child(source,EntryAccess::MetadataAndSecurity);assert(security_entry.value());
+    auto access_before=(*security_entry.value())->read_security(SecurityPart::WindowsAccess);assert(access_before.value());
+    auto integrity_before=(*security_entry.value())->read_security(SecurityPart::WindowsIntegrity);assert(integrity_before.value());
+    const auto basic_before=(*security_entry.value())->inspect_basic();assert(basic_before.value());
+    security_entry=Observation<std::unique_ptr<OpenedEntry>>{};
     ckfe_entry input{}; input.child=*observed.value();ckfea_item item;ckfea_item_init(&item);item.source=&input;
     ckfea_request request;ckfea_request_init(&request);request.operation=CKFEA_TRASH;request.capabilities=CKFEA_ALLOW_NATIVE_TRASH;
     request.items=&item;request.item_count=1;request.journal_directory=native_path_text(*root);request.journal_name=native_text(journal);
     ckfea_job* job=nullptr;assert(ckfea_job_create(&request,&job)==CKFEA_OK);wait_c(job);
     auto result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK);
-    if(result.state!=CKFEA_READY)std::fprintf(stderr,"native Trash preview state=%u domain=%u code=%lld reason=%u\n",result.state,result.error_domain,(long long)result.error_code,result.reason);
+    if(result.state!=CKFEA_READY) {
+        std::fprintf(stderr,"native Trash preview state=%u domain=%u code=%lld reason=%u\n",result.state,result.error_domain,(long long)result.error_code,result.reason);
+        auto diagnostic=native_trash_backend()->prepare_trash(*observed.value(),{});
+        if(!diagnostic.value())std::fprintf(stderr,"native Trash preparation operation=%s domain=%u code=%lld\n",diagnostic.unavailable_detail()->error.operation.c_str(),unsigned(diagnostic.unavailable_detail()->error.domain),(long long)diagnostic.unavailable_detail()->error.code);
+    }
     assert(result.state==CKFEA_READY);execute_c(job);result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK);
     if(result.state!=CKFEA_VERIFIED)std::fprintf(stderr,"native Trash commit state=%u domain=%u code=%lld\n",result.state,result.error_domain,(long long)result.error_code);
     assert(result.state==CKFEA_VERIFIED);
     ckfea_trash_receipt* trash=nullptr;assert(ckfea_job_trash_receipt(job,0,&trash)==CKFEA_OK&&trash);ckfea_job_destroy(job);
+    uint32_t kind=CKFE_OBJECT_UNKNOWN;
+    assert(ckfea_trash_receipt_get_kind(trash,&kind)==CKFEA_OK);
+    assert(kind==(directory?CKFE_OBJECT_DIRECTORY:CKFE_OBJECT_REGULAR_FILE));
     auto info=output<ckfea_trash_info>();assert(ckfea_trash_receipt_info(trash,&info)==CKFEA_OK);
     assert(info.encoding==CKFEA_WINDOWS_UTF16&&info.original_name_bytes==source.windows_units()->size()*2&&info.object.scheme==2);
     uint64_t required=0;assert(ckfea_trash_receipt_copy_name(trash,CKFEA_TRASH_ORIGINAL_NAME,nullptr,0,&required)==CKFEA_BUFFER_TOO_SMALL);
@@ -546,7 +575,7 @@ void windows_native_trash_case(std::shared_ptr<const DirectoryCursor> cursor,con
     ckfea_restore_request restore;ckfea_restore_request_init(&restore);restore.capabilities=CKFEA_ALLOW_NATIVE_RESTORE;restore.items=&restore_item;restore.item_count=1;
     auto restore_journal=*NativeName::from_windows(std::u16string(u"restore-")+std::u16string(suffix.begin(),suffix.end()));
     restore.journal_directory=native_path_text(*root);restore.journal_name=native_text(restore_journal);
-    assert(ckfea_restore_job_create(&restore,&job)==CKFEA_OK);if(!collision)ckfea_trash_receipt_destroy(trash);wait_c(job);
+    assert(ckfea_restore_job_create(&restore,&job)==CKFEA_OK);if(!collision&&!directory)ckfea_trash_receipt_destroy(trash);wait_c(job);
     result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK);
     if(collision) {
         assert(result.state==CKFEA_CHANGED||result.state==CKFEA_COLLISION);ckfea_job_destroy(job);
@@ -557,16 +586,45 @@ void windows_native_trash_case(std::shared_ptr<const DirectoryCursor> cursor,con
         assert(compare_identity(occupied_id,identity)==IdentityComparison::Different);
         auto removed=cursor->discard_child(source,occupied_id);assert(removed.value()&&*removed.value());
         occupied=Observation<HeldChild::Pointer>{};
-        assert(ckfea_restore_job_create(&restore,&job)==CKFEA_OK);ckfea_trash_receipt_destroy(trash);wait_c(job);
+        assert(ckfea_restore_job_create(&restore,&job)==CKFEA_OK);if(!directory)ckfea_trash_receipt_destroy(trash);wait_c(job);
         result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK);
     }
     if(result.state!=CKFEA_READY)std::fprintf(stderr,"native Restore preview state=%u domain=%u code=%lld\n",result.state,result.error_domain,(long long)result.error_code);
     assert(result.state==CKFEA_READY);execute_c(job);result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK);
     if(result.state!=CKFEA_VERIFIED)std::fprintf(stderr,"native Restore commit state=%u domain=%u code=%lld\n",result.state,result.error_domain,(long long)result.error_code);
     assert(result.state==CKFEA_VERIFIED);ckfea_job_destroy(job);
-    auto restored=HeldChild::observe_with_access(cursor,source,EntryAccess::ContentRead);assert(restored.value());
+    auto restored=HeldChild::observe_with_access(cursor,source,directory?EntryAccess::MetadataOnly:EntryAccess::ContentRead);assert(restored.value());
     assert(compare_identity(identity,*(*restored.value())->metadata().identity.value())==IdentityComparison::Same);
-    auto bytes=(*restored.value())->read_content();assert(bytes.value()&&bytes.value()->complete&&bytes.value()->bytes==std::vector<std::byte>(content.begin(),content.end()));
+    security_entry=cursor->open_child(source,EntryAccess::MetadataAndSecurity);assert(security_entry.value());
+    auto access_after=(*security_entry.value())->read_security(SecurityPart::WindowsAccess);assert(access_after.value());
+    auto integrity_after=(*security_entry.value())->read_security(SecurityPart::WindowsIntegrity);assert(integrity_after.value());
+    const auto basic_after=(*security_entry.value())->inspect_basic();assert(basic_after.value());
+    assert(access_before.value()->presence==access_after.value()->presence&&access_before.value()->bytes==access_after.value()->bytes);
+    assert(integrity_before.value()->presence==integrity_after.value()->presence&&integrity_before.value()->bytes==integrity_after.value()->bytes);
+    assert(basic_before.value()->created.value()&&basic_after.value()->created.value()&&*basic_before.value()->created.value()==*basic_after.value()->created.value());
+    assert(basic_before.value()->modified.value()&&basic_after.value()->modified.value()&&*basic_before.value()->modified.value()==*basic_after.value()->modified.value());
+    assert(basic_before.value()->windows_attributes.value()&&basic_after.value()->windows_attributes.value()&&*basic_before.value()->windows_attributes.value()==*basic_after.value()->windows_attributes.value());
+    security_entry=Observation<std::unique_ptr<OpenedEntry>>{};
+    if(directory) {
+        auto folder=cursor->open_directory_child(source);assert(folder.value());
+        auto nested=(*folder.value())->open_directory_child(nested_name);assert(nested.value());
+        assert(compare_identity(*nested_identity,*(*nested.value())->identity().value())==IdentityComparison::Same);
+        auto leaf=(*nested.value())->open_child(leaf_name,EntryAccess::ContentRead);assert(leaf.value());
+        assert(compare_identity(*leaf_identity,*(*leaf.value())->inspect_basic().value()->identity.value())==IdentityComparison::Same);
+        auto bytes=(*leaf.value())->read_content();assert(bytes.value()&&bytes.value()->complete&&bytes.value()->bytes==std::vector<std::byte>(content.begin(),content.end()));
+        // The old opaque receipt remains alive: restoring must still remove
+        // the $I namespace entry, not defer deletion until receipt destruction.
+        assert(ckfea_trash_receipt_copy_name(trash,CKFEA_TRASH_METADATA_NAME,nullptr,0,&required)==CKFEA_BUFFER_TOO_SMALL);
+        std::u16string metadata(static_cast<size_t>(required/2),u'\0');
+        assert(ckfea_trash_receipt_copy_name(trash,CKFEA_TRASH_METADATA_NAME,metadata.data(),required,&required)==CKFEA_OK);
+        auto metadata_path=test_volume_root(*cursor)+L"$Recycle.Bin\\"+test_current_sid()+L"\\"+std::wstring(metadata.begin(),metadata.end());
+        assert(GetFileAttributesW(metadata_path.c_str())==INVALID_FILE_ATTRIBUTES&&GetLastError()==ERROR_FILE_NOT_FOUND);
+        assert(ckfea_restore_job_create(&restore,&job)==CKFEA_OK);wait_c(job);
+        result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK&&result.state!=CKFEA_READY&&result.state!=CKFEA_VERIFIED);
+        ckfea_job_destroy(job);ckfea_trash_receipt_destroy(trash);
+    } else {
+        auto bytes=(*restored.value())->read_content();assert(bytes.value()&&bytes.value()->complete&&bytes.value()->bytes==std::vector<std::byte>(content.begin(),content.end()));
+    }
 }
 struct TestWinClose { void operator()(void* p) const noexcept {if(p&&p!=INVALID_HANDLE_VALUE)CloseHandle(p);} };
 using TestWinHandle=std::unique_ptr<void,TestWinClose>;
@@ -655,6 +713,9 @@ void native_bin_critical_tests() {
         assert(RemoveDirectoryW(path.c_str()));assert(MoveFileExW(moved.c_str(),path.c_str(),0));
     }
     auto unbound=receipt;unbound.continuity.reset();assert(!backend->prepare_restore(unbound,cursor,{}).value());
+    auto changed=receipt;changed.original_name=host_name("forged-original");assert(!backend->prepare_restore(changed,cursor,{}).value());
+    changed=receipt;changed.object_kind=ObjectKind::Directory;assert(!backend->prepare_restore(changed,cursor,{}).value());
+    changed=receipt;changed.metadata_bytes.back()^=std::byte{1};assert(!backend->prepare_restore(changed,cursor,{}).value());
     auto restore=backend->prepare_restore(receipt,cursor,{});assert(restore.value());TestTrashJournal restored;
     assert_native_result((*restore.value())->commit(restored.callback(),{}),"critical Restore");
     std::puts("critical Trash: pinned bin ancestry, inherited-public ACE rejection, protected $I DACL and live-only restore passed");
@@ -695,12 +756,15 @@ void windows_native_trash_tests() {
     windows_native_trash_case(cursor,*NativeName::from_windows(u"ordinary-trash.bin"),false);
     windows_native_trash_case(cursor,*NativeName::from_windows(std::u16string(u"猫-ß-")+char16_t(0xd800)),false);
     windows_native_trash_case(cursor,*NativeName::from_windows(u"restore-collision.bin"),true);
+    windows_native_trash_case(cursor,*NativeName::from_windows(u"directory-trash"),false,true);
+    windows_native_trash_case(cursor,*NativeName::from_windows(u"directory-collision"),true,true);
     // Held-directory creation keeps every component native and exceeds MAX_PATH.
     for(unsigned i=0;i<5;++i) {
         auto n=*NativeName::from_windows(std::u16string(60,char16_t(u'a'+i)));
         auto child=cursor->create_child_directory(n);assert(child.value());cursor=std::shared_ptr<const DirectoryCursor>(std::move(child).take_value());
     }
     windows_native_trash_case(cursor,*NativeName::from_windows(u"long-path-猫.bin"),false);
+    windows_native_trash_case(cursor,*NativeName::from_windows(std::u16string(u"long-directory-猫-")+char16_t(0xdc00)),false,true);
 }
 #endif
 void release_test() {

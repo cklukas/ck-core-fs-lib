@@ -186,6 +186,16 @@ ckfea_status ckfea_trash_receipt_copy_name(const ckfea_trash_receipt* receipt,ui
     });
 }
 void ckfea_trash_receipt_destroy(ckfea_trash_receipt* receipt) noexcept {delete receipt;}
+ckfea_status ckfea_trash_receipt_get_kind(const ckfea_trash_receipt* receipt,uint32_t* out) noexcept {
+    if(out)*out=CKFE_OBJECT_UNKNOWN;
+    return boundary([&]()->ckfea_status {
+        require(receipt && receipt->value && out);
+        const auto kind=receipt->value->object_kind;
+        require(kind==ObjectKind::RegularFile || kind==ObjectKind::Directory);
+        *out=kind==ObjectKind::Directory?CKFE_OBJECT_DIRECTORY:CKFE_OBJECT_REGULAR_FILE;
+        return CKFEA_OK;
+    });
+}
 ckfea_status ckfea_job_summary(const ckfea_job* job, ckfea_summary* out) noexcept {
     if (!header(out) || out->reserved) return CKFEA_INVALID_ARGUMENT;
     reset(*out);
