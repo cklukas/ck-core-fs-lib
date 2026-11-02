@@ -156,6 +156,19 @@ OperationCommitState OperationCommitJob::advance(std::stop_token stop) {
             return result_.state;
         }
         if (!append(OperationJournalState::DestinationCommitted)) return result_.state;
+        if (request_.finalize_destination) {
+            try {
+                auto finished=request_.finalize_destination();
+                if (!finished.value() || !*finished.value()) {
+                    fail(finished.value() ? detail(AdapterError::InvalidNativeResult,"operation_commit.finalize_result")
+                                          : *finished.unavailable_detail(),true);
+                    return result_.state;
+                }
+            } catch (...) {
+                fail(AdapterError::InvalidNativeResult,"operation_commit.finalize_exception",true);
+                return result_.state;
+            }
+        }
         if (request_.operation == FileOperation::Copy) {
             if (append(OperationJournalState::Complete)) result_.state = OperationCommitState::Complete;
         } else {

@@ -4,6 +4,7 @@ project(ck-core-fs-lib VERSION 0.3.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+find_package(Threads REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -103,6 +104,7 @@ target_include_directories(ck_core_fs_engine
          $<INSTALL_INTERFACE:include/ck-core-fs>
          $<INSTALL_INTERFACE:include>)
 target_compile_features(ck_core_fs_engine PUBLIC cxx_std_20)
+target_link_libraries(ck_core_fs_engine PUBLIC Threads::Threads)
 
 # Pane ordering/filtering and index views depend on browser policy. The reusable
 # directory_index_record/store primitives remain in the engine below this layer.
@@ -146,6 +148,9 @@ else()
     src/files/platform/operation_journal_file_posix.cpp
     src/files/platform/sync_session_posix.cpp
     src/files/platform/home_posix.cpp)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(ck_files_platform PRIVATE src/files/platform/linux_anonymous_staging.cpp)
+  endif()
 endif()
 target_link_libraries(ck_files_platform PUBLIC ck_core_fs_engine)
 target_include_directories(ck_files_platform PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/files>)
@@ -162,8 +167,16 @@ set_target_properties(ck_core_fs_native PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ck_core_fs_native PUBLIC ck_files_platform)
 target_compile_features(ck_core_fs_native PUBLIC cxx_std_20)
 
-add_library(ck_file_engine_c SHARED src/c-api/ck_file_engine.cpp src/c-api/preservation_policy_c.cpp
+add_library(ck_file_engine_c_objects OBJECT src/c-api/ck_file_engine.cpp src/c-api/preservation_policy_c.cpp
   src/c-api/comparison_plan_c.cpp src/c-api/tree_c.cpp src/c-api/actions_c.cpp src/c-api/session_c.cpp)
+set_target_properties(ck_file_engine_c_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(ck_file_engine_c_objects PRIVATE cxx_std_20)
+target_compile_definitions(ck_file_engine_c_objects PRIVATE CK_FILE_ENGINE_BUILD)
+target_link_libraries(ck_file_engine_c_objects PRIVATE ck_core_fs_native)
+if(WIN32)
+  target_compile_definitions(ck_file_engine_c_objects PRIVATE NOMINMAX)
+endif()
+add_library(ck_file_engine_c SHARED $<TARGET_OBJECTS:ck_file_engine_c_objects>)
 target_compile_features(ck_file_engine_c PUBLIC cxx_std_20)
 target_compile_definitions(ck_file_engine_c PRIVATE CK_FILE_ENGINE_BUILD)
 target_include_directories(ck_file_engine_c
@@ -181,6 +194,17 @@ set_target_properties(ck_file_engine_c PROPERTIES
 include(CTest)
 if(BUILD_TESTING)
   enable_testing()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  # Mixed C++/C qualification must contain ONE native implementation. Linking
+  # the native static archives and the C shared library into the same process
+  # duplicates RTTI/state and triggers a genuine ASan ODR violation. Reuse the
+  # exact C wrapper objects with the same native archives for these tests.
+  # Pure C ABI/job/installed-consumer tests still load the actual shared library.
+  add_library(ck_file_engine_c_test_support STATIC $<TARGET_OBJECTS:ck_file_engine_c_objects>)
+  target_link_libraries(ck_file_engine_c_test_support PUBLIC ck_core_fs_native)
+  target_include_directories(ck_file_engine_c_test_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(ck_file_engine_c_test_support INTERFACE
+    CK_FILE_ENGINE_STATIC CK_FS_POLICY_STATIC CK_FS_SESSION_STATIC)
   set(CK_CORE_FS_NATIVE_TEST_ROOT "${CMAKE_CURRENT_BINARY_DIR}/tasks" CACHE PATH
     "Explicit native fixture root; private-store/ownership tests need an ownership-enforcing filesystem")
   if(NOT IS_ABSOLUTE "${CK_CORE_FS_NATIVE_TEST_ROOT}")
@@ -193,7 +217,7 @@ if(BUILD_TESTING)
   add_test(NAME ck_core_fs_c_abi_tests COMMAND ck_core_fs_c_abi_tests)
   add_executable(ck_fs_preservation_policy_tests tests/preservation_policy_tests.cpp)
   target_compile_definitions(ck_fs_preservation_policy_tests PRIVATE CK_FS_POLICY_STATIC)
-  target_link_libraries(ck_fs_preservation_policy_tests PRIVATE ck_core_fs_engine ck_file_engine_c)
+  target_link_libraries(ck_fs_preservation_policy_tests PRIVATE ck_file_engine_c_test_support)
   add_test(NAME preservation_policy COMMAND ck_fs_preservation_policy_tests)
   add_executable(ck_fs_comparison_plan_tests tests/comparison_plan_tests.cpp)
   target_link_libraries(ck_fs_comparison_plan_tests PRIVATE ck_core_fs_engine)
@@ -217,6 +241,26 @@ if(BUILD_TESTING)
   add_executable(ck_fs_sync_baseline_tests tests/sync_baseline_tests.cpp)
   target_link_libraries(ck_fs_sync_baseline_tests PRIVATE ck_core_fs_engine)
   add_test(NAME sync_baseline COMMAND ck_fs_sync_baseline_tests)
+  foreach(suite io_finalization recovery_evidence)
+    add_executable(ck_fs_${suite}_tests tests/${suite}_tests.cpp)
+    target_link_libraries(ck_fs_${suite}_tests PRIVATE ck_core_fs_engine)
+    if(MSVC)
+      target_compile_options(ck_fs_${suite}_tests PRIVATE /UNDEBUG)
+    else()
+      target_compile_options(ck_fs_${suite}_tests PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME ${suite} COMMAND ck_fs_${suite}_tests)
+  endforeach()
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ck_fs_native_staging_tests tests/native_staging_tests.cpp)
+    target_link_libraries(ck_fs_native_staging_tests PRIVATE ck_core_fs_native)
+    target_compile_options(ck_fs_native_staging_tests PRIVATE -UNDEBUG)
+    add_test(NAME native_staging COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py $<TARGET_FILE:ck_fs_native_staging_tests>
+      ${CK_CORE_FS_NATIVE_TEST_ROOT})
+    set_tests_properties(native_staging PROPERTIES TIMEOUT 180
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT};CK_FS_REQUIRE_NATIVE_STAGING=1;CK_FS_REQUIRE_UNPRIVILEGED_STAGING=1;CK_FS_REQUIRE_THREAD_FD_STAGING=1")
+  endif()
   add_executable(ck_fs_regular_metadata_tests tests/regular_metadata_preservation_tests.cpp)
   target_link_libraries(ck_fs_regular_metadata_tests PRIVATE ck_files_platform)
   add_test(NAME regular_metadata COMMAND ck_fs_regular_metadata_tests)
@@ -227,7 +271,6 @@ if(BUILD_TESTING)
   add_test(NAME job_lifecycle COMMAND ck_fs_job_lifecycle_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
   set_tests_properties(job_lifecycle PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
-  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_executable(ck_fs_tree_c_tests tests/tree_c_tests.cpp)
   target_link_libraries(ck_fs_tree_c_tests PRIVATE ck_file_engine_c)
   if(MSVC)
@@ -235,7 +278,7 @@ if(BUILD_TESTING)
   else()
     target_compile_options(ck_fs_tree_c_tests PRIVATE -UNDEBUG)
   endif()
-  foreach(tree_case copy stale cancel keepboth)
+  foreach(tree_case copy stale cancel cancelreview keepboth)
     add_test(NAME tree_c_${tree_case} COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tree_c.py $<TARGET_FILE:ck_fs_tree_c_tests>
       ${CK_CORE_FS_NATIVE_TEST_ROOT} ${tree_case})
@@ -244,7 +287,11 @@ if(BUILD_TESTING)
   endforeach()
   foreach(native_suite metadata_replay reviewed_tree_plan sync_session actions_c retained_target)
     add_executable(ck_fs_${native_suite}_tests tests/${native_suite}_tests.cpp)
-    target_link_libraries(ck_fs_${native_suite}_tests PRIVATE ck_core_fs_native ck_file_engine_c)
+    if(native_suite STREQUAL "actions_c" OR native_suite STREQUAL "sync_session")
+      target_link_libraries(ck_fs_${native_suite}_tests PRIVATE ck_file_engine_c_test_support)
+    else()
+      target_link_libraries(ck_fs_${native_suite}_tests PRIVATE ck_core_fs_native)
+    endif()
     target_include_directories(ck_fs_${native_suite}_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/c-api)
     if(MSVC)
       target_compile_options(ck_fs_${native_suite}_tests PRIVATE /UNDEBUG)

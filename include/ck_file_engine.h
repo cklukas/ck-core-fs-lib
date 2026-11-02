@@ -7,7 +7,9 @@
 #include <stdint.h>
 #include "ck_fs_policy.h"
 
-#if defined(_WIN32) && defined(CK_FILE_ENGINE_BUILD)
+#if defined(CK_FILE_ENGINE_STATIC)
+#define CK_FILE_ENGINE_API
+#elif defined(_WIN32) && defined(CK_FILE_ENGINE_BUILD)
 #define CK_FILE_ENGINE_API __declspec(dllexport)
 #elif defined(_WIN32)
 #define CK_FILE_ENGINE_API __declspec(dllimport)

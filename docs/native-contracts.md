@@ -94,7 +94,7 @@ not exclude unrelated filesystem writers.
 
 The store stages and flushes a generation, publishes a durable intent, installs
 the generation, and flushes its parent. It retains prior generation evidence
-and recovers an authenticated interrupted intent. Generation checks compare
+and recovers a validated interrupted intent. Generation checks compare
 the loaded and stored state. Corruption or a missing required baseline remains
 a review condition. First-run approval is explicit.
 
@@ -124,3 +124,40 @@ records toolchain, timing, and native fixture outcomes. Native-call acceptance
 and deterministic crash-state tests are separate from physical power-loss
 qualification. Sanitizers must instrument the entire implementation and use
 matching dependency layouts; a mixed-layout crash is not a valid passing gate.
+
+## Hardening work after the integration checkpoint
+
+The native copy protocol closes its writable destination after durable
+publication and before completion or any source-removal intent. It caches the
+actual committed identity before closing; it never claims a fresh observation
+through the closed writer. Final journal close is also fallible. Close errors
+require reconciliation and never turn into successful completion. Descriptors
+are consumed before close and never retried after EINTR or another ambiguous
+close result.
+
+Journal flush includes both the file and its retained parent directory, so a
+successful record does not depend on an unflushed journal entry. Darwin also
+requires `F_FULLFSYNC`. The caller must durably provision the journal root and
+its ancestors before handing it to the library. These calls and fault tests do
+not establish physical power-loss qualification.
+
+Linux staging uses `O_TMPFILE` and publishes the held object with a no-replace
+hard link. A qualified `/proc/thread-self/fd` route supports unprivileged
+publication when the empty-path operation is denied. Anonymous staging has no
+filename. Recovery evidence version 6 records that distinction; the retained
+name is only a diagnostic hint and is never reopened or deleted. Old evidence
+versions remain named and cannot manufacture live creator ownership.
+
+Ordinary named creation is separate from staging. POSIX name-based publication
+cannot satisfy the source-identity contract by checking before and after
+rename. It is refused rather than silently substituted for held-object
+publication. The current macOS provider has no qualified strong publication
+implementation; positive macOS copy/execution gates remain open.
+
+Complete metadata capture, application and verification currently refuse
+unproved logical-security coverage. A successful ordinary copy is not Complete
+preservation. Complete provider qualification requires every requested logical
+class, including labels/capabilities, to be known and preserved. Windows
+alternate streams, complete security coverage, directory replay, native
+two-way composition and verified prefix resume remain active implementation
+work. None is qualified merely by its interface or a model test.

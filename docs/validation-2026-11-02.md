@@ -207,3 +207,53 @@ proves no remaining backend I/O; it does not repair destructor-only close-error
 reporting. Frontend execution remains gated pending these fixes and pinned
 cross-platform qualification. No release tag or blanket preservation claim
 is made from this checkpoint.
+
+### Complete-scope report review
+
+Independent consumer review found that the passing Complete-copy cases above
+checked basic bytes/mode/times but did not require the report's logical-security
+coverage. `LABELS_CAPABILITIES` remained Unknown while provider qualification
+was incorrectly promoted to Available. Therefore those cases do **not**
+qualify Complete logical preservation. The provider report is being corrected
+to require every requested logical class; native Complete capture must also
+refuse before mutation until its security-label/capability coverage is proved.
+No successful basic-copy test or blanket flag change supplies that proof.
+
+## Fallible finalization and held-object publication checkpoint
+
+An immutable copy of the integrated hardening inputs built on macOS from
+21:35:25 to 21:37:37 UTC (132 seconds), consistent with the preceding
+140-second clean build. Every compiled input still matched the live source
+after the run. Source manifest SHA-256:
+`bd2f2e7ffbd59b80831df1711447268484020be95952c8b009ac045143aa059d`.
+Library SHA-256:
+`ef05b6d846d8f88531a103af29d62b563bbd0dde23f2322076aa07876a19603f`.
+Evidence is `/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/qualification`.
+
+The complete macOS run is **FAILED: 15 of 20 suites passed**. The five failures
+are positive copy gates (`regular_metadata`, `job_lifecycle`, `tree_c_copy`,
+`tree_c_keepboth`, `reviewed_tree_plan`), all refusing the unqualified macOS
+publication primitive. They remain failures, not skips or expected passes.
+The passing suites include idle-review pause/resume, cancellation of a queued
+review, explicit worker drain, metadata/writer finalization, durable session
+close faults, action close faults, and retained-target close-failure handling.
+No app was launched from this partially qualified output.
+
+Two isolated, fully instrumented focused tests also passed ASan/UBSan with
+warnings as errors: destination-close failure before source retirement, and
+recovery-evidence versions 1–6 including every truncated prefix and anonymous
+name-hint rejection. Their records are beneath
+`/Volumes/S8T/tmp/ck-core-fs-close.n40qkin9` and
+`/Volumes/S8T/tmp/ck-core-fs-codec.uzvqhgqj`. They do not replace a fully
+instrumented integration run. The CI-reported duplicate native RTTI problem
+was corrected by removing duplicate implementations from mixed C/C++ test
+processes; sanitizer checks were not disabled.
+
+The independent metadata owner additionally qualified actual Windows ReFS
+writer closure and the integrity-label replay fix, including preserving an
+already-exact implicit label without creating a present-null SACL. That focused
+run does not qualify the subsequently changed journal-parent flush protocol,
+NTFS, two-way execution, or replacement content guards. Complete logical
+security coverage, macOS publication, native prefix resume, directory replay
+and full mixed-direction execution remain open. Frontend mutation enablement
+and a release tag remain blocked on those requirements.

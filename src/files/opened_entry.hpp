@@ -120,6 +120,14 @@ public:
     virtual Observation<std::size_t> write_content(std::uint64_t offset, std::span<const std::byte> bytes,
                                                     ContentWriteLimits limits = {}, std::stop_token stop = {});
     virtual Observation<bool> flush_content();
+    // Worker-only terminal boundary for operation-owned writable handles.
+    // Flushes and closes them, retaining the result for idempotent calls. Native
+    // adapters detach handles before close and never retry a consumed close,
+    // including EINTR. No live inspection or further writes are available
+    // afterward: capture qualified committed evidence before calling this.
+    // The default succeeds only for portable fakes with no native handles;
+    // every native writable adapter must override it.
+    virtual Observation<bool> finish_content_writes();
     // Worker-only proof for the lifetime of this held guard, checked before
     // and after data verification and immediately before mutation. Ordinary
     // share exclusion does not qualify preexisting writable mappings. Default

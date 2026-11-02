@@ -42,6 +42,16 @@ void drained(ckfet_job* job) {
     } while (std::chrono::steady_clock::now() < until);
     std::abort();
 }
+void pause_ack(ckfet_job* job, std::uint32_t desired) {
+    ckfet_request_pause(job,desired);
+    const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    do {
+        ckfet_snapshot_v1 s{}; assert(ckfet_poll_v1(job,&s)==CKFE_API_OK);
+        if (s.pause_requested==desired && s.paused==desired) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while(std::chrono::steady_clock::now()<until);
+    std::abort();
+}
 }
 int main(int argc, char** argv) {
     assert(argc == 4);
@@ -75,10 +85,31 @@ int main(int argc, char** argv) {
     ckfe_directory_destroy(parent); ckfe_engine_destroy(engine);
     if (mode == "cancel") {
         ckfet_request_pause(job, 1); ckfet_request_cancel(job);
-        auto s = wait(job); show(s); assert(s.state == CKFET_CANCELLED);
-        drained(job); ckfet_release(job); ckfe_error_free(&e); return 0;
+        drained(job);
+        ckfet_snapshot_v1 s{};assert(ckfet_poll_v1(job,&s)==CKFE_API_OK);
+        show(s); assert(s.state == CKFET_CANCELLED);
+        ckfet_release(job); ckfe_error_free(&e); return 0;
     }
     auto s = wait(job); show(s); assert(s.state == CKFET_AWAITING_REVIEW && s.plan_generation);
+    // Idle review waits must acknowledge pause without a command. Admission
+    // may queue a review while paused, but the worker cannot consume it until
+    // the resume acknowledgement. This exercises the actual C worker loop.
+    pause_ack(job,1);
+    std::uint64_t paused_command=0;
+    assert(ckfet_review_v1(job,s.plan_generation,nullptr,0,nullptr,0,&paused_command)==CKFE_API_OK && paused_command);
+    assert(ckfet_poll_v1(job,&s)==CKFE_API_OK && s.paused && s.command_state==CKFET_COMMAND_PENDING);
+    if(mode=="cancelreview") {
+        ckfet_request_cancel(job);
+        drained(job);
+        assert(ckfet_poll_v1(job,&s)==CKFE_API_OK && s.state==CKFET_CANCELLED);
+        assert(s.command_id==paused_command && s.command_state==CKFET_COMMAND_REJECTED);
+        assert(!s.receipt_id);
+        ckfet_release(job);ckfe_error_free(&e);return 0;
+    }
+    pause_ack(job,0);
+    s=wait(job,true);
+    assert(s.command_id==paused_command && s.command_state>=CKFET_COMMAND_ACCEPTED);
+    assert(ckfet_acknowledge_command_v1(job,paused_command)==CKFE_API_OK);
     ckfet_row_v1 rows[32]{}; ckfet_page_v1 p{};
     assert(ckfet_page_v1_get(job, s.plan_generation, 0, rows, 32, &p) == CKFE_API_OK);
     assert(p.row_count && p.total_rows >= p.row_count);

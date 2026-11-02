@@ -101,7 +101,7 @@ Observation<bool> Entry::rename_noreplace(const DirectoryCursor& from,const Dire
     }
     return Observation<bool>::unavailable(ObservationState::Changed);
 }
-struct Bytes { std::vector<std::byte> live,durable; unsigned flushes=0,fail_at=0; std::function<void(unsigned)> on_flush; };
+struct Bytes { std::vector<std::byte> live,durable; unsigned flushes=0,fail_at=0; bool close_fails=false; unsigned finishes=0; std::function<void(unsigned)> on_flush; };
 class Journal final: public OperationJournalFile {
     std::shared_ptr<Bytes> b_;
 public:
@@ -115,6 +115,11 @@ public:
     Observation<bool> flush() override {
         if(++b_->flushes==b_->fail_at) return Observation<bool>::unavailable(ObservationState::Failed,{ErrorDomain::Posix,5,"test.flush"});
         b_->durable=b_->live; if(b_->on_flush) b_->on_flush(b_->flushes); return Observation<bool>::available(true);
+    }
+    Observation<bool> finish_io() override {
+        ++b_->finishes;
+        if (b_->close_fails) return Observation<bool>::unavailable(ObservationState::Failed,{ErrorDomain::Posix,5,"test.retention_close"});
+        return flush();
     }
 };
 struct Fixture {
@@ -380,6 +385,15 @@ int main(int argc,char** argv) {
         assert(f.directory->nodes.at(name("former"))==f.original && !f.directory->nodes.contains(name("version")));
     }
 
+    {
+        Fixture f(root); f.bytes->close_fails=true;
+        auto t=*f.create().value(); verify(*t);
+        assert(!t->retain().value() && t->state()==RetainedTargetState::NeedsReconciliation);
+        assert(t->failure() && t->failure()->error.operation=="test.retention_close");
+        assert(f.directory->renames==1 && !f.directory->nodes.contains(name("target")));
+        assert(f.directory->nodes.at(name("version"))==f.original && f.bytes->finishes==1);
+        assert(!t->retain().value() && f.bytes->finishes==1);
+    }
     native_writable_mapping(root);
     native_former_name(root);
     native_namespace_guard(root);

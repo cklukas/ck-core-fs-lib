@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <map>
+#include <utility>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -254,6 +255,11 @@ public:
 #ifdef __APPLE__
         if(fcntl(f.fd,F_FULLFSYNC)) return failure<bool>(errno,"sync_session.file_fullflush");
 #endif
+        r=before(SyncSessionIo::FileClose);if(!r.value()) return r;
+        // Relinquish ownership BEFORE close. A delayed failure/EINTR must never
+        // trigger a second close on a descriptor another thread could reuse.
+        const auto descriptor=std::exchange(f.fd,-1);
+        if(::close(descriptor)) return failure<bool>(errno,"sync_session.stage_close");
         return Observation<bool>::available(true);
     }
     Observation<bool> publish(std::string_view from,std::string_view to) override {

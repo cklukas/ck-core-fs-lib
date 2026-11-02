@@ -6,6 +6,7 @@
 #include "native_path.hpp"
 #include "native_name.hpp"
 #include "observation.hpp"
+#include "staging_namespace.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +53,9 @@ struct NativeOperationRecoveryEvidence final {
     // no-replace publication boundary. The parent identity above remains a
     // separate value and is never conflated with this object identity.
     std::optional<NativeDurableIdentity> published_identity;
+    // Legacy records describe Named staging. Anonymous records retain the
+    // first name only as a diagnostic hint; it must NEVER be reopened/deleted.
+    StagingNamespace staging_namespace = StagingNamespace::Named;
 };
 
 struct NativeOperationRecoveryEvidenceLimits final {

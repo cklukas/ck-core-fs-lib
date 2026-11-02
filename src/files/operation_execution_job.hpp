@@ -32,6 +32,9 @@ struct OperationExecutionRequest final {
     // native callbacks and remains worker-bound.
     std::function<Observation<OperationCommitJob::Pointer>(std::stop_token)> prepare_commit;
     std::function<Observation<bool>()> cleanup_unpublished_staging;
+    // Final durable-journal close, after the commit protocol and before the
+    // public Complete state. This callback must not perform source deletion.
+    std::function<Observation<bool>()> finish_io;
 };
 
 struct OperationExecutionResult final {

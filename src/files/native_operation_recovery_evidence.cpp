@@ -13,6 +13,7 @@ constexpr std::array<std::byte, 4> magic{
 constexpr std::uint8_t address_version = 3;
 constexpr std::uint8_t digest_version = 4;
 constexpr std::uint8_t published_identity_version = 5;
+constexpr std::uint8_t namespace_version = 6;
 constexpr std::uint8_t staging_identity_version = 2;
 constexpr std::uint8_t legacy_version = 1;
 
@@ -251,13 +252,19 @@ bool NativeDurableIdentity::matches_live(const ObjectIdentity& value) const noex
 Observation<std::vector<std::byte>> encode_native_operation_recovery_evidence(
     const NativeOperationRecoveryEvidence& evidence, NativeOperationRecoveryEvidenceLimits limits) {
     if (!valid_limits(limits)) return invalid<std::vector<std::byte>>(AdapterError::InvalidLimit, "native_recovery_evidence.limits");
+    const bool anonymous = evidence.staging_namespace == StagingNamespace::Anonymous;
+    if ((evidence.staging_namespace != StagingNamespace::Named && !anonymous) ||
+        (anonymous && !evidence.staging_name.posix_bytes()) ||
+        (evidence.published_identity && !evidence.content_digest))
+        return invalid<std::vector<std::byte>>(AdapterError::InvalidNativeResult,"native_recovery_evidence.namespace");
     std::vector<std::byte> result;
     result.reserve(256);
     result.insert(result.end(), magic.begin(), magic.end());
-    put_u8(result, evidence.published_identity ? published_identity_version :
+    put_u8(result, anonymous ? namespace_version : evidence.published_identity ? published_identity_version :
         (evidence.content_digest ? digest_version :
          (evidence.destination_address ? address_version : staging_identity_version)));
     put_u8(result, 0);
+    if (anonymous) put_u8(result, static_cast<std::uint8_t>(evidence.staging_namespace));
     if (!append_name(result, evidence.staging_name, limits.max_name_units) ||
         !append_name(result, evidence.destination_name, limits.max_name_units))
         return invalid<std::vector<std::byte>>(AdapterError::InvalidNativeResult, "native_recovery_evidence.encode");
@@ -267,7 +274,15 @@ Observation<std::vector<std::byte>> encode_native_operation_recovery_evidence(
         !append_identity(result, evidence.source_identity) ||
         !append_identity(result, evidence.destination_identity))
         return invalid<std::vector<std::byte>>(AdapterError::InvalidNativeResult, "native_recovery_evidence.encode");
-    if (evidence.content_digest) {
+    if (anonymous) {
+        put_u8(result, (evidence.destination_address ? 1 : 0) | (evidence.content_digest ? 2 : 0) |
+            (evidence.published_identity ? 4 : 0));
+        if (evidence.destination_address && !append_address(result,*evidence.destination_address,NativePathLimits::hard_native_bytes))
+            return invalid<std::vector<std::byte>>(AdapterError::InvalidNativeResult,"native_recovery_evidence.address");
+        if (evidence.content_digest) put_digest(result,*evidence.content_digest);
+        if (evidence.published_identity && !append_identity(result,*evidence.published_identity))
+            return invalid<std::vector<std::byte>>(AdapterError::InvalidNativeResult,"native_recovery_evidence.published_identity");
+    } else if (evidence.content_digest) {
         put_u8(result, evidence.destination_address ? 1 : 0);
         if (evidence.destination_address && !append_address(result, *evidence.destination_address,
                                                              NativePathLimits::hard_native_bytes))
@@ -300,10 +315,17 @@ Observation<NativeOperationRecoveryEvidence> decode_native_operation_recovery_ev
     std::uint8_t decoded_version = 0, reserved = 0;
     if (!reader.take(magic.size(), decoded_magic) || !std::equal(magic.begin(), magic.end(), decoded_magic.begin()) ||
         !reader.u8(decoded_version) || !reader.u8(reserved) ||
-        (decoded_version != published_identity_version && decoded_version != digest_version &&
+        (decoded_version != namespace_version && decoded_version != published_identity_version && decoded_version != digest_version &&
          decoded_version != address_version && decoded_version != staging_identity_version &&
          decoded_version != legacy_version) || reserved != 0)
         return invalid<NativeOperationRecoveryEvidence>(AdapterError::InvalidNativeResult, "native_recovery_evidence.header");
+    auto staging_namespace = StagingNamespace::Named;
+    if (decoded_version == namespace_version) {
+        std::uint8_t value=0;
+        if (!reader.u8(value) || value!=static_cast<std::uint8_t>(StagingNamespace::Anonymous))
+            return invalid<NativeOperationRecoveryEvidence>(AdapterError::InvalidNativeResult,"native_recovery_evidence.namespace");
+        staging_namespace=StagingNamespace::Anonymous;
+    }
     auto staging = read_name(reader, limits.max_name_units);
     auto destination = read_name(reader, limits.max_name_units);
     std::optional<NativeDurableIdentity> staging_identity;
@@ -325,7 +347,26 @@ Observation<NativeOperationRecoveryEvidence> decode_native_operation_recovery_ev
     std::optional<NativeAbsolutePath> destination_address;
     std::optional<std::array<std::byte, 32>> content_digest;
     std::optional<NativeDurableIdentity> published_identity;
-    if (decoded_version == address_version) {
+    if (decoded_version == namespace_version) {
+        std::uint8_t flags=0;
+        if (!reader.u8(flags) || flags>7 || ((flags&4) && !(flags&2)))
+            return invalid<NativeOperationRecoveryEvidence>(AdapterError::InvalidNativeResult,"native_recovery_evidence.optional_flags");
+        if (flags&1) {
+            auto decoded=read_address(reader,NativePathLimits::hard_native_bytes);
+            if (!decoded.value()) return Observation<NativeOperationRecoveryEvidence>::unavailable(decoded.state(),decoded.unavailable_detail()->error);
+            destination_address=std::move(decoded).take_value();
+        }
+        if (flags&2) {
+            std::span<const std::byte> digest;
+            if (!reader.take(32,digest)) return invalid<NativeOperationRecoveryEvidence>(AdapterError::InvalidNativeResult,"native_recovery_evidence.digest");
+            std::array<std::byte,32> value{};std::copy(digest.begin(),digest.end(),value.begin());content_digest=value;
+        }
+        if (flags&4) {
+            auto decoded=read_identity(reader);
+            if (!decoded.value()) return Observation<NativeOperationRecoveryEvidence>::unavailable(decoded.state(),decoded.unavailable_detail()->error);
+            published_identity=std::move(decoded).take_value();
+        }
+    } else if (decoded_version == address_version) {
         auto decoded = read_address(reader, NativePathLimits::hard_native_bytes);
         if (!decoded.value())
             return Observation<NativeOperationRecoveryEvidence>::unavailable(
@@ -363,12 +404,13 @@ Observation<NativeOperationRecoveryEvidence> decode_native_operation_recovery_ev
         }
     }
     if (!staging.value() || !destination.value() || !source_parent.value() || !source.value() ||
-        !destination_identity.value() || !reader.empty())
+        !destination_identity.value() || !reader.empty() ||
+        (staging_namespace==StagingNamespace::Anonymous && !staging.value()->posix_bytes()))
         return invalid<NativeOperationRecoveryEvidence>(AdapterError::InvalidNativeResult, "native_recovery_evidence.trailing");
     return Observation<NativeOperationRecoveryEvidence>::available({
         std::move(staging).take_value(), std::move(destination).take_value(),
         std::move(source_parent).take_value(), std::move(source).take_value(),
         std::move(destination_identity).take_value(), std::move(staging_identity),
-        std::move(destination_address), std::move(content_digest), std::move(published_identity)});
+        std::move(destination_address), std::move(content_digest), std::move(published_identity),staging_namespace});
 }
 } // namespace ck::files

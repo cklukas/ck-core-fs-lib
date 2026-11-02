@@ -167,8 +167,11 @@ bool valid_io(std::uint64_t offset, std::size_t count) {
 
 class WindowsOperationJournalFile final : public OperationJournalFile {
 public:
-    explicit WindowsOperationJournalFile(HANDLE file) noexcept : file_(file) {}
+    WindowsOperationJournalFile(HANDLE file,HANDLE directory,std::vector<std::byte> user) noexcept
+        : file_(file),directory_(directory),user_(std::move(user)) {}
     Observation<std::uint64_t> size() override {
+        const auto checked=revalidate();
+        if(!checked.value()) return Observation<std::uint64_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
         LARGE_INTEGER value{};
         if (!GetFileSizeEx(file_.get(), &value)) return failure<std::uint64_t>(GetLastError(), "journal_file.GetFileSizeEx");
         if (value.QuadPart < 0) return rejected<std::uint64_t>(AdapterError::InvalidNativeResult, "journal_file.size");
@@ -176,6 +179,8 @@ public:
     }
     Observation<std::size_t> read_at(std::uint64_t offset, std::span<std::byte> bytes) override {
         if (!valid_io(offset, bytes.size())) return rejected<std::size_t>(AdapterError::InvalidLimit, "journal_file.read_range");
+        const auto checked=revalidate();
+        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
         LARGE_INTEGER at{}; at.QuadPart = static_cast<LONGLONG>(offset);
         if (!SetFilePointerEx(file_.get(), at, nullptr, FILE_BEGIN)) return failure<std::size_t>(GetLastError(), "journal_file.read_seek");
         DWORD count{};
@@ -185,6 +190,8 @@ public:
     }
     Observation<std::size_t> write_at(std::uint64_t offset, std::span<const std::byte> bytes) override {
         if (!valid_io(offset, bytes.size())) return rejected<std::size_t>(AdapterError::InvalidLimit, "journal_file.write_range");
+        const auto checked=revalidate();
+        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
         LARGE_INTEGER at{}; at.QuadPart = static_cast<LONGLONG>(offset);
         if (!SetFilePointerEx(file_.get(), at, nullptr, FILE_BEGIN)) return failure<std::size_t>(GetLastError(), "journal_file.write_seek");
         DWORD count{};
@@ -193,11 +200,47 @@ public:
         return Observation<std::size_t>::available(count);
     }
     Observation<bool> flush() override {
+        const auto checked=revalidate();if(!checked.value()) return checked;
         if (!FlushFileBuffers(file_.get())) return failure<bool>(GetLastError(), "journal_file.FlushFileBuffers");
-        return Observation<bool>::available(true);
+        if (!FlushFileBuffers(directory_.get())) return failure<bool>(GetLastError(),"journal_file.parent_FlushFileBuffers");
+        return revalidate();
+    }
+    Observation<bool> finish_io() override {
+        if (finished_) return finish_failure_ ? Observation<bool>::unavailable(finish_failure_->state,finish_failure_->error)
+                                             : Observation<bool>::available(true);
+        auto flushed=flush();
+        if (!flushed.value() || !*flushed.value())
+            finish_failure_=flushed.value() ? UnavailableObservation{ObservationState::Failed,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_file.finish_flush"}}
+                : *flushed.unavailable_detail();
+        const auto handle=file_.release();
+        if (!CloseHandle(handle) && !finish_failure_)
+            finish_failure_=*failure<bool>(GetLastError(),"journal_file.CloseHandle").unavailable_detail();
+        const auto directory=directory_.release();
+        if (!CloseHandle(directory) && !finish_failure_)
+            finish_failure_=*failure<bool>(GetLastError(),"journal_file.parent_CloseHandle").unavailable_detail();
+        finished_=true;
+        return finish_failure_ ? Observation<bool>::unavailable(finish_failure_->state,finish_failure_->error)
+                               : Observation<bool>::available(true);
     }
 private:
-    Handle file_;
+    Observation<bool> revalidate() {
+        const auto root=verify_root(directory_.get(),user_.data());if(!root.value())return root;
+        if(!*root.value())return rejected<bool>(AdapterError::InvalidNativeResult,"journal_file.root_security");
+        const auto security=verify_security(file_.get(),user_.data());if(!security.value())return security;
+        if(!*security.value())return rejected<bool>(AdapterError::InvalidNativeResult,"journal_file.file_security");
+        FILE_ATTRIBUTE_TAG_INFO tag{};FILE_STANDARD_INFO info{};
+        if(!GetFileInformationByHandleEx(file_.get(),FileAttributeTagInfo,&tag,sizeof(tag)) ||
+            !GetFileInformationByHandleEx(file_.get(),FileStandardInfo,&info,sizeof(info)))
+            return failure<bool>(GetLastError(),"journal_file.revalidate_info");
+        if((tag.FileAttributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DIRECTORY)) || info.NumberOfLinks!=1)
+            return rejected<bool>(AdapterError::InvalidAccess,"journal_file.revalidate_kind",ObservationState::Denied);
+        return Observation<bool>::available(true);
+    }
+    Handle file_,directory_;
+    std::vector<std::byte> user_;
+    bool finished_=false;
+    std::optional<UnavailableObservation> finish_failure_;
 };
 }
 
@@ -255,7 +298,7 @@ Observation<std::unique_ptr<OperationJournalFile>> open_native_operation_journal
     auto user_data = std::move(user).take_value();
     const auto native_path = windows_extended_path(root.native());
     if (!native_path) return rejected<Pointer>(AdapterError::InvalidPath, "journal_file.root_address");
-    Handle directory(CreateFileW(native_path->c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+    Handle directory(CreateFileW(native_path->c_str(), FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     if (directory.get() == INVALID_HANDLE_VALUE) return failure<Pointer>(GetLastError(), "journal_file.open_root");
@@ -299,7 +342,7 @@ Observation<std::unique_ptr<OperationJournalFile>> open_native_operation_journal
     IO_STATUS_BLOCK io{};
     HANDLE raw_file{};
     const auto status = NtCreateFile(&raw_file, FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_OWNER,
-        &object, &io, nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &object, &io, nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
         create_new ? FILE_CREATE : FILE_OPEN,
         FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_WRITE_THROUGH,
         nullptr, 0);
@@ -327,6 +370,8 @@ Observation<std::unique_ptr<OperationJournalFile>> open_native_operation_journal
         return Observation<Pointer>::unavailable(detail.state, detail.error);
     }
     if (!*security.value()) return rejected<Pointer>(AdapterError::InvalidNativeResult, "journal_file.file_security");
-    return Observation<Pointer>::available(std::make_unique<WindowsOperationJournalFile>(file.release()));
+    auto result=std::make_unique<WindowsOperationJournalFile>(file.get(),directory.get(),std::move(user_data));
+    file.release();directory.release();
+    return Observation<Pointer>::available(std::move(result));
 }
 } // namespace ck::files

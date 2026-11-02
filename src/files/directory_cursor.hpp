@@ -5,6 +5,7 @@
 #include "file_metadata.hpp"
 #include "native_name.hpp"
 #include "opened_entry.hpp"
+#include "staging_file.hpp"
 #include "child_lookup.hpp"
 #include "location_info.hpp"
 #include "directory_access.hpp"
@@ -70,6 +71,12 @@ public:
     // results are refused. The returned handle is not published under a
     // destination name and must be retained by the worker.
     virtual Observation<std::unique_ptr<OpenedEntry>> create_child_file(const NativeName& name) const;
+    // Creates an owning staging object whose publication cannot be redirected
+    // by substitution of a source basename. Anonymous implementations ignore
+    // recovery_hint as a namespace address and return no native name. Named
+    // implementations must retain a qualified object-bound publication guard.
+    // No named/path-based fallback when this capability is unavailable.
+    virtual Observation<CreatedStagingFile> create_staging_file(const NativeName& recovery_hint) const;
     // Worker-only creation of a new hard-link name for one verified regular
     // file below a held destination directory. The source identity is checked
     // at use, the destination is no-replace, and the adapter must flush the

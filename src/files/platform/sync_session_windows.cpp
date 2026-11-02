@@ -289,18 +289,22 @@ public:
         if(security!=ERROR_SUCCESS) return fail<bool>(security,"sync_session.stage_security");
         auto f=relative(store.back().handle.get(),*n,FILE_GENERIC_READ|FILE_GENERIC_WRITE,FILE_CREATE,false,raw_sd);
         if(!f.value()) return propagate<bool>(f);
-        auto id=identity(f.value()->get(),false); if(!id.value()) return propagate<bool>(id);
-        r=private_security(f.value()->get()); if(!r.value()) return r;
+        auto writable=std::move(f).take_value();
+        auto id=identity(writable.get(),false); if(!id.value()) return propagate<bool>(id);
+        r=private_security(writable.get()); if(!r.value()) return r;
         std::size_t at=0;
         while(at<bytes.size()) {
             r=before(SyncSessionIo::Write); if(!r.value()) return r;
             DWORD wrote=0;
-            if(!WriteFile(f.value()->get(),bytes.data()+at,static_cast<DWORD>(std::min(bytes.size()-at,faults.max_write_bytes)),&wrote,nullptr))
+            if(!WriteFile(writable.get(),bytes.data()+at,static_cast<DWORD>(std::min(bytes.size()-at,faults.max_write_bytes)),&wrote,nullptr))
                 return fail<bool>(GetLastError(),"sync_session.WriteFile");
             if(!wrote) return fail<bool>(ERROR_WRITE_FAULT,"sync_session.zero_write"); at+=wrote;
         }
         r=before(SyncSessionIo::FileFlush); if(!r.value()) return r;
-        if(!FlushFileBuffers(f.value()->get())) return fail<bool>(GetLastError(),"sync_session.file_flush");
+        if(!FlushFileBuffers(writable.get())) return fail<bool>(GetLastError(),"sync_session.file_flush");
+        r=before(SyncSessionIo::FileClose);if(!r.value()) return r;
+        const auto handle=writable.release();
+        if(!CloseHandle(handle)) return fail<bool>(GetLastError(),"sync_session.stage_CloseHandle");
         return Observation<bool>::available(true);
     }
     Observation<bool> publish(std::string_view from,std::string_view to) override {

@@ -80,6 +80,8 @@ struct NativeOperationCopyJob::State final {
     std::unique_ptr<OpenedEntry> staging;
     std::optional<std::array<std::byte, 32>> content_digest;
     std::optional<NativeDurableIdentity> published_identity;
+    std::optional<BasicMetadata> finalized_metadata;
+    StagingNamespace staging_namespace = StagingNamespace::Named;
     bool source_exclusion = false;
 
     Observation<bool> cleanup_unpublished_staging() {
@@ -101,6 +103,13 @@ struct NativeOperationCopyJob::State final {
         }
         if (!staging)
             return Observation<bool>::available(true);
+        if (staging_namespace == StagingNamespace::Anonymous) {
+            // No native entry exists to unlink. Consume only this worker's
+            // unpublished object; never interpret the journal hint as a path.
+            auto finished=staging->finish_content_writes();
+            staging.reset();
+            return finished;
+        }
         const auto metadata = staging->inspect_basic();
         if (!metadata.value())
             return unavailable_bool(*metadata.unavailable_detail());
@@ -176,8 +185,10 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
             state->request.staging_name, state->request.destination_name,
             *source_parent, *source, *destination, {}, state->request.destination_address,
             state->content_digest, state->published_identity};
+        recovery_evidence.staging_namespace=state->staging_namespace;
         if (state->staging) {
-            auto metadata = state->staging->inspect_basic();
+            auto metadata = state->finalized_metadata ? Observation<BasicMetadata>::available(*state->finalized_metadata)
+                                                      : state->staging->inspect_basic();
             if (!metadata.value() || !metadata.value()->identity.value() ||
                 !metadata.value()->kind.value() || *metadata.value()->kind.value() != ObjectKind::RegularFile)
                 return Observation<bool>::unavailable(
@@ -200,7 +211,8 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
                 return Observation<bool>::unavailable(ObservationState::Unknown,
                     {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),
                      "native_operation_copy.journal_published_handle"});
-            auto metadata = state->staging->inspect_basic();
+            auto metadata = state->finalized_metadata ? Observation<BasicMetadata>::available(*state->finalized_metadata)
+                                                      : state->staging->inspect_basic();
             if (!metadata.value() || !metadata.value()->identity.value() ||
                 !metadata.value()->kind.value() || *metadata.value()->kind.value() != ObjectKind::RegularFile)
                 return Observation<bool>::unavailable(
@@ -257,10 +269,19 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
         if (!state->source)
             return rejected<StreamCopyJob::Pointer>(AdapterError::InvalidNativeResult,
                                                     "native_operation_copy.source_handle");
-        auto staging = state->request.destination->create_child_file(state->request.staging_name);
+        auto staging = state->request.destination->create_staging_file(state->request.staging_name);
         if (!staging.value()) return Observation<StreamCopyJob::Pointer>::unavailable(
             staging.state(), staging.unavailable_detail()->error);
-        state->staging = std::move(staging).take_value();
+        auto created=std::move(staging).take_value();
+        if (!created.entry ||
+            (created.staging_namespace!=StagingNamespace::Named && created.staging_namespace!=StagingNamespace::Anonymous) ||
+            (created.staging_namespace==StagingNamespace::Named && (!created.name || *created.name!=state->request.staging_name)) ||
+            (created.staging_namespace==StagingNamespace::Anonymous && created.name))
+            return rejected<StreamCopyJob::Pointer>(AdapterError::InvalidNativeResult,"native_operation_copy.staging_namespace");
+        state->staging_namespace=created.staging_namespace;
+        state->staging = std::move(created.entry);
+        if (state->request.prepare_stream)
+            return state->request.prepare_stream(*state->source,*state->staging,state->request.copy_limits);
         return create_stream_copy_job(*state->source, *state->staging, state->request.copy_limits);
     };
     copy.prepare_metadata = [state](std::stop_token stop) {
@@ -301,8 +322,12 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
             return rejected<bool>(AdapterError::InvalidNativeResult,
                                   "native_operation_copy.journal_digest", ObservationState::Unknown);
         if (copy_result && (record.state == OperationJournalState::Copied ||
-                            record.state == OperationJournalState::Verified))
+                            record.state == OperationJournalState::Verified)) {
+            if (state->request.reviewed_content_digest &&
+                copy_result->source_digest != *state->request.reviewed_content_digest)
+                return rejected<bool>(AdapterError::PlanDecisionStale,"native_operation_copy.reviewed_digest",ObservationState::Changed);
             state->content_digest = copy_result->source_digest;
+        }
         return Observation<bool>::available(true);
     };
     copy.append_journal = append;
@@ -317,6 +342,7 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
     execution_request.cleanup_unpublished_staging = [state] {
         return state->cleanup_unpublished_staging();
     };
+    execution_request.finish_io = [state] { return state->request.journal_file->finish_io(); };
     execution_request.prepare_commit = [state, append](std::stop_token) {
         OperationCommitRequest commit;
         commit.operation = state->request.operation;
@@ -371,6 +397,21 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
                      "native_operation_copy.retained_target_publication"});
             return Observation<bool>::available(*published.value());
         };
+        commit.finalize_destination = [state] {
+            if (!state->staging || !state->published_identity)
+                return rejected<bool>(AdapterError::UnqualifiedIdentity,"native_operation_copy.finish_unpublished",ObservationState::Unknown);
+            auto metadata=state->staging->inspect_basic();
+            if (!metadata.value()) return unavailable_bool(*metadata.unavailable_detail());
+            if (!metadata.value()->identity.value() || !metadata.value()->kind.value() ||
+                *metadata.value()->kind.value()!=ObjectKind::RegularFile ||
+                NativeDurableIdentity::from_live(*metadata.value()->identity.value())!=state->published_identity)
+                return rejected<bool>(AdapterError::MetadataChanged,"native_operation_copy.finish_identity",ObservationState::Changed);
+            // Cache actual held-object evidence before consuming its writer.
+            // Subsequent journal records describe this committed observation;
+            // they do not invent a new observation through a closed handle.
+            state->finalized_metadata=*metadata.value();
+            return state->staging->finish_content_writes();
+        };
         if (state->request.operation == FileOperation::Move) {
             commit.verify_source_stability = [state](std::stop_token) {
                 if (!state->source_exclusion)
@@ -412,6 +453,9 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
 
 OperationExecutionState NativeOperationCopyJob::advance(std::stop_token stop) {
     return execution_->advance(stop);
+}
+StagingNamespace NativeOperationCopyJob::staging_namespace() const noexcept {
+    return state_ ? state_->staging_namespace : StagingNamespace::Unknown;
 }
 
 Observation<bool> NativeOperationCopyJob::cleanup_unpublished_staging() {
@@ -530,7 +574,7 @@ Observation<OperationBatchJob::Pointer> create_native_operation_copy_batch(
             destination_name,
             request.policy.copy_limits,
             {},
-            FileOperation::Copy};
+            FileOperation::Copy, {}, {}, {}, {}};
         const auto metadata_policy = *preservation.value();
         copy_request.prepare_metadata = [metadata_policy](OpenedEntry& staging, std::stop_token stop) {
             return metadata_policy->prepare(staging, stop);

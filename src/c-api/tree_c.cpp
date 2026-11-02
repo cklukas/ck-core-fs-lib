@@ -275,14 +275,22 @@ void worker_body(std::shared_ptr<Shared> s, ReviewedTreePlanRequest request) noe
                 const bool paused = s->paused && !s->stop.stop_requested();
                 if (s->snapshot.paused != paused) { s->snapshot.paused = paused; s->publish(); }
                 s->cv.wait(lock, [&] { return s->stop.stop_requested() ||
+                    s->snapshot.paused != (s->paused && !s->stop.stop_requested()) ||
                     (!s->paused && (job->state() != ReviewedTreeState::AwaitingReview || s->command.has_value())); });
+                // Pause/resume must be acknowledged even when no review
+                // command is pending. Re-enter the safe waiting point without
+                // consuming a queued command or advancing native work.
+                if (s->snapshot.paused != (s->paused && !s->stop.stop_requested())) continue;
                 if (s->command) { command = std::move(s->command); s->command.reset(); }
                 if (s->snapshot.paused) { s->snapshot.paused = 0; s->publish(); }
             }
             if (command) {
                 Observation<bool> accepted;
                 bool assessed = false;
-                if (command->generation != generation || job->state() != ReviewedTreeState::AwaitingReview)
+                if (s->stop.stop_requested())
+                    accepted = Observation<bool>::unavailable(ObservationState::Unknown,
+                        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InterruptedRead),"tree.command_cancelled"});
+                else if (command->generation != generation || job->state() != ReviewedTreeState::AwaitingReview)
                     accepted = Observation<bool>::unavailable(invalid("tree.command_generation").state, invalid("tree.command_generation").error);
                 else if (command->kind == Command::Review) {
                     receipt.reset(); receipt_id = 0;

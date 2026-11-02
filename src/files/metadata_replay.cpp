@@ -51,12 +51,19 @@ Observation<MetadataReplaySnapshot> capture_metadata_replay(const OpenedEntry& e
     auto qualified=entry.qualify_metadata_replay(policy);
     if(!qualified.value()) return propagate<MetadataReplaySnapshot>(*qualified.unavailable_detail());
     if(!*qualified.value()) return fail<MetadataReplaySnapshot>("metadata_replay.provider_not_qualified");
+    // Native ACL/xattr enumeration is not a proof that all mandatory label,
+    // capability and provider security classes are visible and replayable.
+    // No adapter currently supplies that proof. Refuse before replay effects;
+    // ordinary policy still records only its explicit caller-visible scope.
+    if(policy.scope==RegularMetadataScope::CompleteMetadataV1)
+        return fail<MetadataReplaySnapshot>("metadata_replay.complete_security_coverage_unproved");
     auto view=entry.open_metadata_replay_view(policy);
     if(!view.value()) return propagate<MetadataReplaySnapshot>(*view.unavailable_detail());
     const auto& query=*view.value() ? **view.value() : entry;
     MetadataReplaySnapshot result;result.policy=policy;result.basic=*before.value();
     const auto& basic=result.basic;
     if(!basic.kind.value() || *basic.kind.value()!=ObjectKind::RegularFile || !basic.logical_size.value() ||
+       !basic.link_count.value() || *basic.link_count.value()!=1 ||
        !basic.accessed.value() || !basic.modified.value() || !basic.changed.value() ||
        !basic.identity.value() || !identity(basic.identity,basic.identity))
         return fail<MetadataReplaySnapshot>("metadata_replay.required_basic");
@@ -142,6 +149,8 @@ Observation<bool> apply_metadata_replay(OpenedEntry& target,const MetadataReplay
         return fail<bool>("metadata_replay.apply_security_owner",ObservationState::Failed,AdapterError::UnqualifiedIdentity);
     auto qualified=target.qualify_metadata_replay(snapshot.policy);
     if(!qualified.value() || !*qualified.value()) return qualified;
+    if(snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1)
+        return fail<bool>("metadata_replay.complete_security_coverage_unproved");
     const auto target_before=target.inspect_basic();
     if(!target_before.value()) return propagate<bool>(*target_before.unavailable_detail());
     if(!equal(target_before.value()->kind,snapshot.basic.kind) || !equal(target_before.value()->logical_size,snapshot.basic.logical_size))
@@ -183,6 +192,8 @@ Observation<bool> apply_metadata_replay(OpenedEntry& target,const MetadataReplay
 Observation<bool> verify_metadata_replay(const OpenedEntry& target,const MetadataReplaySnapshot& snapshot,
                                         const BasicMetadata& applied,std::stop_token stop) {
     if(stop.stop_requested()) return interrupted();
+    if(snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1)
+        return fail<bool>("metadata_replay.complete_security_coverage_unproved");
     auto now=target.inspect_basic();
     if(!now.value()) return propagate<bool>(*now.unavailable_detail());
     const auto& n=*now.value();const auto& s=snapshot.basic;

@@ -170,6 +170,15 @@ Observation<bool> RetainedTarget::retain(std::stop_token stop) {
         const auto recorded = append(phase);
         if (!recorded.value()) { failure_ = *recorded.unavailable_detail(); state_ = RetainedTargetState::NeedsReconciliation; return unavailable<bool>(*recorded.unavailable_detail()); }
     }
+    const auto finished = file_->finish_io();
+    if (!finished.value() || !*finished.value()) {
+        // The journal handle has been consumed. Preserve its durable prefix;
+        // never reopen by path to append a guessed close-failure disposition.
+        failure_ = finished.value() ? rejected("retained_target.finish_result",ObservationState::Unknown,AdapterError::InvalidNativeResult)
+                                    : *finished.unavailable_detail();
+        state_ = RetainedTargetState::NeedsReconciliation;
+        return unavailable<bool>(*failure_);
+    }
     state_ = RetainedTargetState::Retained;
     return Observation<bool>::available(true);
 }

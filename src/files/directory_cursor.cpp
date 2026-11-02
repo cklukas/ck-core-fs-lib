@@ -94,6 +94,14 @@ Observation<std::unique_ptr<DirectoryCursor>> DirectoryCursor::open_directory_ch
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "open_directory_child.native_query"});
 }
 
+Observation<CreatedStagingFile> DirectoryCursor::create_staging_file(const NativeName& recovery_hint) const {
+    if (!recovery_hint.is_valid())
+        return Observation<CreatedStagingFile>::unavailable(ObservationState::Failed,
+            {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidIdentifier), "create_staging_file.hint"});
+    return Observation<CreatedStagingFile>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "create_staging_file.native_query"});
+}
+
 Observation<std::unique_ptr<OpenedEntry>> DirectoryCursor::create_child_file(const NativeName& name) const {
     if (!name.is_valid())
         return Observation<std::unique_ptr<OpenedEntry>>::unavailable(ObservationState::Failed,

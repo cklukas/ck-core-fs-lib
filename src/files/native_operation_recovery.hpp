@@ -10,14 +10,41 @@
 
 namespace ck::files {
 
+class NativeOperationCopyJob;
+class VerifiedCopyRetryJob;
+struct NativeOperationRecoveryCleanupRequest;
+// Worker-owned, process-local authority. Only a trusted stage creator can mint
+// this object from the original created handle and live journal. Serialized
+// IDs, timestamps and a freshly reopened entry cannot manufacture continuity.
+class NativeStagingOwnershipReceipt final {
+public:
+    using Pointer = std::shared_ptr<const NativeStagingOwnershipReceipt>;
+    ~NativeStagingOwnershipReceipt();
+    NativeStagingOwnershipReceipt(const NativeStagingOwnershipReceipt&) = delete;
+    NativeStagingOwnershipReceipt& operator=(const NativeStagingOwnershipReceipt&) = delete;
+private:
+    struct State;
+    explicit NativeStagingOwnershipReceipt(std::shared_ptr<State>) noexcept;
+    static Observation<Pointer> bind_created(OperationJournal::Pointer journal, std::size_t item,
+        std::shared_ptr<const DirectoryCursor> destination, std::shared_ptr<OpenedEntry> created,
+        std::optional<NativeName> named_component, StagingNamespace staging_namespace);
+    std::shared_ptr<State> state_;
+    friend class NativeOperationCopyJob;
+    friend class VerifiedCopyRetryJob;
+    friend Observation<bool> cleanup_native_unpublished_staging(const NativeOperationRecoveryCleanupRequest&);
+};
+
 struct NativeOperationRecoveryCleanupRequest final {
     NativeOperationRecoveryArtifact artifact;
     std::shared_ptr<const DirectoryCursor> destination;
     ObjectIdentity destination_identity;
+    NativeStagingOwnershipReceipt::Pointer ownership;
 };
 
-// Cleans one crash-recovery staging candidate only after fresh held-directory
-// and object-identity checks. Missing staging identity is never guessed.
+// Mutating cleanup requires live creator ownership and a pre-publication live
+// journal. A fresh-process inspection is review-only, even with matching native
+// IDs. Anonymous staging names are hints and are never passed to path I/O.
+// Caller serializes this worker-only operation with its originating copy job.
 Observation<bool> cleanup_native_unpublished_staging(
     const NativeOperationRecoveryCleanupRequest& request);
 

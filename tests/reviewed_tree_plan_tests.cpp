@@ -117,6 +117,7 @@ struct Fixture {
         // Test paths and all Windows fixture I/O use extended native paths.
         work = base;
         mkdir_new(path("s")); mkdir_new(path("d")); mkdir_new(path("journals"));
+        CHECK(take(prepare_native_operation_journal_root(take(NativeAbsolutePath::from_host(path("journals"))))));
     }
     ~Fixture() { parent.reset(); cleanup(root); }
     std::filesystem::path work;

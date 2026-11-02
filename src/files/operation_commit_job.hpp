@@ -45,6 +45,10 @@ struct OperationCommitRequest final {
     // value and never authorizes source removal.
     std::function<Observation<SourceStabilityGuarantee>(std::stop_token)> verify_source_stability;
     std::function<Observation<bool>(std::stop_token)> commit_destination;
+    // After durable destination publication, before Complete or any source
+    // retirement intent. Close/finalization failures retain the source and
+    // require reconciliation; they must not be hidden in destructors.
+    std::function<Observation<bool>()> finalize_destination;
     std::function<Observation<bool>(std::stop_token)> retire_source;
 
     // The sink must durably append the supplied record before returning

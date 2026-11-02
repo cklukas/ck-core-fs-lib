@@ -14,6 +14,7 @@
 #include <optional>
 #include <utility>
 #include <vector>
+#include "staging_namespace.hpp"
 
 namespace ck::files {
 
@@ -52,6 +53,15 @@ struct NativeOperationCopyRequest final {
     // unavailable. Once it succeeds publication is attempted even if a cancel
     // request arrives; any failure preserves retained-target recovery evidence.
     std::function<Observation<bool>(std::stop_token)> prepare_destination_before_publication;
+    // The reviewed plan's exact whole-file digest. Bind it to both independently
+    // computed stream-copy digests before metadata final times are applied;
+    // reading staging data afterward would itself change atime on relatime FS.
+    std::optional<std::array<std::byte,32>> reviewed_content_digest;
+    // Optional backend-only stream composition for verified prefix resume.
+    // Receives borrowed native owners after this job creates private staging;
+    // creation/publication/journal authority remains here. Never a UI callback.
+    std::function<Observation<StreamCopyJob::Pointer>(OpenedEntry&,OpenedEntry&,StreamCopyLimits)>
+        prepare_stream;
 };
 
 // Worker-only native binding of OperationCopyJob and OperationCommitJob. Move
@@ -68,6 +78,7 @@ public:
     OperationProgress progress() const noexcept { return execution_->progress(); }
     const OperationExecutionResult& result() const noexcept { return execution_->result(); }
     OperationExecutionState advance(std::stop_token stop = {});
+    StagingNamespace staging_namespace() const noexcept;
 
     // Removes only an unpublished, worker-created staging file after a
     // non-ambiguous Failed/Cancelled outcome. Platforms without a qualified

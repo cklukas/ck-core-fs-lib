@@ -87,6 +87,8 @@ ActionJob::ActionJob(ActionRequest request, std::shared_ptr<const ActionNativeBo
     if (!native_ || !count || count > CKFEA_MAX_ITEMS || request_.retry_limit > 2)
         throw std::invalid_argument("invalid action bounds");
     results_.resize(count);
+    journal_affected_.assign(count,false);
+    if(!request_.open_journal) request_.open_journal=[](const NativeAbsolutePath& p,const NativeName& n,bool create){return open_native_operation_journal_file(p,n,create);};
     trash_transactions_.resize(count); trash_receipts_.resize(count);
     // Every item has at most preview + intent + result + two retries.
     events_.reserve(count * 8);
@@ -139,7 +141,8 @@ ckfea_status ActionJob::receipt(ckfea_receipt& out) const {
 ckfea_status ActionJob::trash_receipt(uint32_t i,std::shared_ptr<const NativeTrashReceipt>& out) const {
     std::lock_guard lock(mutex_);
     if(i>=results_.size()||request_.operation!=CKFEA_TRASH) return CKFEA_INVALID_ARGUMENT;
-    if(results_[i].state!=CKFEA_VERIFIED||!trash_receipts_[i]) return CKFEA_NOT_READY;
+    const bool terminal=phase_==CKFEA_FINISHED||phase_==CKFEA_CANCELLED||phase_==CKFEA_JOB_FAILED;
+    if(!terminal||!journal_finish_attempted_||!journal_finish_ok_||results_[i].state!=CKFEA_VERIFIED||!trash_receipts_[i]) return CKFEA_NOT_READY;
     out=trash_receipts_[i]; return CKFEA_OK;
 }
 ckfea_status ActionJob::execute(const ckfea_receipt& in) {
@@ -364,7 +367,7 @@ void ActionJob::preview_trash() {
 void ActionJob::perform_trash() {
     bool any=false; for(size_t i=0;i<results_.size();++i) any|=row(i).state==CKFEA_READY;
     if(!any) return;
-    auto file=open_native_operation_journal_file(*request_.journal_directory,*request_.journal_name,true);
+    auto file=request_.open_journal(*request_.journal_directory,*request_.journal_name,true);
     if(!file.value()) {
         for(size_t i=0;i<results_.size();++i) if(row(i).state==CKFEA_READY) {
             unavailable(i,*file.unavailable_detail());event(i,CKFEA_EVIDENCE_RESULT);
@@ -381,6 +384,7 @@ void ActionJob::perform_trash() {
         event(i,CKFEA_EVIDENCE_INTENT);
         { std::lock_guard lock(mutex_);results_[i].state=CKFEA_EXECUTING;results_[i].attempts=1; }
         const NativeTrashJournal append=[&](OperationJournalState state,const NativeTrashReceipt& receipt) {
+            journal_affected_[i]=true;
             auto bytes=encode_native_trash_receipt(receipt); if(!bytes.value()) return Observation<bool>::unavailable(bytes.state(),bytes.unavailable_detail()->error);
             return append_operation_journal_file(*journal_file_,*journal_,{journal_->records().size()+1,i,state,std::move(bytes).take_value()},{64*1024*1024});
         };
@@ -401,6 +405,7 @@ void ActionJob::perform_trash() {
     }
 }
 bool ActionJob::append_journal(size_t i, OperationJournalState state) {
+    journal_affected_[i]=true;
     const auto& a=request_.items[i]; const auto* s=a.source->metadata().identity.value();
     const auto* p=a.source->parent_identity().value();
     if (!journal_ || !journal_file_ || !s || !p) { set(i,CKFEA_REVIEW_REQUIRED); return false; }
@@ -443,7 +448,7 @@ void ActionJob::perform() {
     bool any=false;
     for (auto i:order_) any |= row(i).state==CKFEA_READY;
     if (!any) return;
-    auto file=open_native_operation_journal_file(*request_.journal_directory,*request_.journal_name,true);
+    auto file=request_.open_journal(*request_.journal_directory,*request_.journal_name,true);
     if (!file.value()) {
         for (auto i:order_) if (row(i).state==CKFEA_READY) { unavailable(i,*file.unavailable_detail()); event(i,CKFEA_EVIDENCE_RESULT); }
         return;
@@ -510,12 +515,49 @@ void ActionJob::perform() {
         set(i,cancelled()?CKFEA_ITEM_CANCELLED:CKFEA_REVIEW_REQUIRED); event(i,CKFEA_EVIDENCE_RESULT);
     }
 }
+void ActionJob::journal_finish_failed(ObservationState observation,ErrorDomain domain,int64_t code) noexcept {
+    // Emergency finalization must work even after allocation failure. Only
+    // cached POD rows and already-reserved event storage may be touched here.
+    std::lock_guard lock(mutex_);
+    journal_finish_ok_=false;
+    const bool any=std::any_of(journal_affected_.begin(),journal_affected_.end(),[](bool b){return b;});
+    for(size_t i=0;i<results_.size();++i) {
+        auto& r=results_[i];
+        if(!journal_affected_[i]&&(any||(r.state!=CKFEA_READY&&r.state!=CKFEA_EXECUTING&&r.state!=CKFEA_VERIFIED)))continue;
+        // A delayed close failure invalidates even previously verified rows.
+        r.state=CKFEA_REVIEW_REQUIRED;
+        r.observation=static_cast<uint32_t>(observation);
+        r.error_domain=static_cast<uint32_t>(domain);r.error_code=code;
+        if(events_.size()<events_.capacity())
+            events_.push_back({CKFEA_VERSION,sizeof(ckfea_evidence),CKFEA_EVIDENCE_RESULT,
+                static_cast<uint32_t>(i),events_.size()+1,id_,r,{0,0}});
+    }
+}
+bool ActionJob::finish_journal() noexcept {
+    {
+        std::lock_guard lock(mutex_);
+        if(!journal_file_||journal_finish_attempted_)return journal_finish_ok_;
+        journal_finish_attempted_=true;
+    }
+    try {
+        const auto result=journal_file_->finish_io();
+        if(result.value()&&*result.value())return true;
+        if(!result.value()) {
+            const auto& failure=*result.unavailable_detail();
+            journal_finish_failed(failure.state,failure.error.domain,failure.error.code);
+        } else journal_finish_failed(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult));
+    } catch(...) {
+        journal_finish_failed(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult));
+    }
+    return false;
+}
 void ActionJob::release_native_inputs() noexcept {
     // Public handles retain cached state only after completion. Close native
     // owners here on the worker, including the last-reference close path.
     trash_transactions_.clear(); trash_backend_.reset();
     request_.restore_items.clear();
     journal_file_.reset(); journal_.reset(); artifact_.reset();
+    request_.open_journal={};
     request_.items.clear(); request_.recovery_destination.reset(); request_.recovery.reset();
     native_.reset();
 }
@@ -530,9 +572,11 @@ void ActionJob::run() noexcept {
             if (row(i).state==CKFEA_READY || row(i).state==CKFEA_PENDING) {
                 set(i,CKFEA_ITEM_CANCELLED); event(i,CKFEA_EVIDENCE_RESULT);
             }
+        const bool finished=finish_journal();
         release_native_inputs();
-        { std::lock_guard lock(mutex_); phase_=cancelled()?CKFEA_CANCELLED:CKFEA_FINISHED; cv_.notify_all(); }
+        { std::lock_guard lock(mutex_); phase_=!finished?CKFEA_JOB_FAILED:cancelled()?CKFEA_CANCELLED:CKFEA_FINISHED; cv_.notify_all(); }
     } catch (...) {
+        finish_journal();
         release_native_inputs();
         std::lock_guard lock(mutex_);
         for (auto& r:results_) if (r.state==CKFEA_READY || r.state==CKFEA_PENDING || r.state==CKFEA_EXECUTING)

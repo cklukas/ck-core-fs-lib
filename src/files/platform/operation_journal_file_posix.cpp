@@ -99,7 +99,32 @@ public:
     Observation<bool> flush() override {
         auto checked=revalidate();if(!checked.value()) return checked;
         if (fsync(fd_.value()) != 0) return failure<bool>(errno, "journal_file.fsync");
+        if (fsync(directory_.value()) != 0) return failure<bool>(errno,"journal_file.parent_fsync");
+#ifdef __APPLE__
+        if (fcntl(fd_.value(),F_FULLFSYNC) != 0) return failure<bool>(errno,"journal_file.fullsync");
+#endif
         return revalidate();
+    }
+    Observation<bool> finish_io() override {
+        if (finished_) return finish_failure_ ? Observation<bool>::unavailable(finish_failure_->state,finish_failure_->error)
+                                             : Observation<bool>::available(true);
+        auto flushed=flush();
+        if (!flushed.value() || !*flushed.value()) {
+            finish_failure_=flushed.value() ? UnavailableObservation{ObservationState::Failed,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_file.finish_flush"}}
+                : *flushed.unavailable_detail();
+        }
+        // Release ownership before close: EINTR/EIO must never cause a second
+        // close on a descriptor that another thread could already have reused.
+        const int fd=fd_.release();
+        if (::close(fd)!=0 && !finish_failure_)
+            finish_failure_=*failure<bool>(errno,"journal_file.close").unavailable_detail();
+        const int directory=directory_.release();
+        if (::close(directory)!=0 && !finish_failure_)
+            finish_failure_=*failure<bool>(errno,"journal_file.parent_close").unavailable_detail();
+        finished_=true;
+        return finish_failure_ ? Observation<bool>::unavailable(finish_failure_->state,finish_failure_->error)
+                               : Observation<bool>::available(true);
     }
 private:
     Observation<bool> revalidate() {
@@ -107,6 +132,8 @@ private:
         return private_regular(fd_.value(),false);
     }
     Fd fd_,directory_;
+    bool finished_=false;
+    std::optional<UnavailableObservation> finish_failure_;
 };
 }
 

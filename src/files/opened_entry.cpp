@@ -81,6 +81,11 @@ Observation<bool> OpenedEntry::flush_content() {
     return Observation<bool>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "content.flush_native_query"});
 }
+Observation<bool> OpenedEntry::finish_content_writes() {
+    // Explicit no-native-handle contract for portable test doubles. This is
+    // never the implementation for a native operation-owned writer.
+    return Observation<bool>::available(true);
+}
 Observation<bool> OpenedEntry::qualify_stable_content() const {
     return Observation<bool>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),

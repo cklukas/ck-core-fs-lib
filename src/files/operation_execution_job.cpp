@@ -107,6 +107,20 @@ OperationExecutionState OperationExecutionJob::advance(std::stop_token stop) {
     const auto commit_state = commit_->advance(stop);
     switch (commit_state) {
     case OperationCommitState::Complete:
+        if (request_.finish_io) {
+            try {
+                auto finished=request_.finish_io();
+                if (!finished.value() || !*finished.value()) {
+                    fail(finished.value() ? error(AdapterError::InvalidNativeResult,"operation_execution.finish_result")
+                                          : *finished.unavailable_detail(),OperationExecutionState::NeedsReconciliation);
+                    break;
+                }
+            } catch (...) {
+                fail(error(AdapterError::InvalidNativeResult,"operation_execution.finish_exception"),
+                     OperationExecutionState::NeedsReconciliation);
+                break;
+            }
+        }
         result_.state = OperationExecutionState::Complete;
         break;
     case OperationCommitState::Failed:

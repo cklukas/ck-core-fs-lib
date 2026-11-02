@@ -23,6 +23,11 @@ public:
     virtual Observation<std::size_t> read_at(std::uint64_t offset, std::span<std::byte> bytes) = 0;
     virtual Observation<std::size_t> write_at(std::uint64_t offset, std::span<const std::byte> bytes) = 0;
     virtual Observation<bool> flush() = 0;
+    // Explicit worker-bound completion, including delayed close errors. Native
+    // adapters must release their writable handle and cache the outcome so a
+    // second call cannot close a reused descriptor. Memory-only adapters have
+    // no native close and use the flush default. Never retry close after EINTR.
+    virtual Observation<bool> finish_io() { return flush(); }
 };
 
 // Reads the bounded durable prefix and reports a corrupt/truncated tail while

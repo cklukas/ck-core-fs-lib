@@ -401,12 +401,13 @@ void native_tests() {
     s.reset(); CHECK(rmdir(f.left.c_str())==0); CHECK(rename((f.left+"-moved").c_str(),f.left.c_str())==0);
     s=native(f); CHECK(s->identity().pair==id.pair && s->snapshot().generation==1); s.reset();
     // Native failures after short writes and at each durability/publication kind.
-    for(const auto kind:{SyncSessionIo::Write,SyncSessionIo::FileFlush,SyncSessionIo::Publish,SyncSessionIo::ParentFlush,SyncSessionIo::Remove}) {
+    for(const auto kind:{SyncSessionIo::Write,SyncSessionIo::FileFlush,SyncSessionIo::Publish,SyncSessionIo::ParentFlush,SyncSessionIo::Remove,SyncSessionIo::FileClose}) {
         auto enabled=std::make_shared<bool>(false); auto count=std::make_shared<unsigned>(0);
         SyncSessionFaults fault; fault.max_write_bytes=13;
         fault.before=[=](SyncSessionIo k) { return !(*enabled && k==kind && ++*count==2); };
         s=native(f,fault); const auto gen=s->snapshot().generation; *enabled=true;
         CHECK(!s->commit(gen,updates(2)).value()); s.reset(); s=native(f);
+        if(kind==SyncSessionIo::FileClose) CHECK(s->snapshot().generation==gen);
         CHECK(s->snapshot().state!=SyncSessionState::ReviewRequired);
         CHECK(s->snapshot().generation==gen || s->snapshot().generation==gen+1); s.reset();
     }
@@ -486,7 +487,7 @@ void native_tests() {
     CHECK(s->snapshot().generation==1 && s->identity().pair==pair); s.reset();
     // Faults in each native storage boundary leave either the old generation
     // or the intended new generation, recoverable without trusting caller data.
-    for(const auto kind:{SyncSessionIo::Write,SyncSessionIo::FileFlush,SyncSessionIo::Publish,SyncSessionIo::ParentFlush,SyncSessionIo::Remove}) {
+    for(const auto kind:{SyncSessionIo::Write,SyncSessionIo::FileFlush,SyncSessionIo::Publish,SyncSessionIo::ParentFlush,SyncSessionIo::Remove,SyncSessionIo::FileClose}) {
         auto enabled=std::make_shared<bool>(false); auto count=std::make_shared<unsigned>(0);
         SyncSessionFaults fault; fault.max_write_bytes=13;
         fault.before=[=](SyncSessionIo k) { return !(*enabled && k==kind && ++*count==2); };

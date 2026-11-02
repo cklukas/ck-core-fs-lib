@@ -3,6 +3,7 @@
 #include "metadata_replay.hpp"
 #include "regular_metadata_preservation.hpp"
 #include "native_filesystem.hpp"
+#include "windows_name.hpp"
 #include <cstdlib>
 #include <algorithm>
 #include <iostream>
@@ -14,6 +15,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <sddl.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -64,10 +66,12 @@ struct Fixture {
         (void)fixture_root;
         const auto* temp=_wgetenv(L"TEMP");const auto* tmp=_wgetenv(L"TMP");
         require(temp&&*temp&&tmp&&*tmp,"Windows tests require explicit TEMP/TMP");
+        const auto native_temp=windows_extended_path(temp);const auto native_tmp=windows_extended_path(tmp);
+        require(native_temp&&native_tmp,"Windows tests require absolute TEMP/TMP");
         const auto* require_v=_wgetenv(L"CK_FS_REQUIRE_V_DEV_DRIVE");
         if (require_v&&std::wstring_view(require_v)==L"1")
-            require(std::wstring(temp).starts_with(L"V:\\tmp\\")&&std::wstring(tmp).starts_with(L"V:\\tmp\\"),"workstation tests require V:\\tmp TEMP/TMP");
-        root=L"\\\\?\\"+std::wstring(temp)+L"\\metadata-replay-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
+            require(native_temp->starts_with(L"\\\\?\\V:\\tmp\\")&&native_tmp->starts_with(L"\\\\?\\V:\\tmp\\"),"workstation tests require V:\\tmp TEMP/TMP");
+        root=*native_temp+L"\\metadata-replay-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
         require(CreateDirectoryW(root.c_str(),nullptr)!=0,"create root");directories.push_back(root);
         // Exact wide/native calls exercise an extended path longer than MAX_PATH.
         for(int i=0;i<4;++i) {root+=L"\\"+std::wstring(72,L'a'+i);require(CreateDirectoryW(root.c_str(),nullptr)!=0,"create long root");directories.push_back(root);}
@@ -90,7 +94,7 @@ struct Fixture {
     ~Fixture() {
         source.reset();target.reset();directory.reset();
 #ifdef _WIN32
-        for(const auto* n:{L"source",L"target",L"renamed",L"moved",L"held-renamed",L"exact_\u00e9. "}) DeleteFileW((root+L"\\"+n).c_str());
+        for(const auto* n:{L"source",L"target",L"renamed",L"moved",L"held-renamed",L"staging",L"published",L"exact_\u00e9. "}) DeleteFileW((root+L"\\"+n).c_str());
         for(auto it=directories.rbegin();it!=directories.rend();++it) RemoveDirectoryW(it->c_str());
 #else
         for(const auto* n:{"source","target","renamed"}) unlink((root+"/"+n).c_str());
@@ -150,6 +154,71 @@ void policy_tests() {
     require(!valid_entry_access(EntryAccess::RenameSource|EntryAccess::MoveSource),"contradictory guards accepted");
     require(valid_entry_access(EntryAccess::RenameSource|EntryAccess::ContentRead),"rename read guard rejected");
 }
+void writer_finalization_tests() {
+    Fixture f;
+    // Capture live qualified evidence before fully closing the writer. The
+    // receipt can retain this value, never a post-close reinspection claim.
+    const auto before=need(f.target->inspect_basic(),"writer identity before finish");
+    success(f.target->finish_content_writes(),"native writer finish");
+    success(f.target->finish_content_writes(),"native writer finish idempotent");
+    require(!f.target->inspect_basic().value(),"closed writer remained inspectable");
+    require(!f.target->read_content().value(),"closed writer remained readable");
+    const std::byte bytes[]{std::byte{'x'}};
+    require(!f.target->write_content(0,bytes).value(),"closed writer remained writable");
+    require(!f.target->flush_content().value(),"closed writer flush accepted");
+    auto opened=f.directory->open_child(name("target"),EntryAccess::ContentRead);
+    need(opened,"independent final destination read");
+    const auto after=need((*opened.value())->inspect_basic(),"independent final identity");
+    require(before.identity.value()&&after.identity.value()&&
+        compare_identity(*before.identity.value(),*after.identity.value())==IdentityComparison::Same,
+        "finalized writer identity changed");
+    const auto data=need((*opened.value())->read_content(),"finalized data");
+    require(data.bytes==std::vector<std::byte>{std::byte{'t'},std::byte{'e'},std::byte{'s'},std::byte{'t'}},
+        "finalized bytes changed");
+#ifdef _WIN32
+    HANDLE writer=CreateFileW((f.root+L"\\target").c_str(),GENERIC_WRITE|DELETE,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    require(writer!=INVALID_HANDLE_VALUE,"finalization retained WRITE/DELETE share exclusion");
+    require(CloseHandle(writer)!=0,"independent writer close");
+#endif
+    std::cout<<"native writer finalization closes handle, disables live access and caches success\n";
+}
+#ifdef _WIN32
+void strong_staging_tests() {
+    Fixture f;
+    auto created=f.directory->create_staging_file(name("staging"));need(created,"strong Windows staging");
+    require(created.value()->staging_namespace==StagingNamespace::Named&&created.value()->name&&
+        *created.value()->name==name("staging"),"Windows staging namespace evidence");
+    auto staging=std::move(created).take_value().entry;
+    const auto before=need(staging->inspect_basic(),"staging held identity");
+    const std::byte bytes[]{std::byte{'x'}};
+    require(need(staging->write_content(0,bytes),"staging content")==1,"staging write length");
+    const auto excluded=[&](const wchar_t* leaf) {
+        for(const DWORD rights:{DWORD(GENERIC_WRITE),DWORD(DELETE)}) {
+            HANDLE outsider=CreateFileW((f.root+L"\\"+leaf).c_str(),rights,
+                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+            const DWORD code=GetLastError();if(outsider!=INVALID_HANDLE_VALUE) CloseHandle(outsider);
+            require(outsider==INVALID_HANDLE_VALUE&&code==ERROR_SHARING_VIOLATION,"strong staging lost WRITE/DELETE exclusion");
+        }
+    };
+    excluded(L"staging");
+    success(staging->publish_noreplace(*f.directory,name("published")),"same held staging publication");
+    excluded(L"published");
+    const auto published=need(staging->inspect_basic(),"published held identity");
+    require(before.identity.value()&&published.identity.value()&&
+        compare_identity(*before.identity.value(),*published.identity.value())==IdentityComparison::Same,
+        "publication changed held staging identity");
+    success(staging->finish_content_writes(),"published writer finish");
+    success(staging->finish_content_writes(),"published writer cached finish");
+    auto reopened=f.directory->open_child(name("published"),EntryAccess::ContentRead);need(reopened,"published independent reader");
+    const auto observed=need((*reopened.value())->inspect_basic(),"published independent identity");
+    require(observed.identity.value()&&compare_identity(*published.identity.value(),*observed.identity.value())==IdentityComparison::Same,
+        "finalized published identity mismatch");
+    require(need((*reopened.value())->read_content(),"published bytes").bytes==std::vector<std::byte>{std::byte{'x'}},
+        "published content mismatch");
+    std::cout<<"strong Windows staging retains WRITE/DELETE exclusion through held-object publication, then finalizes\n";
+}
+#endif
 #ifdef __APPLE__
 void noowners_tests() {
     const auto* negative_root=std::getenv("CK_FS_NOOWNERS_TEST_ROOT");
@@ -211,6 +280,37 @@ void native_tests() {
     f.add_attribute("user.ck_empty",{});
 #endif
 #ifdef _WIN32
+    // Opting into label replay must not materialize a present null SACL for
+    // an already-exact implicit label. This is the C v2 Original-owner path.
+    {
+        Fixture original;
+        auto explicit_policy=original.policy();explicit_policy.ownership=MetadataOwnership::Original;
+        explicit_policy.allow_privilege_metadata=true;
+        const auto captured=original.capture(explicit_policy);
+        original.replay(captured);
+        success(original.target->finish_content_writes(),"security-bearing writer finish");
+        require(!original.target->inspect_basic().value(),"security-bearing writer still live");
+    }
+    {
+        Fixture labelled;
+        auto explicit_policy=labelled.policy();explicit_policy.ownership=MetadataOwnership::Original;
+        explicit_policy.allow_privilege_metadata=true;
+        PSECURITY_DESCRIPTOR descriptor=nullptr;ULONG size=0;
+        require(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)",SDDL_REVISION_1,&descriptor,&size)!=0,
+            "construct explicit low integrity label");
+        const auto* first=static_cast<const std::byte*>(descriptor);
+        NativeSecurityValue label{SecurityPart::WindowsIntegrity,SecurityEncoding::WindowsRelativeDescriptor,
+            SecurityPresence::Present,NativeBytes(first,first+size),
+            need(labelled.source->inspect_basic(),"label source identity").identity,LABEL_SECURITY_INFORMATION};
+        LocalFree(descriptor);
+        success(labelled.source->apply_replay_security(label,explicit_policy),"install actual mandatory integrity label");
+        const auto captured=labelled.capture(explicit_policy);
+        auto no_optin=explicit_policy;no_optin.allow_privilege_metadata=false;
+        const auto refused=labelled.target->apply_replay_security(captured.security.back(),no_optin);
+        require(refused.state()==ObservationState::Changed,"different integrity label silently accepted without optin");
+        labelled.replay(captured);
+        std::cout<<"explicit mandatory integrity ACE replayed and exactly verified with optin\n";
+    }
     // Match the C API/tree leaf access: data read without EA/READ_CONTROL.
     auto minimal=HeldChild::observe_with_access(f.directory,name("source"),EntryAccess::ContentRead);
     need(minimal,"minimal source handle");
@@ -316,9 +416,17 @@ void native_tests() {
     require(need(acl.target->read_security(SecurityPart::DarwinExtendedAcl),"removed ACL query").presence==SecurityPresence::Absent,"inherited ACL not removed");
     Fixture complete;
     auto full=complete.policy(RegularMetadataScope::CompleteMetadataV1);full.ownership=MetadataOwnership::Original;
-    auto all=complete.capture(full);complete.replay(all);
-    require(need(complete.target->inspect_basic(),"birthtime").created.value()&&
-        *complete.target->inspect_basic().value()->created.value()==*all.basic.created.value(),"complete birthtime not preserved");
+    const auto unproved=capture_metadata_replay(*complete.source,full);
+    require(unproved.state()==ObservationState::Unsupported&&
+        unproved.unavailable_detail()->error.operation=="metadata_replay.complete_security_coverage_unproved",
+        "Darwin complete security coverage overclaimed");
+    auto forged=complete.capture(p);forged.policy=full;
+    const auto untouched=need(complete.target->inspect_basic(),"complete target before refusal");
+    require(apply_metadata_replay(*complete.target,forged).state()==ObservationState::Unsupported,
+        "caller-constructed complete snapshot bypassed coverage proof");
+    const auto after_refusal=need(complete.target->inspect_basic(),"complete target after refusal");
+    require(untouched.changed.value()&&after_refusal.changed.value()&&*untouched.changed.value()==*after_refusal.changed.value(),
+        "complete target mutated before coverage refusal");
 #endif
 #ifdef __linux__
     Fixture acl;
@@ -412,7 +520,10 @@ void native_tests() {
     std::cout<<"native capture/apply/verify, ACL/xattr, identity, limits and mutation regressions passed\n";
 }
 }
-int main() {try {policy_tests();
+int main() {try {policy_tests();writer_finalization_tests();
+#ifdef _WIN32
+    strong_staging_tests();
+#endif
 #ifdef __APPLE__
     noowners_tests();
 #endif

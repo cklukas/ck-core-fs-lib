@@ -504,11 +504,14 @@ static ckfe_api_status start_copy_regular(ckfe_entry *source, ckfe_directory *de
             CKFE_PRESERVED_LABELS_CAPABILITIES | CKFE_PRESERVED_STORAGE_REPRESENTATION;
         report.explicitly_excluded_fields = CKFE_PRESERVED_BIRTH_CHANGE_TIMES | CKFE_PRESERVED_STORAGE_REPRESENTATION;
 #ifdef _WIN32
-        report.explicitly_excluded_fields |= CKFE_PRESERVED_PRIVILEGE_BITS;
+        report.explicitly_excluded_fields |= CKFE_PRESERVED_PRIVILEGE_BITS | CKFE_PRESERVED_ORDINARY_MODE;
 #endif
         if (scope == RegularMetadataScope::OrdinaryCallerVisibleV1 || allow_metadata_loss)
             report.explicitly_excluded_fields = CKFE_PRESERVED_SOURCE_OWNER | CKFE_PRESERVED_PRIVILEGE_BITS |
                 CKFE_PRESERVED_BIRTH_CHANGE_TIMES | CKFE_PRESERVED_STORAGE_REPRESENTATION;
+#ifdef _WIN32
+        report.explicitly_excluded_fields |= CKFE_PRESERVED_ORDINARY_MODE;
+#endif
         if (metadata_policy && !allow_metadata_loss) {
             if (metadata_policy->ownership == MetadataOwnership::Original)
                 report.explicitly_excluded_fields &= ~static_cast<uint64_t>(CKFE_PRESERVED_SOURCE_OWNER);
@@ -653,7 +656,6 @@ ckfe_api_status ckfe_job_get_preservation_report_v1(ckfe_job *job,
             // consent. That is not evidence that the requested provider scope
             // was inventoried or qualified: loss-consenting paths bypass it.
             if (job->preservation_scope_checks_required) {
-                report->provider_qualification = CKFE_OBSERVATION_AVAILABLE;
                 report->source_preserved_fields |= CKFE_PRESERVED_ACL;
                 report->unknown_fields &= ~static_cast<uint64_t>(CKFE_PRESERVED_ACL);
                 if (report->requested_scope == CKFE_METADATA_COMPLETE_V1) {
@@ -666,6 +668,18 @@ ckfe_api_status ckfe_job_get_preservation_report_v1(ckfe_job *job,
                 if (!(report->explicitly_excluded_fields & CKFE_PRESERVED_PRIVILEGE_BITS))
                     report->source_preserved_fields |= CKFE_PRESERVED_PRIVILEGE_BITS;
 #endif
+                auto required = static_cast<std::uint64_t>(CKFE_PRESERVED_ACCESS_TIME |
+                    CKFE_PRESERVED_MODIFIED_TIME | CKFE_PRESERVED_ACL);
+#ifndef _WIN32
+                required |= CKFE_PRESERVED_ORDINARY_MODE;
+#endif
+                if (report->requested_scope == CKFE_METADATA_COMPLETE_V1)
+                    required |= CKFE_PRESERVED_SOURCE_OWNER | CKFE_PRESERVED_XATTRS |
+                        CKFE_PRESERVED_LABELS_CAPABILITIES;
+                required &= ~report->explicitly_excluded_fields;
+                report->provider_qualification =
+                    (report->source_preserved_fields & required) == required &&
+                    !(report->unknown_fields & required) ? CKFE_OBSERVATION_AVAILABLE : CKFE_OBSERVATION_UNKNOWN;
             }
         } else if (job->failure) report->provider_qualification = static_cast<ckfe_observation_state>(job->failure->state);
         return CKFE_API_OK;

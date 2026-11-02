@@ -289,6 +289,100 @@ void journal_failure_test() {
     auto j=start(std::move(r),b); assert(item(j,0).state==CKFEA_READY); execute(j);
     assert(!b->calls&&d->has("a")&&!d->has("b")&&item(j,0).state!=CKFEA_VERIFIED);
 }
+struct FinishFault {
+    std::vector<std::byte> bytes;
+    std::atomic<unsigned> calls{0};
+    bool fail=true,throw_finish=false,false_finish=false,oom_finish=false;
+    std::shared_ptr<Block> block;
+};
+class FinishJournal final:public OperationJournalFile {
+    std::shared_ptr<FinishFault> state_;
+public:
+    explicit FinishJournal(std::shared_ptr<FinishFault> s):state_(std::move(s)){}
+    Observation<uint64_t> size() override{return Observation<uint64_t>::available(state_->bytes.size());}
+    Observation<size_t> read_at(uint64_t offset,std::span<std::byte> out) override {
+        if(offset>state_->bytes.size())return Observation<size_t>::available(0);
+        auto n=std::min(out.size(),state_->bytes.size()-static_cast<size_t>(offset));
+        std::copy_n(state_->bytes.begin()+static_cast<ptrdiff_t>(offset),n,out.begin());return Observation<size_t>::available(n);
+    }
+    Observation<size_t> write_at(uint64_t offset,std::span<const std::byte> bytes) override {
+        assert(offset<=state_->bytes.size());state_->bytes.resize(static_cast<size_t>(offset)+bytes.size());
+        std::copy(bytes.begin(),bytes.end(),state_->bytes.begin()+static_cast<ptrdiff_t>(offset));return Observation<size_t>::available(bytes.size());
+    }
+    Observation<bool> flush() override{return Observation<bool>::available(true);}
+    Observation<bool> finish_io() override {
+        ++state_->calls;
+        if(state_->block){auto& b=*state_->block;std::unique_lock lock(b.mutex);b.entered=true;b.cv.notify_all();b.cv.wait(lock,[&]{return b.release;});}
+        if(state_->oom_finish)throw std::bad_alloc();
+        if(state_->throw_finish)throw std::runtime_error("injected finish exception");
+        if(state_->false_finish)return Observation<bool>::available(false);
+        return state_->fail?Observation<bool>::unavailable(ObservationState::Failed,{ErrorDomain::Posix,5,"test.journal_close"}):Observation<bool>::available(true);
+    }
+};
+void inject_finish(ActionRequest& request,std::shared_ptr<FinishFault> fault) {
+    request.open_journal=[fault](const NativeAbsolutePath&,const NativeName&,bool){return Observation<std::unique_ptr<OperationJournalFile>>::available(std::make_unique<FinishJournal>(fault));};
+}
+void wait_terminal(const std::shared_ptr<ActionJob>& job) {
+    for(unsigned i=0;i<20&&(job->summary().state==CKFEA_RUNNING||job->summary().state==CKFEA_PREVIEWING);++i)job->wait(1000);
+    assert(job->summary().state==CKFEA_JOB_FAILED||job->summary().state==CKFEA_FINISHED||job->summary().state==CKFEA_CANCELLED);
+}
+class FinishTrashTransaction final:public NativeTrashTransaction {
+    NativeTrashReceipt receipt_;
+public:
+    explicit FinishTrashTransaction(const HeldChild& source):receipt_{source.name(),name("data"),name("metadata"),name("sid"),
+        *NativeDurableIdentity::from_live(*source.parent_identity().value()),*NativeDurableIdentity::from_live(*source.metadata().identity.value()),
+        *NativeDurableIdentity::from_live(*source.parent_identity().value()),NativeDurableIdentity::from_live(*source.metadata().identity.value()),{},{}}{}
+    const NativeTrashReceipt& receipt() const noexcept override{return receipt_;}
+    bool mutation_attempted() const noexcept override{return true;}
+    Observation<bool> commit(const NativeTrashJournal& journal,std::stop_token) override {
+        for(auto state:{OperationJournalState::Planned,OperationJournalState::Prepared,OperationJournalState::CommitIntended,
+            OperationJournalState::DestinationCommitted,OperationJournalState::SourceRemovalIntended,OperationJournalState::SourceRetired,OperationJournalState::Complete}) {
+            auto r=journal(state,receipt_);if(!r.value()||!*r.value())return r;
+        }
+        return Observation<bool>::available(true);
+    }
+};
+class FinishTrashBackend final:public NativeTrashBackend {
+public:
+    Observation<std::unique_ptr<NativeTrashTransaction>> prepare_trash(HeldChild::Pointer source,std::stop_token) const override {
+        return Observation<std::unique_ptr<NativeTrashTransaction>>::available(std::make_unique<FinishTrashTransaction>(*source));
+    }
+    Observation<std::unique_ptr<NativeTrashTransaction>> prepare_restore(const NativeTrashReceipt&,std::shared_ptr<const DirectoryCursor>,std::stop_token) const override {
+        return Observation<std::unique_ptr<NativeTrashTransaction>>::unavailable(ObservationState::Unsupported);
+    }
+};
+void journal_finish_tests() {
+    for(unsigned mode=0;mode<4;++mode) {
+        auto d=std::make_shared<Directory>();d->add("a");d->add("b");d->add("noop");auto boundary=std::make_shared<Boundary>();
+        auto request=rename_request({{held(d,"a"),"b"},{held(d,"b"),"c"},{held(d,"noop"),"noop"}});auto fault=std::make_shared<FinishFault>();
+        fault->throw_finish=mode==1;fault->false_finish=mode==2;fault->oom_finish=mode==3;inject_finish(request,fault);
+        auto job=start(std::move(request),boundary);ckfea_receipt receipt{};assert(job->receipt(receipt)==CKFEA_OK);assert(job->execute(receipt)==CKFEA_OK);wait_terminal(job);
+        assert(job->summary().state==CKFEA_JOB_FAILED&&job->summary().verified_count==0&&job->summary().review_count==2);
+        assert(item(job,1).state==CKFEA_REVIEW_REQUIRED&&item(job,2).state==CKFEA_NO_CHANGE&&item(job,2).error_code==0);
+        auto r=item(job,0);assert(r.state==CKFEA_REVIEW_REQUIRED&&r.observation==static_cast<uint32_t>(ObservationState::Failed));
+        if(mode==0)assert(r.error_domain==static_cast<uint32_t>(ErrorDomain::Posix)&&r.error_code==5);
+        assert(boundary->calls==2&&!d->has("a")&&d->has("b")&&d->has("c")&&fault->calls==1);
+        auto journal=decode_operation_journal(fault->bytes);assert(journal.value()&&journal.value()->journal->state(0)==OperationJournalState::Complete);
+        assert(job->wait(0)==CKFEA_OK&&fault->calls==1);
+    }
+    for(bool fail:{false,true}) {
+        auto d=std::make_shared<Directory>();d->add("trash");auto request=rename_request({{held(d,"trash"),"unused"}});
+        request.operation=CKFEA_TRASH;request.capabilities=CKFEA_ALLOW_NATIVE_TRASH;
+        auto fault=std::make_shared<FinishFault>();fault->fail=fail;fault->block=std::make_shared<Block>();inject_finish(request,fault);
+        auto job=std::make_shared<ActionJob>(std::move(request),std::make_shared<Boundary>(),std::make_shared<FinishTrashBackend>());job->start();
+        for(unsigned i=0;i<20&&job->summary().state==CKFEA_PREVIEWING;++i)job->wait(1000);
+        ckfea_receipt approval{};assert(job->receipt(approval)==CKFEA_OK);assert(job->execute(approval)==CKFEA_OK);
+        {std::unique_lock lock(fault->block->mutex);assert(fault->block->cv.wait_for(lock,std::chrono::seconds(5),[&]{return fault->block->entered;}));}
+        assert(item(job,0).state==CKFEA_VERIFIED&&job->summary().state==CKFEA_RUNNING);
+        std::shared_ptr<const NativeTrashReceipt> receipt;assert(job->trash_receipt(0,receipt)==CKFEA_NOT_READY&&!receipt);
+        job->cancel();{std::lock_guard lock(fault->block->mutex);fault->block->release=true;fault->block->cv.notify_all();}wait_terminal(job);
+        assert(fault->calls==1);
+        if(fail) {
+            assert(job->summary().state==CKFEA_JOB_FAILED&&item(job,0).state==CKFEA_REVIEW_REQUIRED&&item(job,0).error_code==5);
+            assert(job->trash_receipt(0,receipt)==CKFEA_NOT_READY&&!receipt);
+        } else {assert(job->summary().state==CKFEA_CANCELLED);assert(job->trash_receipt(0,receipt)==CKFEA_OK&&receipt);}
+    }
+}
 void retry_tests() {
     for(bool ambiguous:{false,true}) {
         auto d=std::make_shared<Directory>(); d->add("a"); auto b=std::make_shared<Boundary>();
@@ -320,6 +414,17 @@ ActionRequest recovery_request(std::shared_ptr<Directory> d,bool wrong_digest=fa
     r.recovery->artifacts.push_back({0,OperationJournalState::DestinationCommitted,std::move(evidence),{}}); return r;
 }
 void recovery_tests() {
+    // Restart evidence, including a matching durable ID, cannot mint live
+    // creation authority. No namespace lookup/disposition may be attempted.
+    for(auto ns:{StagingNamespace::Unknown,StagingNamespace::Named,StagingNamespace::Anonymous}) {
+        auto d=std::make_shared<Directory>();auto r=recovery_request(d);
+        auto artifact=r.recovery->artifacts.front();artifact.state=OperationJournalState::Verified;
+        artifact.evidence->staging_namespace=ns;artifact.evidence->staging_name=name("published");
+        artifact.evidence->staging_identity=artifact.evidence->published_identity;
+        const auto rejected=cleanup_native_unpublished_staging({artifact,d,*d->identity().value(),{}});
+        assert(!rejected.value()&&rejected.state()==ObservationState::Unknown&&d->has("published"));
+        assert(rejected.unavailable_detail()->error.operation=="native_recovery.cleanup_live_ownership_required");
+    }
     for(bool mismatch:{false,true}) {
         auto d=std::make_shared<Directory>(); auto j=start(recovery_request(d,mismatch),std::make_shared<Boundary>());
         assert(item(j,0).state==CKFEA_READY); execute(j); assert(item(j,0).state==(mismatch?CKFEA_CHANGED:CKFEA_VERIFIED));
@@ -633,6 +738,12 @@ int main(int argc,char** argv) {
     assert(argc==2||argc==3);
     auto address=NativeAbsolutePath::from_host(std::filesystem::path(argv[1])); assert(address.value());
     root=std::move(address).take_value();
+    if(argc==3&&std::string_view(argv[2])=="--journal-finalization") {
+        // Injected journal adapters test delayed errors independently of the
+        // host volume's native private-storage qualification.
+        journal_finish_tests();recovery_tests();
+        std::puts("actions: journal finalization and recovery authority regressions passed");return 0;
+    }
     assert(prepare_native_operation_journal_root(*root).value());
 #ifdef _WIN32
     if(argc==3&&std::string_view(argv[2])=="--critical-trash") {
@@ -640,7 +751,7 @@ int main(int argc,char** argv) {
         std::puts("Windows critical Trash regressions passed");return 0;
     }
 #endif
-    abi_tests(); rename_tests(); exact_names_tests(); journal_failure_test(); retry_tests(); recovery_tests(); trash_metadata_tests(); native_gate_test();
+    abi_tests(); rename_tests(); exact_names_tests(); journal_failure_test(); journal_finish_tests(); retry_tests(); recovery_tests(); trash_metadata_tests(); native_gate_test();
 #ifdef _WIN32
     windows_native_trash_tests();
 #endif

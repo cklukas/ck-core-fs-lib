@@ -442,6 +442,29 @@ public:
         if (!FlushFileBuffers(handle_.get())) return failure<bool>(GetLastError(), "content.FlushFileBuffers");
         return Observation<bool>::available(true);
     }
+    Observation<bool> finish_content_writes() override {
+        using Result=Observation<bool>;
+        if (finish_result_) return *finish_result_;
+        if (finish_started_) return failure<bool>(ERROR_INVALID_HANDLE,"content.finish_result_unrecorded");
+        if (!content_write_access_) return Result::available(true);
+        finish_started_=true;
+        content_write_access_=false;
+        content_access_=false;
+        layout_access_=false;
+        rename_access_=false;
+        // Close the independent metadata-mutating handle before flushing the
+        // data writer. Consume both owners first so destructors cannot retry.
+        const HANDLE security=security_handle_.release();
+        const HANDLE writer=handle_.release();
+        const DWORD security_error=!security || security==INVALID_HANDLE_VALUE || CloseHandle(security) ? ERROR_SUCCESS : GetLastError();
+        const DWORD flush_error=FlushFileBuffers(writer) ? ERROR_SUCCESS : GetLastError();
+        const DWORD close_error=CloseHandle(writer) ? ERROR_SUCCESS : GetLastError();
+        if (security_error) finish_result_=failure<bool>(security_error,"content.finish_security_close");
+        else if (flush_error) finish_result_=failure<bool>(flush_error,"content.finish_FlushFileBuffers");
+        else if (close_error) finish_result_=failure<bool>(close_error,"content.finish_CloseHandle");
+        else finish_result_=Result::available(true);
+        return *finish_result_;
+    }
     Observation<std::unique_ptr<OpenedEntry>> open_metadata_replay_view(const MetadataReplayPolicy& policy) const override {
         using Result=Observation<std::unique_ptr<OpenedEntry>>;
         if (!policy.valid()) return Result::unavailable(ObservationState::Failed,
@@ -564,8 +587,15 @@ public:
             if (policy.ownership==MetadataOwnership::Original) {mask|=OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION;rights|=WRITE_OWNER;}
             break;
         case SecurityPart::WindowsIntegrity:
-            // An unchanged label needs no privilege-affecting mutation.
-            if (!policy.allow_privilege_metadata) return verify_replay_security(source,policy);
+            // Even an opted-in write can change an implicit/absent label into
+            // a present null SACL. Preserve the exact already-matching native
+            // state without issuing a mutation. A query failure is not a
+            // reason to attempt a less-informed security write.
+            {
+                auto unchanged=verify_replay_security(source,policy);
+                if (unchanged.value() || unchanged.state()!=ObservationState::Changed || !policy.allow_privilege_metadata)
+                    return unchanged;
+            }
             mask=LABEL_SECURITY_INFORMATION;rights|=WRITE_OWNER;break;
         case SecurityPart::WindowsFullDescriptor:
             if (!policy.allow_privilege_metadata) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.full_security_optin");
@@ -770,7 +800,11 @@ public:
         return Result::available(true);
     }
     Observation<bool> publish_noreplace(const DirectoryCursor& destination, const NativeName& name) override;
-    Observation<BasicMetadata> inspect_basic() const override { return handle_metadata(handle_.get(), scope_); }
+    Observation<BasicMetadata> inspect_basic() const override {
+        if (finish_started_) return Observation<BasicMetadata>::unavailable(ObservationState::Failed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"content.finished_inspection"});
+        return handle_metadata(handle_.get(), scope_);
+    }
     Observation<FileIntegrityInfo> inspect_integrity(InventoryLimits limits = {}) const override {
         using Result = Observation<FileIntegrityInfo>;
         if (!limits.valid()) return Result::unavailable(ObservationState::Failed,
@@ -1098,6 +1132,8 @@ private:
         return Result::available(std::move(opened));
     }
     OwnedHandle security_handle_;
+    bool finish_started_ = false;
+    std::optional<Observation<bool>> finish_result_;
     std::optional<NativeSecurityValue> caller_security_;
     OwnedHandle handle_;
     AdapterScope scope_;
@@ -1225,6 +1261,18 @@ public:
     }
     Observation<BasicMetadata> inspect_basic() const override { return handle_metadata(handle_.get(), scope_); }
     Observation<std::unique_ptr<OpenedEntry>> open_parent_directory() const override { return open_windows_parent(handle_.get(), scope_); }
+    Observation<CreatedStagingFile> create_staging_file(const NativeName& recovery_hint) const override {
+        using Result=Observation<CreatedStagingFile>;
+        const auto qualified=qualify_identity_bound_rename();
+        if (!qualified.value()) {const auto& e=*qualified.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if (!*qualified.value()) return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"staging.windows_publication_unqualified"});
+        auto created=create_child_file(recovery_hint);
+        if (!created.value()) {const auto& e=*created.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        // The original DELETE-bearing writer denies WRITE/DELETE sharing
+        // from NtCreateFile through same-handle no-replace publication.
+        return Result::available({std::move(created).take_value(),StagingNamespace::Named,recovery_hint});
+    }
     Observation<std::unique_ptr<OpenedEntry>> create_child_file(const NativeName& name) const override {
         using Result = Observation<std::unique_ptr<OpenedEntry>>;
         const auto* units = name.windows_units();

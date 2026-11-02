@@ -33,6 +33,7 @@ struct ActionRequest {
     uint32_t operation = CKFEA_RENAME, capabilities = 0, retry_limit = 0;
     std::vector<ActionItem> items;
     std::vector<ActionRestoreItem> restore_items;
+    std::function<Observation<std::unique_ptr<OperationJournalFile>>(const NativeAbsolutePath&, const NativeName&, bool)> open_journal;
     std::optional<NativeAbsolutePath> journal_directory;
     std::optional<NativeName> journal_name;
     std::optional<NativeOperationRecoveryInspection> recovery;
@@ -62,6 +63,8 @@ private:
     void preview_trash();
     void perform_trash();
     void release_native_inputs() noexcept;
+    bool finish_journal() noexcept;
+    void journal_finish_failed(ObservationState, ErrorDomain, int64_t) noexcept;
     void preview_rename();
     bool revalidate(size_t);
     bool destination_clear(size_t);
@@ -86,6 +89,8 @@ private:
     std::vector<ckfea_evidence> events_;
     std::vector<size_t> order_;
     std::vector<int> dependencies_;
+    std::vector<bool> journal_affected_;
+    bool journal_finish_attempted_ = false, journal_finish_ok_ = true;
     OperationJournal::Pointer journal_;
     std::unique_ptr<OperationJournalFile> journal_file_;
     std::optional<NativeOperationRecoveryArtifact> artifact_;

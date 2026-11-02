@@ -24,7 +24,7 @@ struct SyncSessionSnapshot final {
     // Inspection only, never implicitly promoted after corruption/lost intent.
     std::optional<SyncBaseline> previous;
 };
-enum class SyncSessionIo { Write, FileFlush, Publish, ParentFlush, Remove };
+enum class SyncSessionIo { Write, FileFlush, Publish, ParentFlush, Remove, FileClose };
 // Test hook: return false to fail BEFORE the named operation. Write is called
 // for every native write, including retries. max_write_bytes forces short writes.
 struct SyncSessionFaults final {
@@ -46,7 +46,8 @@ public:
     virtual std::intptr_t root_handle(bool right) const noexcept = 0;
     virtual Observation<std::optional<std::vector<std::byte>>> read(std::string_view name,
         std::size_t limit) = 0;
-    // Create/replace a disposable stage, complete short writes, then flush file.
+    // Create/replace a disposable stage, complete short writes, flush AND
+    // explicitly close the file successfully before allowing publication.
     virtual Observation<bool> stage(std::string_view name, std::span<const std::byte>) = 0;
     virtual Observation<bool> publish(std::string_view from, std::string_view to) = 0;
     virtual Observation<bool> remove(std::string_view name) = 0;

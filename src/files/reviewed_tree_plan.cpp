@@ -312,10 +312,8 @@ struct ReviewedTreePlanJob::Impl {
     NativeOperationCopyJob::Pointer copy;
     OpenedEntry* staging = nullptr;
     OperationMetadataJob* metadata_phase = nullptr;
-    Sha256 staging_hash;
-    std::uint64_t staging_offset = 0;
     std::optional<BasicMetadata> staging_before;
-    bool staging_hashed = false;
+    bool staging_verified = false;
     std::optional<UnavailableObservation> failure;
 
     void fail(UnavailableObservation e, bool reconcile = false) {
@@ -635,28 +633,19 @@ struct ReviewedTreePlanJob::Impl {
         progress.state = ReviewedTreeState::Revalidating;
         reset_topology(); start_scan(0);
     }
-    void staging_step(std::stop_token stop) {
-        if (!staging_before) {
-            auto m = staging->inspect_basic();
-            if (!m.value()) { fail(*m.unavailable_detail(), true); return; }
-            staging_before = *m.value(); return;
+    void staging_step() {
+        // The native stream copier binds its complete source/destination
+        // digests to reviewed_content_digest BEFORE metadata application. Do
+        // not read data after final timestamps: relatime can change atime and
+        // invalidate otherwise correct strict metadata preservation.
+        auto now=staging->inspect_basic();
+        if(!now.value()) { fail(*now.unavailable_detail(),true);return; }
+        const auto& incoming=source.nodes.at(items[index()].row.relative_path);
+        if(!qualified(*now.value()) || *now.value()->kind.value()!=ObjectKind::RegularFile ||
+            !equal(now.value()->logical_size,incoming.metadata.logical_size)) {
+            fail(error(AdapterError::MetadataChanged,"reviewed_tree.staging_identity_size",ObservationState::Changed),true);return;
         }
-        auto data = staging->read_content({request.digest_chunk_bytes}, staging_offset, stop);
-        if (!data.value()) { fail(*data.unavailable_detail(), true); return; }
-        const auto& source_node = source.nodes.at(items[index()].row.relative_path);
-        auto size = *source_node.metadata.logical_size.value();
-        if (staging_offset > size || data.value()->bytes.size() > size - staging_offset ||
-            (data.value()->bytes.empty() && !data.value()->complete)) {
-            fail(error(AdapterError::MetadataChanged, "reviewed_tree.staging_size", ObservationState::Changed), true); return;
-        }
-        staging_hash.update(data.value()->bytes); staging_offset += data.value()->bytes.size();
-        if (!data.value()->complete) return;
-        auto after = staging->inspect_basic();
-        if (staging_offset != size || staging_hash.digest() != source_node.entry.digest->bytes ||
-            !after.value() || !unchanged(*staging_before, *after.value())) {
-            fail(error(AdapterError::PlanDecisionStale, "reviewed_tree.staging_digest", ObservationState::Changed), true); return;
-        }
-        staging_hashed = true;
+        staging_before=*now.value();staging_verified=true;
     }
     std::optional<NativeAbsolutePath> address_for(const Node& n) const {
         auto address = request.destination_address;
@@ -728,6 +717,7 @@ struct ReviewedTreePlanJob::Impl {
             .prepare_metadata = {},
             .operation = FileOperation::Copy,
             .verify_metadata_before_publication = {}};
+        r.reviewed_content_digest=n.entry.digest->bytes;
         auto policy = *preservation.value();
         r.prepare_metadata = [this, policy](OpenedEntry& stage, std::stop_token token) {
             staging = &stage;
@@ -738,7 +728,7 @@ struct ReviewedTreePlanJob::Impl {
         r.verify_metadata_before_publication = [this, policy, &n](OpenedEntry& stage, std::stop_token token) {
             auto valid = guard(n);
             if (!valid.value()) return valid;
-            if (!staging_hashed || !staging_before) return invalid<bool>("reviewed_tree.staging_not_verified");
+            if (!staging_verified || !staging_before) return invalid<bool>("reviewed_tree.staging_not_verified");
             auto now = stage.inspect_basic();
             if (!now.value() || !unchanged(*staging_before, *now.value()))
                 return unavailable<bool>(error(AdapterError::PlanDecisionStale, "reviewed_tree.staging_changed", ObservationState::Changed));
@@ -1035,8 +1025,14 @@ struct ReviewedTreePlanJob::Impl {
             return;
         }
         case 5: append(OperationJournalState::Complete); return;
-        default:
+        default: {
+            auto finished=d.file->finish_io();
+            if(!finished.value() || !*finished.value()) {
+                fail(finished.value() ? error(AdapterError::InvalidNativeResult,"reviewed_tree.delete_finish_false") :
+                    *finished.unavailable_detail(),true);return;
+            }
             deleting.reset(); progress.recovery_required = false; item.recovery_required = false; finish_item(); return;
+        }
         }
     }
     void execute_step(std::stop_token stop) {
@@ -1060,19 +1056,22 @@ struct ReviewedTreePlanJob::Impl {
             return;
         }
         if (copy) {
-            // Observe the worker-owned metadata phase without advancing it;
-            // hash the finalized staging object before native verify/commit.
-            if (staging && metadata_phase && metadata_phase->state() == OperationMetadataState::Complete && !staging_hashed) {
-                staging_step(stop); return;
+            // Capture finalized staging identity/version/size without reading
+            // data after metadata replay. Native copy verified the frozen
+            // content digest before its metadata phase began.
+            if (staging && metadata_phase && metadata_phase->state() == OperationMetadataState::Complete && !staging_verified) {
+                staging_step(); return;
             }
             auto state = copy->advance(stop);
+            if(copy->staging_namespace()==StagingNamespace::Anonymous)
+                item.staging_name.reset(); // Hint only; anonymous objects have no recoverable pathname.
             if (state == OperationExecutionState::Complete) {
                 mutated = true; progress.partial = true;
                 if (replacement_prepared && !record_retained(n)) return;
                 record_created(n, false);
                 if (progress.state != ReviewedTreeState::Executing) return;
                 progress.copied_bytes += *n.metadata.logical_size.value();
-                copy.reset(); retained.reset(); replacement_prepared = false; staging = nullptr; metadata_phase = nullptr; staging_before.reset(); staging_hashed = false; staging_offset = 0; staging_hash.reset();
+                copy.reset(); retained.reset(); replacement_prepared = false; staging = nullptr; metadata_phase = nullptr; staging_before.reset(); staging_verified = false;
                 progress.recovery_required = false; items[index()].recovery_required = false;
                 finish_item();
             } else if (state == OperationExecutionState::Failed || state == OperationExecutionState::Cancelled ||
