@@ -276,3 +276,9 @@ and waited for worker drain. This qualifies read-only Compare only; it does
 not qualify Complete metadata preservation or mutation publication.
 Input hashes and build/test timestamps are recorded in
 `/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/compare-record.json`.
+
+The follow-up C boundary accepts Compare with an empty journal root and a zero
+operation ID, without parsing or validating either mutation-only field. The
+same five suites passed again; the C test additionally proves Copy and Sync
+reject both missing IDs and missing journal roots. Evidence is
+`/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/compare-no-journal-record.json`.

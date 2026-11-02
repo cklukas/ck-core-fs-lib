@@ -67,8 +67,8 @@ typedef struct ckfet_options_v1 {
     uint64_t timestamp_quantum_ns;
     ckfsp_limits limits;
     ckfsp_filters filters;
-    ckfet_native journal_root; /* private absolute native address; required */
-    uint8_t operation_id[16]; /* nonzero, caller-generated unique ID */
+    ckfet_native journal_root; /* mutation: required private absolute address; Compare: ignored */
+    uint8_t operation_id[16]; /* mutation: nonzero unique ID; Compare: ignored */
 } ckfet_options_v1;
 typedef struct ckfet_rule_v1 {
     uint32_t version, struct_size, kind, choice;

@@ -397,8 +397,9 @@ ckfe_api_status ckfet_start_v1(const ckfe_entry* src, const ckfe_entry* dst,
     return boundary([&] {
         require(out && src && src->child && dst && dst->child && o && o->version == CKFET_VERSION &&
             o->struct_size == sizeof(*o) && o->profile <= CKFSP_COMPARE && o->metadata_scope <= 1 &&
-            o->allow_metadata_loss <= 1 && !o->reserved && o->metadata_ownership <= 1 && o->allow_privilege_metadata <= 1 &&
-            std::any_of(std::begin(o->operation_id), std::end(o->operation_id), [](auto b) { return b != 0; }));
+            o->allow_metadata_loss <= 1 && !o->reserved && o->metadata_ownership <= 1 && o->allow_privilege_metadata <= 1);
+        const bool reporting=o->profile==CKFSP_COMPARE;
+        if(!reporting) require(std::any_of(std::begin(o->operation_id),std::end(o->operation_id),[](auto b){return b!=0;}));
         ReviewedTreePlanRequest r;
         r.source_root = src->child; r.destination_root = dst->child;
         r.destination_address = dst->address;
@@ -413,9 +414,11 @@ ckfe_api_status ckfet_start_v1(const ckfe_entry* src, const ckfe_entry* dst,
         metadata.ownership = static_cast<MetadataOwnership>(o->metadata_ownership);
         metadata.allow_privilege_metadata = o->allow_privilege_metadata;
         r.copy_policy.metadata_policy = metadata;
-        r.journal_root = path(o->journal_root);
-        std::memcpy(r.journal_id.bytes.data(), o->operation_id, sizeof(o->operation_id));
-        r.open_journal = open_native_operation_journal_file;
+        if(!reporting) {
+            r.journal_root = path(o->journal_root);
+            std::memcpy(r.journal_id.bytes.data(), o->operation_id, sizeof(o->operation_id));
+            r.open_journal = open_native_operation_journal_file;
+        }
         auto result = std::make_unique<ckfet_job>(); result->state = std::make_shared<Shared>();
         result->state->page_limit = r.limits.max_page_rows;
         auto slot = std::make_unique<WorkerSlot>();

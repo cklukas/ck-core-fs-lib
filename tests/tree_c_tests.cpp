@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "ck_fs_tree.h"
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -78,6 +79,16 @@ int main(int argc, char** argv) {
 #else
     o.journal_root = {journal.data(), journal.size(), CKFET_POSIX_BYTES, 0};
 #endif
+    if(compare) {
+        o.journal_root={};std::fill(std::begin(o.operation_id),std::end(o.operation_id),0);
+        for(auto profile:{CKFSP_COPY,CKFSP_SYNC}) {
+            auto mutating=o;mutating.profile=profile;
+            ckfet_job* refused=reinterpret_cast<ckfet_job*>(1);
+            assert(ckfet_start_v1(source,target,&mutating,&refused,&e)==CKFE_API_INVALID_ARGUMENT&&!refused);
+            mutating.operation_id[0]=1;
+            assert(ckfet_start_v1(source,target,&mutating,&refused,&e)==CKFE_API_INVALID_ARGUMENT&&!refused);
+        }
+    }
     ckfet_job* job = reinterpret_cast<ckfet_job*>(1);
     auto invalid = o; invalid.reserved = 1;
     assert(ckfet_start_v1(source, target, &invalid, &job, &e) == CKFE_API_INVALID_ARGUMENT && job == nullptr);
