@@ -643,6 +643,20 @@ install(EXPORT ck_core_fs_targets
   NAMESPACE ck::
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ck-core-fs)
 
+if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+  set(CK_CORE_FS_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+  set(CK_CORE_FS_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+else()
+  file(RELATIVE_PATH _ck_prefix_from_pc
+    "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/pkgconfig" "${CMAKE_INSTALL_PREFIX}")
+  set(CK_CORE_FS_PC_PREFIX "\${pcfiledir}/${_ck_prefix_from_pc}")
+  set(CK_CORE_FS_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+endif()
+if(IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+  set(CK_CORE_FS_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+else()
+  set(CK_CORE_FS_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
 configure_file(cmake/ck-core-fs-lib.pc.in ${CMAKE_CURRENT_BINARY_DIR}/ck-core-fs-lib.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ck-core-fs-lib.pc
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

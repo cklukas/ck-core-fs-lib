@@ -165,11 +165,23 @@ evidence remain recorded; no sleep or weakened assertion was used.
 
 The later coherent Windows and macOS integration runs still fail Tree receipt
 validation after publication. Passing source and metadata components therefore
-do not establish receipt-bound execution completion. The Linux mount candidate
-passed ext4 and XFS but exposed a real Btrfs identity-domain bug: statmount's
-superblock device is distinct from the held object's VFS device. Its correction
-retains and revalidates both domains separately; a fresh coherent three-filesystem
-run is required before counting that correction as qualified.
+do not establish receipt-bound execution completion.
+
+## Relocatable pkg-config metadata
+
+The generated pkg-config file now derives relative installation directories
+from its own installed location. Explicit absolute GNUInstallDirs destinations
+retain their configured meaning. This fixes the embedded `/usr/local` prefix
+that required the CDE requalification to use a consumer-side override.
+
+Two actual ISO C11 consumers passed after moving independently staged SDKs
+into paths containing spaces: the default `lib`/`include` layout and
+`lib/aarch64-linux-gnu` with `headers/custom`. Each was compiled with GCC 14,
+`-std=c11 -Wall -Wextra -Wpedantic -Werror`, using only pkg-config's flags;
+loader inspection confirmed the relocated runtime. Neither configured original
+prefix existed, and the copied runtime and protected source SDK retained their
+SHA-256 identities. These packaging checks reuse the previously qualified Linux
+runtime; they do not qualify subsequent native-execution changes.
 
 ## Remaining gates
 
