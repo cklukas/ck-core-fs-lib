@@ -49,6 +49,11 @@ warnings treated as errors. This qualifies the phase framework. Incremental
 native capture, stream replay, final timestamp handling and independent target
 verification need their own integrated native results.
 
+The subsequent explicit clean-cancellation result is accepted only with a
+requested stop. An unrequested cancellation fails; unavailable native errors
+still retain precedence. The expanded 103-check suite passed normal and
+matching ASan/UBSan builds with warnings treated as errors.
+
 ## Remaining gates
 
 - Integrate and qualify postorder directory metadata replay and bounded

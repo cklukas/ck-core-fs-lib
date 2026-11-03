@@ -13,7 +13,7 @@ namespace ck::files {
 
 enum class OperationMetadataState { Ready, ApplyingTraversal, ApplyingSecurity, ApplyingTimes, Flushing,
                                     Complete, Failed, Cancelled };
-enum class OperationMetadataStep { Pending, Complete };
+enum class OperationMetadataStep { Pending, Complete, Cancelled };
 
 struct OperationMetadataRequest final {
     // Every phase is required, including explicit no-op callbacks.

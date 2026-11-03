@@ -83,10 +83,14 @@ OperationMetadataState OperationMetadataJob::advance_cooperative(std::stop_token
     try {
         auto step = request_.advance_phase(state(), stop);
         if (!step.value()) { fail(*step.unavailable_detail()); return state(); }
-        if (*step.value() != OperationMetadataStep::Pending && *step.value() != OperationMetadataStep::Complete) {
+        if (*step.value() != OperationMetadataStep::Pending && *step.value() != OperationMetadataStep::Complete &&
+            *step.value() != OperationMetadataStep::Cancelled) {
             fail(error(AdapterError::InvalidNativeResult, "metadata_job.cooperative_result")); return state();
         }
         if (stop.stop_requested()) { cancel(); return state(); }
+        if (*step.value() == OperationMetadataStep::Cancelled) {
+            fail(error(AdapterError::InvalidNativeResult, "metadata_job.unrequested_cancellation")); return state();
+        }
         if (*step.value() == OperationMetadataStep::Pending) return state();
         switch (state()) {
         case OperationMetadataState::ApplyingTraversal: result_.state = OperationMetadataState::ApplyingSecurity; break;

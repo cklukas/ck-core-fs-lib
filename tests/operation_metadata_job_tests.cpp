@@ -69,6 +69,15 @@ void failures() {
         CHECK(job->advance() == State::Failed); CHECK(calls == 1);
     }
 }
+void explicit_cancellation() {
+    for(bool requested:{false,true}) {
+        std::stop_source stop;OperationMetadataRequest request;
+        request.advance_phase=[&](State,std::stop_token){if(requested)stop.request_stop();return ready(Step::Cancelled);};
+        auto job=take(std::move(request));
+        CHECK(job->advance(stop.get_token())==(requested?State::Cancelled:State::Failed));
+        CHECK(job->failure()->error.code==static_cast<std::int64_t>(requested?AdapterError::InterruptedRead:AdapterError::InvalidNativeResult));
+    }
+}
 void adapters() {
     CHECK(!OperationMetadataJob::create({}).value());
     auto mixed = single(); mixed.advance_phase = [](State, std::stop_token) { return ready(Step::Complete); };
@@ -84,6 +93,6 @@ void adapters() {
 }
 }
 int main() {
-    try { phases(); cancellation(); failures(); adapters(); std::printf("cooperative metadata job: %u checks passed\n", checks); return 0; }
+    try { phases(); cancellation(); failures(); explicit_cancellation(); adapters(); std::printf("cooperative metadata job: %u checks passed\n", checks); return 0; }
     catch (const std::exception& e) { std::fprintf(stderr, "cooperative metadata job: %s\n", e.what()); return 1; }
 }
