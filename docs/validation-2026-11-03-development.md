@@ -118,6 +118,20 @@ and installed audits, actual interposition probe, native C resolution roundtrip,
 and installed ISO C11 consumer all pass. Only the shared runtime was relinked;
 the native static archive bytes and source/header cohort were unchanged.
 
+## Matching macOS sanitizers
+
+A fresh ownership-enforced APFS run passed all seven selected tests under
+ASan and UBSan in 4.30s, with no sanitizer diagnostics. All 130 product
+translation units and six test objects carried matching instrumentation.
+The derivative manifest is
+`8ae4f343a00329ee8f1a554766b9bcfc48740e5579f495cedc8e114e1cdec446`.
+The tests cover main-content production, regular execution source, v3
+directory workers, metadata capture, progressive review cleanup, and both
+Scanner paths. The Linux-only ancestry-method guard matches the tested
+source exactly. This snapshot predates the subsequent base copy-source drain
+and deferred protocol-diagnostic changes; those need their own qualification.
+Positive macOS publication remains an open gate.
+
 ## Linux native mount identity
 
 The frozen Root 0.4 candidate, based on `e89504e`, passed all 40 native tests
@@ -135,6 +149,12 @@ statx/fstat VFS identity, with native mount IDs, filesystem IDs, attributes,
 mount-root endpoints and before/after checks. The Btrfs run observed SB `0:60`
 and VFS `0:61`; no filesystem-specific bypass is used. Btrfs qualification
 covers top-level subvolid 5. Mounted non-root subvolumes remain refused.
+
+A separate native-query eligibility probe also passed on rpi4 Linux 6.18.34
+as UID 1000 with zero effective/permitted/inheritable/ambient capabilities.
+It is not a full controlled-privilege or SDK qualification: its bounding set
+remained nonzero and NoNewPrivs was zero. No kernel compatibility fallback
+was needed for that query.
 
 The lifecycle fixture's old duplicated directory stream missed populated
 Btrfs entries during teardown. Its qualified derivative opens a fresh iterator
