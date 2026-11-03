@@ -345,3 +345,29 @@ TemporaryDirectory creation and cleanup. Errors remain fatal; no ignore or
 skip was added. Windows also retains the separately tracked metadata-fixture
 collision and reviewed-tree fixture failures. See
 [CI run 41544431697](https://github.com/cklukas/ck-core-fs-lib/actions/runs/41544431697).
+
+### One-unit native name buffers and reviewed Windows fixtures
+
+A controlled native test isolated a production failure: one UTF-16 unit made
+`offsetof(FILE_RENAME_INFO, FileName) + 2` equal 22 bytes, below the native
+structure's 24-byte minimum. The same held handle failed at 22 and succeeded at
+24 bytes. Rename and hard-link variable-name buffers now allocate at least the
+complete native structure, retaining the exact byte-counted filename.
+
+The focused Windows reviewed-tree, session and Compare suites passed after this
+fix: 1,238, 2,701 and 102 checks respectively. The 25.16-second build and
+5.33-second test run retained an unchanged source manifest; evidence is
+`/Volumes/S8T/tmp/ckfs-minbuffer-731-20261103-m/summary.json`.
+The fixtures account for Windows denying ancestor renames while descendant
+files are open. Empty directory/root substitution still checks changed native
+identities, and the collision test proves the provider's actual case-alias
+lookup before checking its exact refusal reason. Metadata fixture names also
+include a process-local atomic sequence to avoid same-tick collisions.
+
+An additional fully instrumented Windows build passed ten NTFS Trash/restore
+round trips, including single-unit ASCII names, a one-unit unpaired surrogate,
+and a single-unit directory name. A one-unit hard-link publication passed;
+multiply linked Trash input and a real junction were refused without mutation
+or journal creation, preserving the target sentinel. The incremental ASan build
+took 26.63 seconds and native tests 1.61 seconds. The record is
+`/Volumes/S8T/tmp/ck-core-fs-dir-asan.m5djf5jd/short-output.log`.

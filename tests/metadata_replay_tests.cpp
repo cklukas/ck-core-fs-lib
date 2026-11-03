@@ -15,6 +15,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <atomic>
 #include <sddl.h>
 #else
 #include <fcntl.h>
@@ -71,7 +72,9 @@ struct Fixture {
         const auto* require_v=_wgetenv(L"CK_FS_REQUIRE_V_DEV_DRIVE");
         if (require_v&&std::wstring_view(require_v)==L"1")
             require(native_temp->starts_with(L"\\\\?\\V:\\tmp\\")&&native_tmp->starts_with(L"\\\\?\\V:\\tmp\\"),"workstation tests require V:\\tmp TEMP/TMP");
-        root=*native_temp+L"\\metadata-replay-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
+        static std::atomic<std::uint64_t> sequence{0};
+        root=*native_temp+L"\\metadata-replay-"+std::to_wstring(GetCurrentProcessId())+L"-"+
+            std::to_wstring(GetTickCount64())+L"-"+std::to_wstring(sequence.fetch_add(1,std::memory_order_relaxed));
         require(CreateDirectoryW(root.c_str(),nullptr)!=0,"create root");directories.push_back(root);
         // Exact wide/native calls exercise an extended path longer than MAX_PATH.
         for(int i=0;i<4;++i) {root+=L"\\"+std::wstring(72,L'a'+i);require(CreateDirectoryW(root.c_str(),nullptr)!=0,"create long root");directories.push_back(root);}

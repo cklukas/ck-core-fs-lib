@@ -9,9 +9,13 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <winternl.h>
+#include <bit>
+#include <cstddef>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -55,7 +59,79 @@ void write_file(const std::filesystem::path& p, const std::string& data, bool re
     CHECK(CloseHandle(h));
 }
 void rename_exact(const std::filesystem::path& a, const std::filesystem::path& b) {
-    CHECK(MoveFileExW(extended(a).c_str(), extended(b).c_str(), 0));
+    struct Handle {
+        HANDLE value;
+        ~Handle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    };
+    auto failed = [&](const char* phase, DWORD code, NTSTATUS status = 0) {
+        std::fprintf(stderr,"fixture rename failed phase=%s code=%lu ntstatus=0x%08lx source=%ls destination=%ls\n",
+            phase, static_cast<unsigned long>(code), static_cast<unsigned long>(status), a.c_str(), b.c_str());
+        CHECK(false);
+    };
+    constexpr DWORD sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    constexpr DWORD flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+    Handle source{CreateFileW(extended(a).c_str(), DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        sharing, nullptr, OPEN_EXISTING, flags, nullptr)};
+    if (source.value == INVALID_HANDLE_VALUE) failed("open-source", GetLastError());
+    Handle parent{CreateFileW(extended(b.parent_path()).c_str(), FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        sharing, nullptr, OPEN_EXISTING, flags, nullptr)};
+    if (parent.value == INVALID_HANDLE_VALUE) failed("open-parent", GetLastError());
+    FILE_ATTRIBUTE_TAG_INFO source_tag{}, parent_tag{};
+    if (!GetFileInformationByHandleEx(source.value, FileAttributeTagInfo, &source_tag, sizeof(source_tag)) ||
+        !GetFileInformationByHandleEx(parent.value, FileAttributeTagInfo, &parent_tag, sizeof(parent_tag)))
+        failed("inspect-handles", GetLastError());
+    CHECK(!(source_tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT));
+    CHECK((parent_tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(parent_tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT));
+    const auto leaf = b.filename().native();
+    CHECK(!leaf.empty() && leaf != L"." && leaf != L".." && leaf.find_first_of(L"\\/:") == leaf.npos);
+    CHECK(leaf.find(L'\0') == leaf.npos && leaf.size() <= 32767);
+    struct Rename { BOOLEAN replace; HANDLE root; ULONG length; WCHAR name[1]; };
+    std::vector<std::byte> buffer(sizeof(Rename) + leaf.size() * sizeof(wchar_t));
+    auto* info = reinterpret_cast<Rename*>(buffer.data());
+    info->replace = FALSE; info->root = parent.value;
+    info->length = static_cast<ULONG>(leaf.size() * sizeof(wchar_t));
+    std::copy(leaf.begin(), leaf.end(), info->name);
+    using Set = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+    using Cancel = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PIO_STATUS_BLOCK);
+    const auto module = GetModuleHandleW(L"ntdll.dll");
+    const auto symbol = GetProcAddress(module, "NtSetInformationFile");
+    const auto cancel = GetProcAddress(module, "NtCancelIoFileEx");
+    CHECK(symbol && cancel);
+    IO_STATUS_BLOCK io{};
+    constexpr NTSTATUS pending = 0x00000103L;
+    io.Status = pending;
+    const auto exact_status = [&] {
+        MemoryBarrier();
+        return *reinterpret_cast<volatile NTSTATUS*>(&io.Status);
+    };
+    const auto drain = [&](ULONGLONG milliseconds) {
+        const auto deadline = GetTickCount64() + milliseconds;
+        while (exact_status() == pending) {
+            const auto now = GetTickCount64();
+            if (now >= deadline) return false;
+            const auto waited = WaitForSingleObject(source.value, static_cast<DWORD>(std::min<ULONGLONG>(50, deadline - now)));
+            if (waited == WAIT_FAILED) return false;
+            if (waited == WAIT_OBJECT_0 && exact_status() == pending) Sleep(1);
+        }
+        return true;
+    };
+    auto status = std::bit_cast<Set>(symbol)(source.value, &io, info, static_cast<ULONG>(buffer.size()), 10);
+    bool timed_out = false;
+    if (status == pending) {
+        timed_out = !drain(5000);
+        if (timed_out) {
+            IO_STATUS_BLOCK cancelled{};
+            const auto cancellation = std::bit_cast<Cancel>(cancel)(source.value, &io, &cancelled);
+            if (!drain(5000)) {
+                std::fprintf(stderr, "fixture rename exact IOSB still pending after cancellation status=0x%08lx\n",
+                    static_cast<unsigned long>(cancellation));
+                std::abort(); // Never destroy a buffer still owned by native I/O.
+            }
+        }
+        status = exact_status();
+    }
+    if (status < 0 || status == pending || timed_out)
+        failed("NtSetInformationFile", timed_out ? ERROR_TIMEOUT : RtlNtStatusToDosError(status), status);
 }
 void cleanup(const std::filesystem::path& root) {
     WIN32_FIND_DATAW data{};
@@ -302,15 +378,38 @@ void test_deletions_and_unsupported() {
 }
 void test_changed_receipts() {
     for (unsigned variant = 0; variant < 6; ++variant) {
+        std::fprintf(stderr, "changed receipts variant=%u\n", variant);
         Fixture f;
-        mkdir_new(f.path("s/folder")); write_file(f.path("s/folder/a"), "original");
+        bool empty_directory_swap = false;
+        bool empty_root_swap = false;
+#ifdef _WIN32
+        // Windows cannot rename an ancestor of an open file. An empty folder
+        // keeps this case focused on directory identity substitution.
+        empty_directory_swap = variant == 4;
+        empty_root_swap = variant == 5;
+#endif
+        if (!empty_root_swap) mkdir_new(f.path("s/folder"));
+        if (!empty_directory_swap && !empty_root_swap) write_file(f.path("s/folder/a"), "original");
         auto job = f.job(); preview(*job); auto receipt = take(job->review({}));
         if (variant == 0) write_file(f.path("s/folder/a"), "modified", true);
         if (variant == 1) { rename_exact(f.path("s/folder/a"), f.path("s/old")); write_file(f.path("s/folder/a"), "original"); }
         if (variant == 2) write_file(f.path("d/foreign"), "target changed");
         if (variant == 3) { rename_exact(f.path("d"), f.path("old-d")); mkdir_new(f.path("d")); }
-        if (variant == 4) { rename_exact(f.path("s/folder"), f.path("s/old")); mkdir_new(f.path("s/folder")); write_file(f.path("s/folder/a"), "original"); }
-        if (variant == 5) { rename_exact(f.path("s"), f.path("old-s")); mkdir_new(f.path("s")); }
+        if (variant == 4) {
+            const auto before = take(f.fs.inspect_basic(f.path("s/folder"))).identity;
+            rename_exact(f.path("s/folder"), f.path("s/old")); mkdir_new(f.path("s/folder"));
+            if (!empty_directory_swap) write_file(f.path("s/folder/a"), "original");
+            const auto after = take(f.fs.inspect_basic(f.path("s/folder"))).identity;
+            CHECK(before.value() && after.value());
+            CHECK(compare_identity(*before.value(), *after.value()) == IdentityComparison::Different);
+        }
+        if (variant == 5) {
+            const auto before = take(f.fs.inspect_basic(f.path("s"))).identity;
+            rename_exact(f.path("s"), f.path("old-s")); mkdir_new(f.path("s"));
+            const auto after = take(f.fs.inspect_basic(f.path("s"))).identity;
+            CHECK(before.value() && after.value());
+            CHECK(compare_identity(*before.value(), *after.value()) == IdentityComparison::Different);
+        }
         CHECK(take(job->begin_execution(receipt))); run(*job);
         CHECK(job->state() == ReviewedTreeState::Failed);
         CHECK(job->progress().failure.has_value());
@@ -329,9 +428,30 @@ void test_overlap_collision_and_limits() {
     auto same_root = f.request(); same_root.destination_root = same_root.source_root;
     CHECK(!ReviewedTreePlanJob::create(std::move(same_root)).value());
     write_file(f.path("s/Alpha"), "a"); write_file(f.path("d/alpha"), "b");
+    const char* collision_phase = "reviewed_tree.cross_tree_case_collision";
+#ifdef _WIN32
+    // A native case alias is rejected during name lookup, before the portable
+    // folded-key check. Qualify the fixture's actual directory semantics.
+    auto destination = take(f.parent->open_directory_child(name("d")));
+    const auto alias = take(destination->lookup_child(name("Alpha"), ChildLookupMode::NativeDefault));
+    if (alias.state() == ChildLookupState::Found) {
+        const auto aliased = take(alias.entry()->inspect_basic()).identity;
+        const auto exact = take(f.fs.inspect_basic(f.path("d/alpha"))).identity;
+        CHECK(aliased.value() && exact.value());
+        CHECK(compare_identity(*aliased.value(), *exact.value()) == IdentityComparison::Same);
+        collision_phase = "reviewed_tree.native_name_collision";
+    } else CHECK(alias.state() == ChildLookupState::Missing);
+#endif
     auto collision = f.job(); run(*collision);
     CHECK(collision->state() == ReviewedTreeState::Failed);
-    CHECK(collision->progress().failure->error.operation == "reviewed_tree.cross_tree_case_collision");
+    CHECK(collision->progress().failure.has_value());
+    const auto collision_failure = *collision->progress().failure;
+    std::fprintf(stderr, "cross-tree collision expected=%s actual=%s state=%u domain=%u code=%lld\n",
+        collision_phase, collision_failure.error.operation.c_str(), unsigned(collision_failure.state),
+        unsigned(collision_failure.error.domain), static_cast<long long>(collision_failure.error.code));
+    CHECK(collision_failure.error.operation == collision_phase);
+    CHECK(collision_failure.error.domain == ErrorDomain::Adapter);
+    CHECK(collision_failure.error.code == static_cast<std::int64_t>(AdapterError::PlanTopologyUnsafe));
     auto bad = f.request(); bad.digest_chunk_bytes = 0; CHECK(!ReviewedTreePlanJob::create(std::move(bad)).value());
     bad = f.request(); bad.comparison.profile = ComparisonProfile::Move;
     CHECK(ReviewedTreePlanJob::create(std::move(bad)).state() == ObservationState::Unsupported);
@@ -351,6 +471,14 @@ void test_cancellation() {
     mkdir_new(f.path("s/folder"));
     auto execution = f.job(); preview(*execution); start(*execution);
     for (unsigned i = 0; i < 10000 && execution->progress().completed_items == 0 && active(execution->state()); ++i) execution->advance();
+    if (!execution->progress().completed_items) {
+        const auto progress = execution->progress();
+        std::fprintf(stderr, "cancellation progress state=%u completed=%llu active=%u failure=%s domain=%u code=%lld\n",
+            unsigned(execution->state()), static_cast<unsigned long long>(progress.completed_items),
+            unsigned(active(execution->state())), progress.failure ? progress.failure->error.operation.c_str() : "none",
+            progress.failure ? unsigned(progress.failure->error.domain) : 0,
+            progress.failure ? static_cast<long long>(progress.failure->error.code) : 0);
+    }
     CHECK(execution->progress().completed_items > 0);
     execution->advance(cancel.get_token());
     CHECK(execution->state() == ReviewedTreeState::Partial);
@@ -386,6 +514,19 @@ void test_changes_during_execution() {
 void test_parent_move_into_source() {
     Fixture f;
     mkdir_new(f.path("q")); mkdir_new(f.path("q/target"));
+#ifdef _WIN32
+    // Windows prevents moving an ancestor while its descendant is open.
+    // Establish the real overlap before taking descendant handles; the
+    // receipt variants separately exercise directory/root substitution.
+    rename_exact(f.path("q"), f.path("s/q"));
+    auto r = f.request();
+    auto source = take(f.parent->open_directory_child(name("s")));
+    auto q = std::shared_ptr<const DirectoryCursor>(take(source->open_directory_child(name("q"))));
+    r.destination_root = take(HeldChild::observe(q, name("target")));
+    r.destination_address = take(NativeAbsolutePath::from_host(f.path("s/q/target")));
+    auto job = take(ReviewedTreePlanJob::create(std::move(r))); run(*job);
+    std::fprintf(stderr, "Windows overlap fixture: ancestor moved before descendant handle acquisition\n");
+#else
     auto r = f.request();
     auto q = std::shared_ptr<const DirectoryCursor>(take(f.parent->open_directory_child(name("q"))));
     r.destination_root = take(HeldChild::observe(q, name("target")));
@@ -393,6 +534,7 @@ void test_parent_move_into_source() {
     auto receipt = take(job->review({}));
     rename_exact(f.path("q"), f.path("s/q"));
     CHECK(take(job->begin_execution(receipt))); run(*job);
+#endif
     CHECK(job->state() == ReviewedTreeState::Failed);
     CHECK(job->progress().failure->error.operation == "reviewed_tree.overlap");
 }

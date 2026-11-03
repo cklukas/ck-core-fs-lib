@@ -14,6 +14,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winioctl.h>
 #include <sddl.h>
 #include <aclapi.h>
 #endif
@@ -748,6 +749,65 @@ void opaque_parent_critical_test() {
     auto missing=cursor->lookup_child(source,ChildLookupMode::NativeDefault);assert(missing.value()&&missing.value()->state()==ChildLookupState::Missing);
     std::puts("critical Trash: opaque receipt survives job destruction and rejects deleted/recreated original parent");
 }
+void windows_short_link_and_reparse(const std::shared_ptr<const DirectoryCursor>& cursor) {
+    const auto source=host_name("hard-link-source"),link=host_name("l");
+    auto created=cursor->create_child_file(source);assert(created.value());
+    assert((*created.value())->finish_content_writes().value());created={};
+    auto held=HeldChild::observe(cursor,source);assert(held.value());
+    const auto original_id=*(*held.value())->metadata().identity.value();
+    auto published=cursor->create_hard_link(source,original_id,*cursor,link);
+    assert_native_result(published,"one-unit hard-link publication");
+    auto linked=HeldChild::observe(cursor,link);assert(linked.value());
+    assert(compare_identity(original_id,*(*linked.value())->metadata().identity.value())==IdentityComparison::Same);
+    assert((*linked.value())->metadata().link_count.value()&&*(*linked.value())->metadata().link_count.value()==2);
+    assert(!cursor->create_hard_link(source,original_id,*cursor,link).value());
+    assert(!native_trash_backend()->prepare_trash(*linked.value(),{}).value());
+
+    const auto target_name=host_name("junction-target"),junction_name=host_name("junction-refused"),sentinel=host_name("sentinel");
+    auto made=cursor->create_child_directory(target_name);assert(made.value());
+    std::shared_ptr<const DirectoryCursor> target(std::move(made).take_value());
+    const std::array<std::byte,3> content{std::byte{9},std::byte{8},std::byte{7}};
+    created=target->create_child_file(sentinel);assert(created.value());
+    auto wrote=(*created.value())->write_content(0,content);assert(wrote.value()&&*wrote.value()==content.size());
+    assert((*created.value())->finish_content_writes().value());created={};
+    auto target_handle=duplicate_windows_trash_parent(*target);assert(target_handle.value());
+    std::vector<wchar_t> path(32768);
+    const auto count=GetFinalPathNameByHandleW(target_handle.value()->get(),path.data(),static_cast<DWORD>(path.size()),FILE_NAME_OPENED|VOLUME_NAME_GUID);
+    assert(count&&count<path.size());std::wstring print(path.data(),count);assert(print.starts_with(L"\\\\?\\Volume{"));
+    const auto substitute=L"\\??\\"+print.substr(4);
+    made=cursor->create_child_directory(junction_name);assert(made.value());
+    std::shared_ptr<const DirectoryCursor> junction(std::move(made).take_value());
+    auto volume=duplicate_windows_trash_parent(*cursor);assert(volume.value());
+    FILE_ID_DESCRIPTOR id{};id.dwSize=sizeof(id);id.Type=ExtendedFileIdType;
+    std::memcpy(id.ExtendedFileId.Identifier,junction->identity().value()->object.bytes.data(),16);
+    TestWinHandle writer(OpenFileById(volume.value()->get(),&id,GENERIC_WRITE,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT));
+    assert(writer.get()!=INVALID_HANDLE_VALUE);
+    struct Mount {DWORD tag;WORD length,reserved,sub_offset,sub_length,print_offset,print_length;wchar_t names[2048];} data{};
+    assert(substitute.size()+print.size()+2<2048);
+    data.tag=IO_REPARSE_TAG_MOUNT_POINT;data.sub_length=static_cast<WORD>(substitute.size()*2);
+    data.print_offset=static_cast<WORD>((substitute.size()+1)*2);data.print_length=static_cast<WORD>(print.size()*2);
+    std::copy(substitute.begin(),substitute.end(),data.names);
+    std::copy(print.begin(),print.end(),data.names+substitute.size()+1);
+    data.length=static_cast<WORD>(8+data.print_offset+data.print_length+2);DWORD returned=0;
+    assert(DeviceIoControl(writer.get(),FSCTL_SET_REPARSE_POINT,&data,data.length+8,nullptr,0,&returned,nullptr));
+    writer.reset();junction.reset();
+    held=HeldChild::observe(cursor,junction_name);assert(held.value());
+    assert((*held.value())->metadata().kind.value()&&*(*held.value())->metadata().kind.value()==ObjectKind::Junction);
+    ckfe_entry input{};input.child=*held.value();ckfea_item item;ckfea_item_init(&item);item.source=&input;
+    const auto journal=host_name("reparse-refusal.journal");
+    ckfea_request request;ckfea_request_init(&request);request.operation=CKFEA_TRASH;request.capabilities=CKFEA_ALLOW_NATIVE_TRASH;
+    request.items=&item;request.item_count=1;request.journal_directory=native_path_text(*root);request.journal_name=native_text(journal);
+    ckfea_job* job=nullptr;assert(ckfea_job_create(&request,&job)==CKFEA_OK);wait_c(job);
+    auto result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK&&result.state==CKFEA_UNSUPPORTED);
+    execute_c(job);assert(ckfea_job_item(job,0,&result)==CKFEA_OK&&result.state==CKFEA_UNSUPPORTED);ckfea_job_destroy(job);
+    auto untouched=HeldChild::observe(cursor,junction_name);assert(untouched.value());
+    assert(compare_identity(*(*held.value())->metadata().identity.value(),*(*untouched.value())->metadata().identity.value())==IdentityComparison::Same);
+    auto no_journal=cursor->lookup_child(journal,ChildLookupMode::NativeDefault);assert(no_journal.value()&&no_journal.value()->state()==ChildLookupState::Missing);
+    auto leaf=target->open_child(sentinel,EntryAccess::ContentRead);assert(leaf.value());auto bytes=(*leaf.value())->read_content();
+    assert(bytes.value()&&bytes.value()->complete&&bytes.value()->bytes==std::vector<std::byte>(content.begin(),content.end()));
+    std::puts("native short hard-link publication and no-follow Trash reparse refusal passed");
+}
 void windows_native_trash_tests() {
     NativeFileSystem fs;auto opened=fs.open_native_directory(*root);assert(opened.value());
     std::shared_ptr<const DirectoryCursor> cursor(std::move(opened).take_value());
@@ -756,8 +816,12 @@ void windows_native_trash_tests() {
     windows_native_trash_case(cursor,*NativeName::from_windows(u"ordinary-trash.bin"),false);
     windows_native_trash_case(cursor,*NativeName::from_windows(std::u16string(u"猫-ß-")+char16_t(0xd800)),false);
     windows_native_trash_case(cursor,*NativeName::from_windows(u"restore-collision.bin"),true);
+    windows_native_trash_case(cursor,*NativeName::from_windows(u"a"),false);
+    windows_native_trash_case(cursor,*NativeName::from_windows(std::u16string(1,char16_t(0xd800))),false);
     windows_native_trash_case(cursor,*NativeName::from_windows(u"directory-trash"),false,true);
     windows_native_trash_case(cursor,*NativeName::from_windows(u"directory-collision"),true,true);
+    windows_native_trash_case(cursor,*NativeName::from_windows(u"b"),false,true);
+    windows_short_link_and_reparse(cursor);
     // Held-directory creation keeps every component native and exceeds MAX_PATH.
     for(unsigned i=0;i<5;++i) {
         auto n=*NativeName::from_windows(std::u16string(60,char16_t(u'a'+i)));

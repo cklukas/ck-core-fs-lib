@@ -276,7 +276,7 @@ Observation<bool> absent(HANDLE directory,const NativeName& n) {
 Observation<bool> native_rename(HANDLE source,HANDLE target,const NativeName& n) {
     if(!valid_name(n)) return reject<bool>("trash.rename_name");
     const auto& w=*n.windows_units(); const size_t bytes=w.size()*2;
-    std::vector<std::byte> storage(offsetof(FILE_RENAME_INFO,FileName)+bytes);
+    std::vector<std::byte> storage(std::max(sizeof(FILE_RENAME_INFO),offsetof(FILE_RENAME_INFO,FileName)+bytes));
     auto* info=reinterpret_cast<FILE_RENAME_INFO*>(storage.data()); info->ReplaceIfExists=FALSE;
     info->RootDirectory=target; info->FileNameLength=static_cast<DWORD>(bytes); std::memcpy(info->FileName,w.data(),bytes);
     using Set=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,ULONG);

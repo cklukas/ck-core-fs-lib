@@ -1376,7 +1376,7 @@ public:
             return Result::unavailable(ObservationState::Failed,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InventoryLimit),
                  "create_hard_link.name_limit"});
-        std::vector<std::byte> buffer(offsetof(FileLinkInformationCompat, FileName) + length);
+        std::vector<std::byte> buffer(std::max(sizeof(FileLinkInformationCompat),offsetof(FileLinkInformationCompat, FileName) + length));
         auto *info = reinterpret_cast<FileLinkInformationCompat *>(buffer.data());
         info->ReplaceIfExists = FALSE;
         info->RootDirectory = destination_access.value()->get();
@@ -1707,7 +1707,7 @@ public:
         if (length > std::numeric_limits<ULONG>::max() - offsetof(FILE_RENAME_INFO, FileName))
             return Result::unavailable(ObservationState::Failed,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidLimit), "trash_child.recycle_name_limit"});
-        std::vector<std::byte> rename_buffer(offsetof(FILE_RENAME_INFO, FileName) + length);
+        std::vector<std::byte> rename_buffer(std::max(sizeof(FILE_RENAME_INFO),offsetof(FILE_RENAME_INFO, FileName) + length));
         auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
         rename->ReplaceIfExists = FALSE;
         rename->RootDirectory = recycle_directory.value()->get();
@@ -1842,7 +1842,7 @@ public:
         if (length > std::numeric_limits<ULONG>::max() - offsetof(FILE_RENAME_INFO, FileName))
             return Result::unavailable(ObservationState::Failed,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidLimit), "rename_child_noreplace.name_limit"});
-        std::vector<std::byte> buffer(offsetof(FILE_RENAME_INFO, FileName) + length);
+        std::vector<std::byte> buffer(std::max(sizeof(FILE_RENAME_INFO),offsetof(FILE_RENAME_INFO, FileName) + length));
         auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
         info->ReplaceIfExists = FALSE;
         info->RootDirectory = destination_access.value()->get();
@@ -1938,7 +1938,7 @@ public:
         if (length > std::numeric_limits<ULONG>::max() - offsetof(FILE_RENAME_INFO, FileName))
             return Result::unavailable(ObservationState::Failed,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidLimit), "rename_child_case_only.name_limit"});
-        std::vector<std::byte> buffer(offsetof(FILE_RENAME_INFO, FileName) + length);
+        std::vector<std::byte> buffer(std::max(sizeof(FILE_RENAME_INFO),offsetof(FILE_RENAME_INFO, FileName) + length));
         auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
         info->ReplaceIfExists = FALSE;
         info->RootDirectory = destination_access.value()->get();
@@ -1987,7 +1987,7 @@ public:
             const auto& error = *destination_access.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
-        std::vector<std::byte> buffer(offsetof(FILE_RENAME_INFO, FileName) + length);
+        std::vector<std::byte> buffer(std::max(sizeof(FILE_RENAME_INFO),offsetof(FILE_RENAME_INFO, FileName) + length));
         auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
         info->ReplaceIfExists = FALSE;
         info->RootDirectory = destination_access.value()->get();
