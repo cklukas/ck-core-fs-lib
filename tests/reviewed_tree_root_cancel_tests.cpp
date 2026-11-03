@@ -10,7 +10,6 @@
 #endif
 namespace root_cancel_hook {
 thread_local std::stop_source* armed=nullptr;
-thread_local std::unique_ptr<ck::files::OperationJournalFile>* journal=nullptr;
 thread_local unsigned hits=0;
 thread_local bool closed_error=false;
 std::optional<std::int64_t> close_fault(ck::files::detail::JournalRootFaultPoint point){
@@ -20,7 +19,6 @@ std::optional<std::int64_t> close_fault(ck::files::detail::JournalRootFaultPoint
 void after_query()noexcept {
     if(!armed)return;
     auto* stop=armed;armed=nullptr;++hits;stop->request_stop();
-    if(journal&&*journal){try{auto result=(*journal)->finish_io();closed_error=!result.value()&&result.unavailable_detail()->error.code==5;}catch(...){}journal->reset();}
 }
 #ifdef _WIN32
 BOOL WINAPI query(HANDLE h,FILE_INFO_BY_HANDLE_CLASS kind,LPVOID out,DWORD n){
@@ -53,10 +51,17 @@ int main(){try{
         auto job=take(ReviewedTreePlanJob::create(std::move(request)));
         if(during_scope){CHECK(job->advance()==ReviewedTreeState::Inventory);}
         const auto previous=detail::journal_root_test_fault;
-        struct Restore{detail::JournalRootFault previous;~Restore(){root_cancel_hook::armed=nullptr;root_cancel_hook::journal=nullptr;detail::journal_root_test_fault=previous;}} restore{previous};
-        if(native_close_error){journal=take(root->open_journal(name(".ck-root-cancel-probe"),true));root_cancel_hook::journal=&journal;detail::journal_root_test_fault=root_cancel_hook::close_fault;}
-        std::stop_source stop;root_cancel_hook::hits=0;root_cancel_hook::closed_error=false;root_cancel_hook::armed=&stop;
-        const auto state=job->advance(stop.get_token());CHECK(root_cancel_hook::hits==1&&stop.stop_requested());
+        struct Restore{detail::JournalRootFault previous;~Restore(){root_cancel_hook::armed=nullptr;detail::journal_root_test_fault=previous;}} restore{previous};
+        std::stop_source stop;root_cancel_hook::hits=0;root_cancel_hook::closed_error=false;
+        if(native_close_error){
+            // Consume the real close before cancellation. Native query hooks
+            // must never reenter a Root while its validation mutex is held.
+            journal=take(root->open_journal(name(".ck-root-cancel-probe"),true));
+            detail::journal_root_test_fault=root_cancel_hook::close_fault;
+            auto closed=journal->finish_io();root_cancel_hook::closed_error=!closed.value()&&closed.unavailable_detail()->error.code==5;
+            journal.reset();stop.request_stop();
+        }else root_cancel_hook::armed=&stop;
+        const auto state=job->advance(stop.get_token());CHECK(root_cancel_hook::hits==(native_close_error?0U:1U)&&stop.stop_requested());
         CHECK(!fixture.exists("d/a"));CHECK(job->progress().failed_items==0);
         if(native_close_error){
             CHECK(root_cancel_hook::closed_error);CHECK(state==ReviewedTreeState::NeedsReconciliation);
