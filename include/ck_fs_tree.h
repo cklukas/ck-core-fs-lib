@@ -131,6 +131,48 @@ typedef struct ckfet_page_v1 {
     uint32_t has_next, reserved;
 } ckfet_page_v1;
 
+/* Additive cached name-side assessment. Existing v1 layouts are unchanged.
+ * No native I/O, rule evaluation, allocation or name probing occurs in getter.
+ * AVAILABLE means eligible in this worker assessment, never name availability
+ * or execution authority. Target naming additionally requires both qualified
+ * source preservation and genuine worker-qualified retention. An old row's
+ * allowed_choices bit alone does not establish either condition.
+ * Native review/receipt/revalidation remains required.
+ */
+#define CKFET_NAME_FEEDBACK_VERSION UINT32_C(1)
+#define CKFET_NAME_CHOICE_SELECTED UINT32_MAX
+enum { CKFET_NAME_SIDE_NONE=2 };
+enum { CKFET_NAME_SIDE_INCOMING_BIT=1, CKFET_NAME_SIDE_TARGET_BIT=2 };
+enum { CKFET_NAME_CAP_NOT_APPLICABLE=0, CKFET_NAME_CAP_AVAILABLE=1, CKFET_NAME_CAP_UNAVAILABLE=2 };
+enum {
+    CKFET_NAME_REASON_NONE=0, CKFET_NAME_REASON_NOT_NAMED_CHOICE=1,
+    CKFET_NAME_REASON_REPORT_ONLY=2, CKFET_NAME_REASON_SOURCE_NOT_REGULAR=3,
+    CKFET_NAME_REASON_TARGET_NOT_REGULAR=4, CKFET_NAME_REASON_SOURCE_METADATA_UNQUALIFIED=5,
+    CKFET_NAME_REASON_RETENTION_UNAVAILABLE=6, CKFET_NAME_REASON_AWAITING_NAME=7,
+    CKFET_NAME_REASON_WRONG_SIDE=8, CKFET_NAME_REASON_NAME_NOT_ALLOWED=9,
+    CKFET_NAME_REASON_INVALID_SELECTION=10, CKFET_NAME_REASON_UNRESOLVED_RULE=11,
+    CKFET_NAME_REASON_CHOICE_UNAVAILABLE=12
+};
+typedef struct ckfet_name_feedback_v1 {
+    uint32_t version, struct_size;
+    uint64_t plan_generation, row_id, assessment_command_id, snapshot_sequence;
+    uint32_t choice, decision_choice, required_side, allowed_sides;
+    uint32_t capability_state, capability_reason, selection_reason, has_submitted_name;
+    uint32_t submitted_side, retention_available, is_selected, decision_state;
+    uint32_t decision_reason, reserved, reserved2[2];
+    uint64_t reserved3;
+} ckfet_name_feedback_v1;
+/* choice is KEEP_BOTH_INCOMING, KEEP_BOTH_TARGET, RENAME, or SELECTED.
+ * SELECTED reports the actual core decision, including a name supplied for a
+ * non-named choice. assessment_command_id=0 is initial assessment. A queued
+ * command leaves the previous assessment visible until worker replacement;
+ * wait for its outcome and compare this ID before attributing a rejection.
+ * Stale generation returns STALE_PLAN; output is cleared on every failure.
+ * Caller must provide a full ckfet_name_feedback_v1 output object.
+ */
+CK_FILE_ENGINE_API ckfe_api_status ckfet_name_feedback_get_v1(const ckfet_job *job,
+    uint64_t generation, uint64_t row_id, uint32_t choice, ckfet_name_feedback_v1 *out_feedback);
+
 CK_FILE_ENGINE_API void ckfet_options_init_v1(ckfet_options_v1 *options);
 CK_FILE_ENGINE_API ckfe_api_status ckfet_start_v1(const ckfe_entry *source_root,
     const ckfe_entry *destination_root, const ckfet_options_v1 *options, ckfet_job **out_job, ckfe_error *error);

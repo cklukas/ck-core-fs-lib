@@ -696,6 +696,35 @@ if(BUILD_TESTING)
   add_test(NAME job_lifecycle COMMAND ck_fs_job_lifecycle_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
   set_tests_properties(job_lifecycle PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  # Name-side feedback is an additive C ABI; private assessment DTOs changed.
+  add_executable(ck_fs_tree_name_policy_tests tests/tree_name_policy_tests.cpp)
+  target_link_libraries(ck_fs_tree_name_policy_tests PRIVATE ck_core_fs_native)
+  add_executable(ck_fs_tree_name_feedback_c11 tests/tree_name_feedback_c11.c)
+  target_link_libraries(ck_fs_tree_name_feedback_c11 PRIVATE ck_file_engine_c)
+  set_target_properties(ck_fs_tree_name_feedback_c11 PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS NO)
+  foreach(name_target ck_fs_tree_name_policy_tests ck_fs_tree_name_feedback_c11)
+    if(MSVC)
+      target_compile_options(${name_target} PRIVATE /UNDEBUG)
+    else()
+      target_compile_options(${name_target} PRIVATE -UNDEBUG -Wall -Wextra -Wpedantic -Werror)
+    endif()
+  endforeach()
+  add_test(NAME tree_name_policy COMMAND ck_fs_tree_name_policy_tests)
+  add_test(NAME tree_name_feedback_c11 COMMAND ck_fs_tree_name_feedback_c11)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ck_fs_tree_name_feedback_c_tests tests/tree_name_feedback_c_tests.cpp)
+    target_link_libraries(ck_fs_tree_name_feedback_c_tests PRIVATE ck_file_engine_c_test_support)
+    target_compile_options(ck_fs_tree_name_feedback_c_tests PRIVATE -UNDEBUG -Wall -Wextra -Wpedantic -Werror)
+    target_link_options(ck_fs_tree_name_feedback_c_tests PRIVATE
+      "LINKER:--wrap=openat" "LINKER:--wrap=fstat" "LINKER:--wrap=statx" "LINKER:--wrap=close" "LINKER:--wrap=pread")
+    add_test(NAME tree_name_feedback_native COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tree_name_feedback.py
+      $<TARGET_FILE:ck_fs_tree_name_feedback_c_tests> ${CK_CORE_FS_NATIVE_TEST_ROOT})
+    set_tests_properties(tree_name_feedback_native PROPERTIES TIMEOUT 90
+      LABELS "linux;native;c-api;memory-only-polling"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  endif()
+  set_tests_properties(tree_name_policy tree_name_feedback_c11 PROPERTIES TIMEOUT 60)
   add_executable(ck_fs_tree_c_tests tests/tree_c_tests.cpp)
   target_link_libraries(ck_fs_tree_c_tests PRIVATE ck_file_engine_c)
   if(MSVC)

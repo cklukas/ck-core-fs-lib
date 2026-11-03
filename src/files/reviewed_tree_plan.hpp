@@ -53,12 +53,35 @@ struct ReviewedTreeFacts final {
     // execution authority or a promise that a subsequent native call succeeds.
     std::uint64_t allowed_choices = 0;
     bool retained_target_available = false;
+    // Exact worker source_allowed predicate: qualified strict metadata or
+    // explicit metadata-loss consent. Retention never qualifies the source.
+    bool source_preservation_qualified = false;
     ConflictClass conflict_class = ConflictClass::Unavailable;
     // Closed native source observations, value facts only. Unknown metadata
     // never grants strict mutation authority. Main data has a separate digest.
     std::optional<ComparisonMetadataDigest> source_metadata, destination_metadata;
     std::optional<UnavailableObservation> source_metadata_failure, destination_metadata_failure;
 };
+// Worker assessment DTOs only: never namespace or execution authority.
+enum class ReviewedTreeNameReason : std::uint32_t {
+    None=0, NotNamedChoice=1, ReportOnly=2, SourceNotRegular=3,
+    TargetNotRegular=4, SourceMetadataUnqualified=5, RetentionUnavailable=6,
+    AwaitingName=7, WrongSide=8, NameNotAllowed=9, InvalidSelection=10,
+    UnresolvedRule=11, ChoiceUnavailable=12
+};
+struct ReviewedTreeNameFeedback final {
+    ConflictChoice choice=ConflictChoice::Ask;
+    std::optional<ReviewedTreeNameSide> required_side,submitted_side;
+    std::uint32_t allowed_sides=0;
+    ReviewedTreeNameReason capability_reason=ReviewedTreeNameReason::NotNamedChoice;
+    ReviewedTreeNameReason selection_reason=ReviewedTreeNameReason::None;
+    bool selected=false;
+};
+// Pure projection of worker-qualified facts/decision. C callers cannot supply
+// these facts to the native worker or use this projection as a receipt.
+ReviewedTreeNameFeedback assess_reviewed_tree_name_feedback(const ReviewedTreeFacts&,
+    ComparisonProfile,ConflictChoice,const ConflictRuleResult*,
+    std::optional<ReviewedTreeNameSide>,bool invalid_selection=false) noexcept;
 struct ReviewedTreeItem final {
     ComparisonRow row;
     std::vector<NativeName> relative_components; // exact native values for presentation; never parsed keys
@@ -75,6 +98,9 @@ struct ReviewedTreeItem final {
     std::optional<NativeName> proposed_name, resulting_name;
     std::optional<ReviewedTreeNameSide> name_side;
     bool target_retained = false;
+    bool name_feedback_ready = false;
+    std::array<ReviewedTreeNameFeedback,3> name_feedback{};
+    ReviewedTreeNameFeedback selected_name_feedback{};
 };
 struct ReviewedTreePage final {
     ComparisonPlanIdentity identity;

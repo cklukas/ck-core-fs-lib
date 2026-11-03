@@ -444,6 +444,28 @@ restricted worker credentials. The frozen source and runtime receipts precede
 the final Main/target-reader merge; combined Tree, SDK and sanitizer gates are
 still required.
 
+## Additive cached manual-name feedback
+
+The new C getter keeps all existing v1 layouts unchanged and returns a fixed
+112-byte cached record. Core assessment reports the required Incoming/Target
+side, side mask, actual selected decision, qualified source preservation and
+retention, plus separate capability and submitted-selection reasons. Unknown
+strict source metadata blocks Target naming even if retention is available.
+The assessment command ID distinguishes old cached feedback from a newly queued
+review; stale/invalid requests clear the full output.
+
+The isolated normal GCC14/ext4 cohort passed three registered tests, strict
+installed C11 linkage and the ELF export audit. Actual worker reviews reject
+side mismatches without a receipt and accept a valid Incoming review. A thousand
+cached polls run with polling-thread allocation rejection and filesystem-call
+traps armed; all counters remain zero. Generation, row, choice and null-job
+negative calls preserve typed failure and zero output. The genuine-retention
+plus strict-unknown-source combination is a pure core policy test; no Windows
+native execution claim follows from it. The native test cancels and drains
+without publication. Windows, Darwin, sanitizers and the final integrated SDK
+remain separate gates. Private Facts/item layouts changed and require coherent
+recompilation of every affected translation unit.
+
 ## Remaining gates
 
 - Qualify the final combined postorder Tree and bounded metadata workers on

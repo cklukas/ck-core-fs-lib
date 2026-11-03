@@ -18,6 +18,10 @@
 #include <string_view>
 #include <thread>
 
+static_assert(sizeof(ckfet_name_feedback_v1)==112);
+static_assert(offsetof(ckfet_name_feedback_v1,choice)==40);
+static_assert(offsetof(ckfet_name_feedback_v1,reserved3)==104);
+static_assert(static_cast<unsigned>(ck::files::ReviewedTreeNameReason::ChoiceUnavailable)==CKFET_NAME_REASON_CHOICE_UNAVAILABLE);
 static_assert(sizeof(ckfet_failure_details_v1)==192);
 static_assert(offsetof(ckfet_failure_details_v1,operation)==64);
 static_assert(offsetof(ckfet_failure_details_v1,reserved)==160);
@@ -106,6 +110,12 @@ struct Command {
     struct Name { std::uint64_t row; NativeName name; ReviewedTreeNameSide side; };
     std::vector<Name> names;
 };
+struct CachedNameFeedback {
+    std::array<ckfet_name_feedback_v1,3> choices{};
+    ckfet_name_feedback_v1 selected{};
+    bool ready=false;
+    std::uint64_t command=0;
+};
 struct CachedRow {
     ckfet_row_v1 value{};
     std::string key;
@@ -126,6 +136,7 @@ struct Shared {
     std::size_t event_head = 0, event_count = 0;
     std::uint64_t coalesced = 0;
     std::vector<CachedRow> rows;
+    std::vector<CachedNameFeedback> name_rows;
     std::vector<ckfet_rule_counts_v1> rule_counts;
     std::size_t page_limit = 256;
     std::array<char,96> failure_operation{};
@@ -172,6 +183,22 @@ ckfet_observed_v1 observed(const std::vector<ComparisonEntry>& entries, std::opt
     r.timestamp_quantum_ns = o.timestamp_quantum_ns;
     return r;
 }
+ckfet_name_feedback_v1 name_feedback(const ReviewedTreeNameFeedback& in,const ReviewedTreeItem& item) noexcept {
+    ckfet_name_feedback_v1 out{};out.version=CKFET_NAME_FEEDBACK_VERSION;out.struct_size=sizeof(out);
+    out.choice=static_cast<std::uint32_t>(in.choice);out.required_side=in.required_side?
+        static_cast<std::uint32_t>(*in.required_side):CKFET_NAME_SIDE_NONE;
+    out.allowed_sides=in.allowed_sides;out.capability_reason=static_cast<std::uint32_t>(in.capability_reason);
+    out.capability_state=!in.required_side?CKFET_NAME_CAP_NOT_APPLICABLE:
+        in.allowed_sides?CKFET_NAME_CAP_AVAILABLE:CKFET_NAME_CAP_UNAVAILABLE;
+    out.selection_reason=static_cast<std::uint32_t>(in.selection_reason);
+    out.has_submitted_name=in.submitted_side.has_value();out.submitted_side=in.submitted_side?
+        static_cast<std::uint32_t>(*in.submitted_side):CKFET_NAME_SIDE_NONE;
+    out.retention_available=item.facts.retained_target_available;out.is_selected=in.selected;
+    if(item.decision){out.decision_choice=static_cast<std::uint32_t>(item.decision->choice);
+        out.decision_state=static_cast<std::uint32_t>(item.decision->state);
+        out.decision_reason=static_cast<std::uint32_t>(item.decision->reason);}
+    return out;
+}
 CachedRow row(const ReviewedTreeItem& item, const ComparisonPlan& plan) {
     CachedRow result;
     auto& r = result.value;
@@ -217,14 +244,23 @@ CachedRow row(const ReviewedTreeItem& item, const ComparisonPlan& plan) {
     return result;
 }
 void refresh_rows(Shared& s, const ReviewedTreePlanJob& job, const ReviewedTreeReceipt* receipt = nullptr,
-    bool assessment = false, std::optional<std::size_t> rules = {}) {
+    bool assessment = false, std::optional<std::size_t> rules = {}, std::uint64_t assessment_command=0) {
     if (!job.preview()) return;
     std::vector<CachedRow> rows;
+    std::vector<CachedNameFeedback> name_rows;
     for (std::size_t offset = 0;;) {
         auto p = receipt ? job.reviewed_page(*receipt,offset,s.page_limit) :
             assessment ? job.assessment_page(offset,s.page_limit) : job.page(offset,s.page_limit);
         if (!p.value()) throw std::logic_error("native tree page unavailable");
-        for (const auto& item : p.value()->items) rows.push_back(row(item,*job.preview()));
+        for (const auto& item : p.value()->items) {
+            rows.push_back(row(item,*job.preview()));
+            if(assessment){
+                CachedNameFeedback feedback;feedback.ready=item.name_feedback_ready;feedback.command=assessment_command;
+                if(feedback.ready){for(std::size_t i=0;i<feedback.choices.size();++i)feedback.choices[i]=name_feedback(item.name_feedback[i],item);
+                    feedback.selected=name_feedback(item.selected_name_feedback,item);}
+                name_rows.push_back(feedback);
+            }
+        }
         if (!p.value()->next_offset) break;
         offset = *p.value()->next_offset;
     }
@@ -245,7 +281,9 @@ void refresh_rows(Shared& s, const ReviewedTreePlanJob& job, const ReviewedTreeR
         c.retention_rows += r.retain_replaced;
     }
     {
-        std::lock_guard lock(s.mutex); s.rows.swap(rows); s.rule_counts.swap(counts);
+        std::lock_guard lock(s.mutex);
+        if(assessment)s.name_rows.swap(name_rows);
+        s.rows.swap(rows); s.rule_counts.swap(counts);
         s.snapshot.rule_count = rule_count; s.snapshot.unresolved_rows = unresolved;
     }
 }
@@ -264,7 +302,7 @@ void progress(Shared& s, const ReviewedTreePlanJob& job) {
     r.known_copy_bytes = p.known_copy_bytes; r.copied_bytes = p.copied_bytes;
     r.counts_complete = p.counts_complete; r.partial = p.partial; r.recovery_required = p.recovery_required;
     r.has_current_row = p.current_row.has_value(); r.current_row = p.current_row.value_or(0);
-    if (current && current->value.row_id <= s.rows.size()) s.rows[current->value.row_id - 1] = std::move(*current);
+    if (current && current->value.row_id <= s.rows.size()) s.rows[current->value.row_id-1]=std::move(*current);
     if (p.failure) s.set_failure(*p.failure);
     s.terminal = terminal(p.state);
     s.publish();
@@ -345,7 +383,7 @@ void worker_body(std::shared_ptr<Shared> s, ReviewedTreePlanRequest request) noe
                     accepted = Observation<bool>::unavailable(invalid("tree.receipt").state, invalid("tree.receipt").error);
                 else accepted = job->begin_execution(*receipt);
                 refresh_rows(*s,*job,receipt ? &*receipt : nullptr,assessed,
-                    command->kind == Command::Review ? std::optional<std::size_t>(assessed ? command->rules.size() : 0) : std::nullopt);
+                    command->kind == Command::Review ? std::optional<std::size_t>(assessed ? command->rules.size() : 0) : std::nullopt, assessed?command->id:0);
                 std::lock_guard lock(s->mutex);
                 s->snapshot.command_id = command->id;
                 s->snapshot.command_state = accepted.value() ? CKFET_COMMAND_ACCEPTED : CKFET_COMMAND_REJECTED;
@@ -534,6 +572,25 @@ ckfe_api_status ckfet_page_v1_get(const ckfet_job* j, uint64_t generation, uint6
         for (std::uint64_t i = 0; i < n; ++i) rows[i] = s.rows[offset + i].value;
         *out = {generation, n, s.rows.size(), offset + n, static_cast<std::uint32_t>(offset + n < s.rows.size()), 0};
         return CKFE_API_OK;
+    });
+}
+ckfe_api_status ckfet_name_feedback_get_v1(const ckfet_job* j,uint64_t generation,uint64_t id,
+    uint32_t choice,ckfet_name_feedback_v1* out) {
+    if(out)*out={};
+    if(!j||!out||!generation||!id||
+       (choice!=CKFET_NAME_CHOICE_SELECTED&&choice!=CKFET_KEEP_BOTH_INCOMING&&
+        choice!=CKFET_KEEP_BOTH_TARGET&&choice!=CKFET_RENAME))return CKFE_API_INVALID_ARGUMENT;
+    return boundary([&]{
+        std::lock_guard lock(j->state->mutex);const auto& s=*j->state;
+        if(!s.snapshot.plan_generation)return CKFE_API_NOT_READY;
+        if(generation!=s.snapshot.plan_generation)return CKFE_API_STALE_PLAN;
+        if(id>s.rows.size())return CKFE_API_INVALID_ARGUMENT;
+        if(id>s.name_rows.size()||!s.name_rows[id-1].ready)return CKFE_API_NOT_READY;
+        const auto& cached=s.name_rows[id-1];
+        if(choice==CKFET_NAME_CHOICE_SELECTED)*out=cached.selected;
+        else *out=cached.choices[choice==CKFET_KEEP_BOTH_INCOMING?0:choice==CKFET_KEEP_BOTH_TARGET?1:2];
+        out->plan_generation=generation;out->row_id=id;out->assessment_command_id=cached.command;
+        out->snapshot_sequence=s.snapshot.sequence;return CKFE_API_OK;
     });
 }
 ckfe_api_status ckfet_key_copy_v1(const ckfet_job* j, uint64_t generation, uint64_t id,

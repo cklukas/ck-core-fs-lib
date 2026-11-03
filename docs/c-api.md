@@ -270,3 +270,14 @@ be independently published and verified on both sides before the new version
 paths enter the baseline. The current named-resolution provider admits regular
 main-data files; its named-stream accounting and directory execution remain
 separate qualification gates.
+
+## Cached manual-name capability
+
+`ckfet_name_feedback_get_v1` reports worker-assessed name-side eligibility and
+selection errors without changing existing v1 layouts. Incoming KeepBoth/Rename
+and Target KeepBoth have distinct required sides; retention and source metadata
+qualification remain backend policy. Bind feedback to the plan generation, row
+and completed assessment command. The fixed cached getter does no filesystem
+I/O, allocation or rule evaluation. Read the
+[name feedback contract](tree-name-feedback.md) before presenting its typed
+reasons; eligibility never replaces native review or a receipt.

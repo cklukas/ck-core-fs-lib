@@ -35,6 +35,7 @@ nav:
   - title: API
     pages:
       - docs/c-api.md
+      - docs/tree-name-feedback.md
       - docs/cpp-api.md
   - title: Integration
     pages:

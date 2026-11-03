@@ -23,6 +23,36 @@
 #include <set>
 
 namespace ck::files {
+ReviewedTreeNameFeedback assess_reviewed_tree_name_feedback(const ReviewedTreeFacts& facts,
+    ComparisonProfile profile,ConflictChoice choice,const ConflictRuleResult* decision,
+    std::optional<ReviewedTreeNameSide> submitted,bool invalid_selection) noexcept {
+    using Reason=ReviewedTreeNameReason;
+    ReviewedTreeNameFeedback out;out.choice=choice;out.submitted_side=submitted;
+    out.selected=decision&&decision->choice==choice;
+    const bool incoming=choice==ConflictChoice::KeepBothIncoming||choice==ConflictChoice::Rename;
+    const bool target=choice==ConflictChoice::KeepBothTarget;
+    if(incoming||target) {
+        out.required_side=target?ReviewedTreeNameSide::Target:ReviewedTreeNameSide::Incoming;
+        if(profile==ComparisonProfile::Compare)out.capability_reason=Reason::ReportOnly;
+        else if(facts.source_kind!=ObjectKind::RegularFile)out.capability_reason=Reason::SourceNotRegular;
+        else if((target||facts.destination_present)&&facts.destination_kind!=ObjectKind::RegularFile)out.capability_reason=Reason::TargetNotRegular;
+        else if(!facts.source_preservation_qualified)out.capability_reason=Reason::SourceMetadataUnqualified;
+        else if(target&&!facts.retained_target_available)out.capability_reason=Reason::RetentionUnavailable;
+        else if(!(facts.allowed_choices&(std::uint64_t{1}<<static_cast<unsigned>(choice))))
+            out.capability_reason=Reason::ChoiceUnavailable;
+        else {out.capability_reason=Reason::None;out.allowed_sides=std::uint32_t{1}<<static_cast<unsigned>(*out.required_side);}
+    }
+    if(out.selected) {
+        if(invalid_selection)out.selection_reason=Reason::InvalidSelection;
+        else if(submitted&&!out.required_side)out.selection_reason=Reason::NameNotAllowed;
+        else if(submitted&&out.required_side&&*submitted!=*out.required_side)out.selection_reason=Reason::WrongSide;
+        else if(out.required_side&&out.capability_reason!=Reason::None)out.selection_reason=out.capability_reason;
+        else if(out.required_side&&!submitted)out.selection_reason=Reason::AwaitingName;
+        else if(decision->state!=ConflictRuleState::Apply&&decision->state!=ConflictRuleState::NoMatch)
+            out.selection_reason=Reason::UnresolvedRule;
+    }
+    return out;
+}
 namespace {
 UnavailableObservation error(AdapterError code, const char* op,
     ObservationState state = ObservationState::Failed) {
@@ -1505,6 +1535,7 @@ struct ReviewedTreePlanJob::Impl {
         const auto known=[](const auto& value){return value&&value->state==ComparisonDigestState::CompleteStable&&
             (value->ownership!=ComparisonMetadataOwnership::CurrentCaller||value->canonical_owner_digest.has_value());};
         const bool source_allowed=request.copy_policy.allow_unhandled_metadata_loss||known(out.source_metadata);
+        out.source_preservation_qualified=source_allowed;
         if (source_allowed && out.source_kind == ObjectKind::RegularFile && (!out.destination_present || out.destination_kind == ObjectKind::RegularFile))
             out.allowed_choices |= choice_bit(ConflictChoice::KeepBothIncoming) | choice_bit(ConflictChoice::Rename);
         if ((request.copy_policy.allow_unhandled_metadata_loss ||
@@ -1626,6 +1657,13 @@ struct ReviewedTreePlanJob::Impl {
             if (reporting && native) { result.state = ConflictRuleState::Invalid; result.reason = ConflictRuleReason::InvalidRule; }
             if (invalid_selection) { result.state = ConflictRuleState::Invalid; result.reason = ConflictRuleReason::InvalidRule; }
             item.decision = result;
+            item.name_feedback_ready=true;
+            constexpr std::array named_choices{ConflictChoice::KeepBothIncoming,ConflictChoice::KeepBothTarget,ConflictChoice::Rename};
+            for(std::size_t i=0;i<named_choices.size();++i)
+                item.name_feedback[i]=assess_reviewed_tree_name_feedback(item.facts,request.comparison.profile,
+                    named_choices[i],&result,item.name_side,invalid_selection);
+            item.selected_name_feedback=assess_reviewed_tree_name_feedback(item.facts,request.comparison.profile,
+                result.choice,&result,item.name_side,invalid_selection);
         }
         for (auto& item : resolved) if (item.action == ReviewedTreeAction::Replace) {
             auto id = request.journal_id;
