@@ -1791,7 +1791,7 @@ struct ReviewedTreePlanJob::Impl {
     Observation<bool> directory_available(const ReviewedTreeItem& item)const {
         if(!directory_row(item)||!request.prepared_journal_root)
             return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.directory_contract_unbound",ObservationState::Unsupported));
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__linux__)
         return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.directory_atime_observer_unqualified",ObservationState::Unsupported));
 #endif
         const auto found=source.nodes.find(item.row.relative_path);
@@ -1859,7 +1859,9 @@ struct ReviewedTreePlanJob::Impl {
         input.verify_review=[this,row,target_side](std::stop_token stop){
             auto valid=directory_guard(row,stop);if(!valid.value()||!*valid.value()||!target_side)return valid;
             const auto found=target.nodes.find(items[row].row.relative_path);if(found==target.nodes.end())return invalid<bool>("reviewed_tree.directory_target_review");
-            return target_guard(found->second);
+            // Metadata replay of an existing directory does not rename it.
+            // Replacement, retention and deletion keep their rename gate.
+            return target_guard(found->second,false);
         };
         auto source_job=DirectoryExecutionSourceJob::create(std::move(input));
         if(!source_job.value()){fail(*source_job.unavailable_detail());return {};}
@@ -1976,7 +1978,8 @@ struct ReviewedTreePlanJob::Impl {
             if(fact.ownership==ComparisonMetadataOwnership::CurrentCaller){auto owner=metadata_ownership_digest(*observed);if(!owner.value()){fail(*owner.unavailable_detail(),true);return;}fact.canonical_owner_digest=*owner.value();}
             fact.bytes=*digest.value();fact.before=fact.after=node.entry.object;node.entry.metadata_digest=std::move(fact);
             node.entry.directory_metadata_contract=request.comparison.directory_metadata_contract;node.directory_payload=*payload.value();
-            node.all_stream_bytes=0;for(const auto& channel:observed->channels){
+            if(!observed->channels.empty())node.all_stream_bytes=0;
+            for(const auto& channel:observed->channels){
                 if(channel.logical_size>std::numeric_limits<std::uint64_t>::max()-*node.all_stream_bytes){fail(error(AdapterError::InvalidNativeResult,"reviewed_tree.directory_verified_byte_overflow"),true);return;}
                 *node.all_stream_bytes+=channel.logical_size;
             }
@@ -2228,7 +2231,7 @@ Observation<bool> ReviewedTreePlanJob::begin_execution(const ReviewedTreeReceipt
                 auto qualified=impl_->directory_available(item);if(!qualified.value())return qualified;
                 if(!*qualified.value())return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.directory_contract_false",ObservationState::Unsupported));
             }
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__linux__)
             if(item.action==ReviewedTreeAction::Copy||item.action==ReviewedTreeAction::Replace)
                 return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.target_atime_observer_unqualified",ObservationState::Unsupported));
 #endif

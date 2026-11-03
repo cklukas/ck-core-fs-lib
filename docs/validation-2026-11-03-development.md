@@ -707,3 +707,46 @@ remain pending.
 The imported ledger implementation and both permanent fixture translation units
 also passed Apple Clang C++20 syntax checks in 5.81 seconds. This is compilation
 coverage only; no Darwin native persistence or final combined SDK result follows.
+
+
+## Linux anonymous-target capture and reviewed execution correction
+
+The private Linux adapter now issues an anonymous-target capability only from
+its genuine writable anonymous creator. Read-only capture views retain that
+capability across native clones. It binds identity, mount and adapter scope;
+each capture independently requalifies current policy and reads the held
+native descriptor to compare identity, kind, link count, size and ctime with
+the supplied facts. A zero-link ordinary source or caller-created entry cannot
+substitute for this proof. Windows and Darwin retain a typed refusal for this
+Linux-only capability.
+
+Existing-directory metadata verification no longer requires rename authority
+for that metadata-only step. Rename, replacement, retention, deletion, Root,
+membership and version checks retain their existing requirements. Postorder
+replay preserves unknown stream coverage instead of inventing a known zero
+from an empty channel vector. The Linux reader/anonymous-target implementation
+now enables the previously guarded regular-copy and existing-directory paths;
+new POSIX directory creation remains Unsupported.
+
+The isolated coherent 439-file GCC 14 Debug candidate passed **8,685 Tree
+checks**, covering regular copy, existing merged directories, source changes,
+foreign target effects, native journal close EIO, one injected diagnostic
+allocation failure, and new-directory refusal. Target Seed, all eight native
+reader/clone/cursor failure cases, ordinary metadata capture, and 114 hardlink
+checks also passed. Its full build took 1,026 seconds and stopped at the old
+archive-layer failure; the relevant targets linked and ran. The later library
+layer fix is independently qualified above, rather than retroactively changing
+that failed full-build result.
+
+This merge rebases those narrow changes over the newer layer, Session lease,
+name-feedback and Windows Caller work. Full anonymous capture has not yet
+passed: the ordinary runner lacks initial-namespace authority, while the root
+attempt reached the precise ext4 birthtime-preservation limitation. A separate
+no-birthtime ext4 fixture is being qualified. Source-only follow-ups order the
+security-proof lease before its held source and tighten the optional Full test
+to known provider gates, exact positive opt-in and successful cleanup. These
+follow-ups and the final combined SDK require fresh runtime qualification.
+
+The frozen baseline-to-final packet manifest is
+`09718b2c7cb99cf53a9cac51ddf6bb18ffead5c68b3ab462a4033df6da00c98e`.
+No existing SDK or later headers were mixed into that candidate's runtime.

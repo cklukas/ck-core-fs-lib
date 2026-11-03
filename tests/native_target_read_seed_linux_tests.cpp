@@ -11,6 +11,7 @@
 #include <array>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -39,6 +40,17 @@ template<class T> T take(Observation<T> value) {
 }
 
 NativeName name(const char* text) { return *NativeName::from_posix(text); }
+
+bool expected_full_gate(const std::string& operation) {
+    return operation=="metadata_replay.complete_requires_initial_sys_admin"||
+        operation=="metadata_replay.initial_user_namespace_unqualified"||
+        operation=="metadata_replay.ext4_birthtime_setter_unavailable"||
+        operation=="metadata_replay.full_active_lsm_unimplemented"||
+        operation=="metadata_replay.full_native_policy_unimplemented"||
+        operation=="metadata_replay.full_attribute_class_unimplemented"||
+        operation=="metadata_replay.full_capability_encoding_unimplemented"||
+        operation=="metadata_replay.full_acl_coverage";
+}
 
 MetadataReplayPolicy policy() {
     MetadataReplayPolicy value;
@@ -219,6 +231,131 @@ void regular_case(const std::filesystem::path& path) {
     assert(!latch->first);
 }
 
+void anonymous_target_capture_case(const std::filesystem::path& path) {
+    NativeFileSystem filesystem;
+    auto directory=std::shared_ptr<const DirectoryCursor>(take(filesystem.open_directory(path)));
+    const std::array<std::byte,4> bytes{std::byte{'a'},std::byte{'n'},std::byte{'o'},std::byte{'n'}};
+    auto source_writer=take(directory->create_child_file(name("anonymous-source")));
+    assert(take(source_writer->write_content(0,bytes))==bytes.size());
+    assert(take(source_writer->finish_content_writes()));
+    source_writer.reset();
+    auto source=std::shared_ptr<const OpenedEntry>(take(directory->open_child(name("anonymous-source"),EntryAccess::ContentRead)));
+    MetadataCaptureLimits limits;limits.read.max_bytes=4096;
+    auto budget=std::make_shared<MetadataCaptureBudget>(limits);
+    auto latch=std::make_shared<Latch>();
+    auto proof=capture_file(source,policy(),budget,latch);
+
+    auto created=take(directory->create_staging_file(name("anonymous-target")));
+    assert(created.staging_namespace==StagingNamespace::Anonymous&&!created.name);
+    assert(take(created.entry->write_content(0,bytes))==bytes.size());
+    auto seed=take(detail::begin_native_target_read_seed(*created.entry,proof,limits,budget,latch));
+    assert(take(seed->advance()));
+    auto anonymous_source=take(seed->source());
+    const auto anonymous_basic=take(anonymous_source->inspect_basic());
+    MetadataReplayPolicy wrong_version=policy();wrong_version.version=2;
+    auto wrong_version_check=detail::qualify_native_anonymous_target_capture(*anonymous_source,anonymous_basic,wrong_version);
+    assert(!wrong_version_check.value()&&wrong_version_check.unavailable_detail()->error.operation=="metadata_capture.anonymous_policy_version");
+    auto stale_basic=anonymous_basic;
+    assert(stale_basic.logical_size.value());
+    stale_basic.logical_size=Observation<std::uint64_t>::available(*stale_basic.logical_size.value()+1);
+    auto live_basic=take(anonymous_source->inspect_basic());
+    std::printf("anonymous bookend supplied_size=%llu live_size=%llu\n",
+        static_cast<unsigned long long>(*stale_basic.logical_size.value()),
+        static_cast<unsigned long long>(*live_basic.logical_size.value()));
+    auto stale_bookend=detail::qualify_native_anonymous_target_capture(*anonymous_source,stale_basic,policy());
+    if(stale_bookend.value())std::fprintf(stderr,"stale anonymous target unexpectedly accepted\n");
+    else std::printf("PASS stale anonymous target refused state=%u operation=%s\n",unsigned(stale_bookend.state()),stale_bookend.unavailable_detail()->error.operation.c_str());
+    assert(!stale_bookend.value());
+    auto anonymous_job=take(MetadataCaptureJob::begin(anonymous_source,policy(),limits,budget,latch));
+    for(unsigned i=0;i<10000&&anonymous_job->progress().phase!=MetadataCapturePhase::Complete;++i)
+        take(anonymous_job->advance());
+    assert(anonymous_job->progress().phase==MetadataCapturePhase::Complete);
+    auto anonymous_proof=take(anonymous_job->result());
+    assert(anonymous_proof->snapshot().basic.link_count.value()&&*anonymous_proof->snapshot().basic.link_count.value()==0);
+    assert(take(anonymous_job->finish_io()));
+    anonymous_proof.reset();anonymous_job.reset();
+
+    // CompleteMetadataV1 is an independent policy qualification. On a
+    // normal unprivileged runner it is a precise pending gate; a fixture
+    // launcher may require it with CK_FS_REQUIRE_FULL_ANONYMOUS_CAPTURE=1.
+    auto full_policy=policy();
+    full_policy.scope=RegularMetadataScope::CompleteMetadataV1;
+    full_policy.allow_privilege_metadata=true;
+    const char* require_full_value=std::getenv("CK_FS_REQUIRE_FULL_ANONYMOUS_CAPTURE");
+    const bool require_full=require_full_value!=nullptr;
+    assert(!require_full||std::strcmp(require_full_value,"1")==0);
+    auto full_job=MetadataCaptureJob::begin(anonymous_source,full_policy,limits,budget,latch);
+    if(!full_job.value()) {
+        const auto&e=*full_job.unavailable_detail();
+        std::printf("FULL_ANONYMOUS_CAPTURE_PENDING state=%u operation=%s\n",unsigned(e.state),e.error.operation.c_str());
+        assert(expected_full_gate(e.error.operation)&&!require_full);
+    } else {
+        auto full_capture=std::move(full_job).take_value();
+        bool pending=false;
+        for(unsigned i=0;i<10000&&full_capture->progress().phase!=MetadataCapturePhase::Complete;++i) {
+            auto step=full_capture->advance();
+            if(!step.value()) {
+                const auto&e=*step.unavailable_detail();
+                std::printf("FULL_ANONYMOUS_CAPTURE_PENDING state=%u operation=%s\n",unsigned(e.state),e.error.operation.c_str());
+                assert(expected_full_gate(e.error.operation));
+                pending=true;
+                break;
+            }
+        }
+        if(pending) {
+            const auto drained=full_capture->finish_io();
+            if(!drained.value()) {
+                const auto&e=*drained.unavailable_detail();
+                std::fprintf(stderr,"FULL_ANONYMOUS_CAPTURE_DRAIN_FAILURE state=%u operation=%s\n",unsigned(e.state),e.error.operation.c_str());
+            }
+            assert(drained.value()&&*drained.value());
+            assert(!require_full);
+        } else {
+            assert(full_capture->progress().phase==MetadataCapturePhase::Complete);
+            auto full_proof=take(full_capture->result());
+            assert(full_proof->snapshot().basic.link_count.value()&&*full_proof->snapshot().basic.link_count.value()==0);
+            assert(take(full_capture->finish_io()));
+            full_proof.reset();
+            std::puts("FULL_ANONYMOUS_CAPTURE_PASS zero-link native capability");
+        }
+        full_capture.reset();
+    }
+    anonymous_source.reset();
+    assert(take(seed->finish_io()));
+    assert(take(created.entry->finish_content_writes()));
+    created.entry.reset();
+
+    NativeFileSystem foreign_filesystem;
+    auto foreign_directory=std::shared_ptr<const DirectoryCursor>(take(foreign_filesystem.open_directory(path)));
+    auto foreign_created=take(foreign_directory->create_staging_file(name("foreign-anonymous-target")));
+    assert(take(foreign_created.entry->write_content(0,bytes))==bytes.size());
+    auto foreign_seed=take(detail::begin_native_target_read_seed(*foreign_created.entry,proof,limits,budget,latch));
+    auto foreign_step=foreign_seed->advance();
+    assert(!foreign_step.value()&&foreign_step.unavailable_detail()->error.operation=="seed.source_target_scope");
+    assert(take(foreign_seed->finish_io()));
+    assert(take(foreign_created.entry->finish_content_writes()));
+    foreign_created.entry.reset();foreign_directory.reset();
+
+    auto unlinked_writer=take(directory->create_child_file(name("ordinary-unlinked")));
+    assert(take(unlinked_writer->write_content(0,bytes))==bytes.size());
+    assert(take(unlinked_writer->finish_content_writes()));
+    unlinked_writer.reset();
+    auto unlinked=std::shared_ptr<const OpenedEntry>(take(directory->open_child(name("ordinary-unlinked"),EntryAccess::ContentRead)));
+    assert(::unlink((path/"ordinary-unlinked").c_str())==0);
+    auto rejected=take(MetadataCaptureJob::begin(unlinked,policy(),limits,budget,latch));
+    auto rejected_step=rejected->advance();
+    assert(!rejected_step.value()&&rejected_step.unavailable_detail()->error.operation=="metadata_capture.anonymous_capability_required");
+    assert(take(rejected->finish_io()));
+    rejected.reset();unlinked.reset();
+
+    assert(!MetadataCaptureJob::begin(source,wrong_version,limits,budget,latch).value());
+    source.reset();
+    assert(take(proof->finish_io()));proof.reset();
+    assert(!latch->first);
+    std::filesystem::remove(path/"anonymous-source");
+    std::puts("native anonymous target capability: genuine zero-link clone accepted; ordinary unlinked, foreign-policy and version fakes refused");
+}
+
 void different_directory_target_case(const std::filesystem::path& path) {
     const auto source_path=path/"source-dir";
     const auto target_path=path/"target-dir";
@@ -336,6 +473,8 @@ int main(int argc, char** argv) {
     directory_case(fixture);
     std::puts("regular-case");
     regular_case(fixture);
+    std::puts("anonymous-target-capture-case");
+    anonymous_target_capture_case(fixture);
     std::puts("different-directory-target-case");
     different_directory_target_case(fixture);
     std::puts("clone-budget-case");

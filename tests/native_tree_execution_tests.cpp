@@ -108,6 +108,11 @@ int wmain(int argc,wchar_t** argv){CHECK(argc==2||argc==3);CHECK(SetEnvironmentV
  if(!controls){regular_positive();directory_positive(false);directory_positive(true);}
  if(controls){source_changed_before_staging();foreign_target_effect();cancel_created_directory();close_failure_no_token(false);close_failure_no_token(true);}
  std::printf("native_tree_execution: %u checks passed\n",checks);return 0;}
+#elif defined(__linux__)
+int main(){regular_positive();directory_positive(true);source_changed_before_staging();foreign_target_effect();close_failure_no_token(false);close_failure_no_token(true);
+ Fixture f;mkdir_new(f.path("s/folder"));write_file(f.path("s/folder/a"),"data");auto job=take(ReviewedTreePlanJob::create(strict_request(f)));bounded_preview(*job,4096);
+ auto receipt=take(job->review({}));auto begin=job->begin_execution(receipt);CHECK(!begin.value()&&begin.state()==ObservationState::Unsupported);CHECK(!f.exists("d/folder"));
+ std::printf("Linux receipt-bound regular/merged tree positives and unqualified new-directory refusal: %u checks passed\n",checks);return 0;}
 #else
 int main(){Fixture f;mkdir_new(f.path("s/folder"));write_file(f.path("s/folder/a"),"data");auto job=take(ReviewedTreePlanJob::create(strict_request(f)));bounded_preview(*job,4096);
  auto receipt=take(job->review({}));auto begin=job->begin_execution(receipt);CHECK(!begin.value()&&begin.state()==ObservationState::Unsupported);CHECK(!f.exists("d/folder"));

@@ -84,6 +84,13 @@ struct NativeTargetReadCloneLease final {
 private:
     std::shared_ptr<NativeTargetReadCloneState> state_;
 };
+struct NativeAnonymousTargetCapability final {
+    static constexpr std::uint64_t supported_format_version = 1;
+    std::uint64_t format_version = supported_format_version;
+    ObjectIdentity identity;
+    std::uint64_t mount_id = 0;
+    AdapterScope scope;
+};
 #endif
 
 NativeError adapter_error(AdapterError code, std::string operation) {
@@ -648,11 +655,70 @@ public:
           content_access_(content_access), content_write_access_(content_write_access),
           publication_(std::move(publication)), directory_metadata_target_(directory_metadata_target) {}
 #if defined(__linux__)
+    Observation<std::shared_ptr<const NativeAnonymousTargetCapability>> issue_anonymous_target_capability() const {
+        using R=Observation<std::shared_ptr<const NativeAnonymousTargetCapability>>;
+        if(!content_write_access_||!publication_||!publication_->anonymous||directory_metadata_target_)
+            return R::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::ProviderReviewRequired,"metadata_capture.anonymous_creator_required"));
+        const int flags=fcntl(descriptor_.get(),F_GETFL);
+        if(flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_capture.anonymous_creator_flags"});
+        if((flags&O_ACCMODE)==O_RDONLY)
+            return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"metadata_capture.anonymous_creator_write_required"));
+        const auto basic=inspect_basic();
+        if(!basic.value())return R::unavailable(basic.unavailable_detail()->state,basic.unavailable_detail()->error);
+        if(!basic.value()->identity.value()||!basic.value()->mount_id.value()||!basic.value()->kind.value()||
+           *basic.value()->kind.value()!=ObjectKind::RegularFile||!basic.value()->link_count.value()||*basic.value()->link_count.value()!=0)
+            return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,"metadata_capture.anonymous_creator_shape"));
+        auto result=std::make_shared<NativeAnonymousTargetCapability>();
+        result->format_version=NativeAnonymousTargetCapability::supported_format_version;
+        result->identity=*basic.value()->identity.value();
+        result->mount_id=*basic.value()->mount_id.value();
+        result->scope=scope_;
+        if(result->identity.scope!=scope_)
+            return R::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::UnqualifiedIdentity,"metadata_capture.anonymous_creator_scope"));
+        return R::available(std::move(result));
+    }
+    Observation<bool> qualify_anonymous_target_capture(const BasicMetadata& basic,const MetadataReplayPolicy& policy) const {
+        using R=Observation<bool>;
+        const auto refuse=[](const char* op){return R::unavailable(ObservationState::Unsupported,
+            adapter_error(AdapterError::ProviderReviewRequired,op));};
+        if(!policy.valid()||policy.version!=1)return refuse("metadata_capture.anonymous_policy_version");
+        if(!anonymous_target_capability_)return refuse("metadata_capture.anonymous_capability_required");
+        const auto& cap=*anonymous_target_capability_;
+        if(cap.format_version!=NativeAnonymousTargetCapability::supported_format_version||
+           cap.scope!=scope_||!basic.identity.value()||!basic.mount_id.value()||!basic.kind.value()||
+           *basic.kind.value()!=ObjectKind::RegularFile||!basic.link_count.value()||*basic.link_count.value()!=0)
+            return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,"metadata_capture.anonymous_capability_changed"));
+        // The caller's BasicMetadata is a claim to bind, never the native
+        // authority. Re-read the held descriptor and require the supplied
+        // snapshot and the capability to agree with this independent bookend.
+        const auto fresh=inspect_basic();
+        if(!fresh.value())return R::unavailable(fresh.state(),fresh.unavailable_detail()->error);
+        if(!fresh.value()->identity.value()||!fresh.value()->mount_id.value()||!fresh.value()->kind.value()||
+           *fresh.value()->kind.value()!=ObjectKind::RegularFile||!fresh.value()->link_count.value()||*fresh.value()->link_count.value()!=0||
+           compare_identity(*basic.identity.value(),*fresh.value()->identity.value())!=IdentityComparison::Same||
+           compare_identity(cap.identity,*fresh.value()->identity.value())!=IdentityComparison::Same||
+           *basic.mount_id.value()!=*fresh.value()->mount_id.value()||cap.mount_id!=*fresh.value()->mount_id.value()||
+           !basic.logical_size.value()||!fresh.value()->logical_size.value()||
+           *basic.logical_size.value()!=*fresh.value()->logical_size.value()||
+           !basic.changed.value()||!fresh.value()->changed.value()||
+           *basic.changed.value()!=*fresh.value()->changed.value())
+            return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,"metadata_capture.anonymous_native_bookend"));
+        const int flags=fcntl(descriptor_.get(),F_GETFL);
+        if(flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_capture.anonymous_read_flags"});
+        if((flags&O_ACCMODE)!=O_RDONLY||(flags&O_NOATIME)==0)
+            return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"metadata_capture.anonymous_read_policy"));
+        return R::available(true);
+    }
+#endif
+#if defined(__linux__)
     Observation<LinuxFullClassState> full_security_class_state()const {
         using R=Observation<LinuxFullClassState>;
         const auto before=inspect_basic();if(!before.value()){const auto&e=*before.unavailable_detail();return R::unavailable(e.state,e.error);}
         const auto proxy=attribute_proxy();if(!proxy.value()){const auto&e=*proxy.unavailable_detail();return R::unavailable(e.state,e.error);}
-        OwnedDescriptor readview(open(proxy.value()->c_str(),O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC));
+        int read_flags=O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC;
+        if(anonymous_target_capability_)read_flags|=O_NOATIME;
+        OwnedDescriptor readview(open(proxy.value()->c_str(),read_flags));
         if(readview.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.full_class_readview"});
         const auto opened=statx_metadata(readview.get(),"",AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW,scope_);
         if(!opened.value()||!linux_full_basic(*before.value(),*opened.value(),false))
@@ -790,6 +856,9 @@ public:
         if(!fresh.value()){const auto&e=*fresh.unavailable_detail();return R::unavailable(e.state,e.error);}
         OwnedDescriptor fd(std::move(fresh).take_value());
         auto clone=std::make_shared<PosixOpenedEntry>(std::move(fd),scope_,false,file);
+#if defined(__linux__)
+        clone->anonymous_target_capability_=anonymous_target_capability_;
+#endif
         clone->target_read_budget_=std::move(child_budget);
         clone->target_read_clone_state_=target_read_clone_state_;
         if(clone->target_read_clone_state_)
@@ -1097,9 +1166,25 @@ public:
         const auto& basic = *before.value();
         const bool directory=basic.kind.value()&&*basic.kind.value()==ObjectKind::Directory;
         if (!basic.kind.value() || (!directory&&*basic.kind.value() != ObjectKind::RegularFile) ||
-            !basic.posix_permissions.value() ||
-            !basic.link_count.value() || (directory?*basic.link_count.value()<1:!metadata_link_count_qualified(*basic.link_count.value())))
+            !basic.posix_permissions.value() || !basic.link_count.value())
             return refuse("regular_metadata.kind_mode_links");
+        if(directory) {
+            if(*basic.link_count.value()<1)return refuse("regular_metadata.kind_mode_links");
+        } else if(*basic.link_count.value()==0) {
+#if defined(__linux__)
+            if(!content_write_access_) {
+                const auto anonymous=qualify_anonymous_target_capture(basic,policy);
+                if(!anonymous.value()) { const auto&e=*anonymous.unavailable_detail(); return Result::unavailable(e.state,e.error); }
+                if(!*anonymous.value())return refuse("metadata_capture.anonymous_capability_required");
+            } else if(!metadata_link_count_qualified(*basic.link_count.value())) {
+                return refuse("regular_metadata.kind_mode_links");
+            }
+#else
+            return refuse("metadata_capture.anonymous_capability_required");
+#endif
+        } else if(!metadata_link_count_qualified(*basic.link_count.value())) {
+            return refuse("regular_metadata.kind_mode_links");
+        }
 #if defined(__linux__)
         if (policy.scope==RegularMetadataScope::CompleteMetadataV1 && basic.created.value())
             return refuse("metadata_replay.ext4_birthtime_setter_unavailable");
@@ -1902,6 +1987,7 @@ private:
     std::shared_ptr<detail::NativeTargetReadBudget> target_read_budget_;
     std::shared_ptr<NativeTargetReadCloneState> target_read_clone_state_;
     std::shared_ptr<NativeTargetReadCloneLease> target_read_clone_lease_;
+    std::shared_ptr<const NativeAnonymousTargetCapability> anonymous_target_capability_;
 #endif
     bool capture_close_started_=false;
     std::optional<MetadataCaptureCleanupError> capture_close_error_;
@@ -1951,7 +2037,7 @@ class LinuxPersistentSecurityProof final:public MetadataSecurityCoverageEvidence
 public:
     LinuxPersistentSecurityProof(std::shared_ptr<const PosixOpenedEntry> source,MetadataReplaySnapshot observed,
         LinuxFullClassState classes,std::shared_ptr<const void> lease)
-        :source_(std::move(source)),observed_(std::move(observed)),classes_(classes),lease_(std::move(lease)){observed_.security_coverage.reset();}
+        :lease_(std::move(lease)),source_(std::move(source)),observed_(std::move(observed)),classes_(classes){observed_.security_coverage.reset();}
     MetadataSecurityCoverage family()const noexcept override{return MetadataSecurityCoverage::LinuxPersistentSecurityV1;}
     Observation<bool> recheck(const MetadataReplaySnapshot& requested)const override {
         using R=Observation<bool>;
@@ -1970,10 +2056,10 @@ public:
     }
     void finish_capture_reads()const noexcept {const_cast<PosixOpenedEntry*>(source_.get())->finish_capture_reads();}
 private:
+    std::shared_ptr<const void> lease_;
     std::shared_ptr<const PosixOpenedEntry> source_;
     MetadataReplaySnapshot observed_;
     LinuxFullClassState classes_;
-    std::shared_ptr<const void> lease_;
 };
 Observation<std::shared_ptr<const MetadataSecurityCoverageEvidence>> PosixOpenedEntry::issue_linux_security_coverage(
     const MetadataReplaySnapshot& snapshot,std::shared_ptr<const void> lease)const {
@@ -1981,10 +2067,15 @@ Observation<std::shared_ptr<const MetadataSecurityCoverageEvidence>> PosixOpened
     const auto qualified=qualify_metadata_replay(snapshot.policy);
     if(!qualified.value()){const auto&e=*qualified.unavailable_detail();return R::unavailable(e.state,e.error);}
     const auto proxy=attribute_proxy();if(!proxy.value()){const auto&e=*proxy.unavailable_detail();return R::unavailable(e.state,e.error);}
-    OwnedDescriptor readview(open(proxy.value()->c_str(),O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC));
+    int read_flags=O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC;
+    if(anonymous_target_capability_)read_flags|=O_NOATIME;
+    OwnedDescriptor readview(open(proxy.value()->c_str(),read_flags));
     if(readview.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.full_source_readview"});
     const bool file=snapshot.basic.kind.value()&&*snapshot.basic.kind.value()==ObjectKind::RegularFile;
     auto source=std::make_shared<PosixOpenedEntry>(std::move(readview),scope_,false,file);
+#if defined(__linux__)
+    source->anonymous_target_capability_=anonymous_target_capability_;
+#endif
     const auto actual=source->full_security_values(snapshot.policy);
     if(!actual.value()){const auto&e=*actual.unavailable_detail();return R::unavailable(e.state,e.error);}
     // Only the private progressive seal supplies a lease: its first native
@@ -2152,6 +2243,11 @@ public:
         OwnedDescriptor file(std::move(created).take_value());
         auto entry = std::make_unique<PosixOpenedEntry>(std::move(file), scope_, false, true, true,
             std::make_unique<PosixPublicationContext>(std::move(parent), recovery_hint, true));
+#if defined(__linux__)
+        auto capability=entry->issue_anonymous_target_capability();
+        if(!capability.value())return Result::unavailable(capability.state(),capability.unavailable_detail()->error);
+        entry->anonymous_target_capability_=std::move(capability).take_value();
+#endif
         return Result::available({std::move(entry), StagingNamespace::Anonymous, std::nullopt});
 #else
         return Result::unavailable(ObservationState::Unsupported,
@@ -3110,6 +3206,9 @@ public:
                 if(!fresh.value()) return fail(fresh.unavailable_detail()->state,fresh.unavailable_detail()->error.domain,
                     fresh.unavailable_detail()->error.code,"seed.reader_open");
                 auto source=std::make_shared<PosixOpenedEntry>(std::move(fresh).take_value(),target_->scope_,false,!is_directory);
+#if defined(__linux__)
+                source->anonymous_target_capability_=target_->anonymous_target_capability_;
+#endif
                 source->target_read_budget_=base_budget_;
                 source->target_read_clone_state_=clone_state_;
                 const auto source_basic=source->inspect_basic();
@@ -3315,8 +3414,8 @@ private:
     std::shared_ptr<MetadataCaptureBudget> budget_;
     std::shared_ptr<const MetadataCaptureFailureLatch> latch_;
     std::shared_ptr<PosixOpenedEntry> source_;
-    OwnedDescriptor enum_parent_{-1};
     std::shared_ptr<detail::NativeTargetReadBudget> base_budget_;
+    OwnedDescriptor enum_parent_{-1};
     std::optional<TargetBookend> target_bookend_;
     std::shared_ptr<NativeTargetReadCloneState> clone_state_;
     std::weak_ptr<const void> active_;
@@ -3454,6 +3553,20 @@ Observation<std::shared_ptr<const OpenedEntry>> open_native_metadata_capture_sou
     if(!native||!policy.valid())return R::unavailable(ObservationState::Unsupported,
         adapter_error(AdapterError::ProviderReviewRequired,"metadata_capture.native_source_required"));
     return native->open_progressive_metadata_source();
+}
+Observation<bool> qualify_native_anonymous_target_capture(
+    const OpenedEntry& source,const BasicMetadata& basic,const MetadataReplayPolicy& policy) {
+    using R=Observation<bool>;
+    const auto* native=dynamic_cast<const PosixOpenedEntry*>(&source);
+    if(!native)return R::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::ProviderReviewRequired,"metadata_capture.anonymous_native_source_required"));
+#if defined(__linux__)
+    return native->qualify_anonymous_target_capture(basic,policy);
+#else
+    (void)basic;(void)policy;
+    return R::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::NotApplicable,"metadata_capture.anonymous_linux_only"));
+#endif
 }
 Observation<std::shared_ptr<const OpenedEntry>> open_native_directory_capture_source(
     std::shared_ptr<const DirectoryCursor> source,const MetadataReplayPolicy& policy){

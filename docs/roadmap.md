@@ -51,7 +51,7 @@ pins. Detailed frozen-cohort evidence is in the
 
 | Requested area | Implemented and exercised | Remaining integration |
 | --- | --- | --- |
-| Reviewed native trees | Receipt/row/policy seals; independent target observations; Windows created/merged postorder execution | Corrected Linux anonymous-target and existing-directory path; hierarchical Session relay; final combined qualification |
+| Reviewed native trees | Receipt/row/policy seals; independent target observations; Windows created/merged postorder execution; Linux regular/existing-directory execution | Hierarchical Session relay; final combined qualification; new POSIX directory creator remains unavailable |
 | Retention and preservation | Native Windows retained versions; Windows Full Original metadata; narrow Linux Full issuer; bounded ACL/xattr replay | Combined Caller/clone/Full SDK; other provider scopes remain explicit refusals |
 | Durable two-way sessions | Flat coordinator, overlapping-root locks, durable generation recovery; qualified read-only Session leases | Recursive mutation and nested-path durable ledger/CAS binding |
 | Stable C operation APIs | Batch rename, native Trash receipts/restore, verified retry/prefix resume, cached name-side feedback | Final combined installed-consumer and platform checks |

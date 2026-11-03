@@ -48,6 +48,13 @@ void finish_native_metadata_capture(const OpenedEntry*,const MetadataReplaySnaps
 // Implemented inside the platform adapter; rejects caller-created entries.
 Observation<std::shared_ptr<const OpenedEntry>> open_native_metadata_capture_source(
     std::shared_ptr<const OpenedEntry>,const MetadataReplayPolicy&);
+// Linux may issue a private, native-authenticated read view for an anonymous
+// staging target whose link count is necessarily zero. The capability binds
+// read-origin identity, mount and adapter scope; the platform independently
+// requalifies the current native read policy. Arbitrary OpenedEntry
+// implementations cannot manufacture either proof.
+Observation<bool> qualify_native_anonymous_target_capture(
+    const OpenedEntry&,const BasicMetadata&,const MetadataReplayPolicy&);
 Observation<std::shared_ptr<const OpenedEntry>> open_native_directory_capture_source(
     std::shared_ptr<const DirectoryCursor>,const MetadataReplayPolicy&);
 Observation<bool> seal_native_metadata_capture(MetadataCaptureJob&);

@@ -3764,6 +3764,11 @@ Observation<std::shared_ptr<const OpenedEntry>> open_native_metadata_capture_sou
         {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_capture.native_source_required"});
     return native->open_progressive_metadata_source(policy);
 }
+Observation<bool> qualify_native_anonymous_target_capture(
+    const OpenedEntry&,const BasicMetadata&,const MetadataReplayPolicy&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::NotApplicable),"metadata_capture.anonymous_linux_only"});
+}
 Observation<std::shared_ptr<const OpenedEntry>> open_native_directory_capture_source(
     std::shared_ptr<const DirectoryCursor> source,const MetadataReplayPolicy& policy){
     using R=Observation<std::shared_ptr<const OpenedEntry>>;
