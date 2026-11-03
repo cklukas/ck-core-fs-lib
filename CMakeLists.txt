@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.25)
 
 project(ck-core-fs-lib VERSION 0.3.0 LANGUAGES C CXX)
 
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 find_package(Threads REQUIRED)
