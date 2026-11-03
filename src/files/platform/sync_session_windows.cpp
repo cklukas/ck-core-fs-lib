@@ -69,10 +69,12 @@ struct CloseContext {
         active_close_context=previous;
     }
     template<class T,class F> Observation<T> run(F&& body) {
-        auto result=[&]() -> Observation<T> {
-            try {return body();} // locals and native owners drain before catch
-            catch(...) {if(failure.operation)return failure.result<T>();throw;}
-        }();
+        // The body's locals drain on success and exception. Root's fixed
+        // first failure survives allocation failure; do not allocate in catch.
+        auto result=body();
+        detail::PreparedJournalConsumerFailure first;
+        if(owner&&detail::read_prepared_journal_consumer_failure(*owner,first))
+            return Observation<T>::unavailable(first.state,{first.domain,first.code,first.operation.data()});
         if(failure.operation)return failure.result<T>();
         return result;
     }
@@ -624,18 +626,23 @@ public:
     bool closed=false;
     DWORD close_error=0;
     const char* close_operation="sync_session.directory_CloseHandle";
+    void remember_close(DWORD code,const char* operation) noexcept {
+        if(!close_error){close_error=code;close_operation=operation;}
+        if(owner)detail::record_prepared_journal_consumer_failure(*owner,
+            ObservationState::Failed,ErrorDomain::Win32,code,operation);
+    }
     void close_native() noexcept {
         if(closed)return;closed=true;
         for(auto* chain:{&store,&left,&right})for(auto& node:*chain) {
             const auto handle=node.handle.release();if(!handle||handle==INVALID_HANDLE_VALUE)continue;
-            if(!CloseHandle(handle)&&!close_error)close_error=GetLastError();
+            if(!CloseHandle(handle))remember_close(GetLastError(),"sync_session.directory_CloseHandle");
             node.handle.get_deleter().owner.reset();
-            try {if(faults.before&&!faults.before(SyncSessionIo::NativeHandleClose)&&!close_error)close_error=ERROR_WRITE_FAULT;}
-            catch(...) {if(!close_error)close_error=ERROR_WRITE_FAULT;}
+            try {if(faults.before&&!faults.before(SyncSessionIo::NativeHandleClose))remember_close(ERROR_WRITE_FAULT,"sync_session.directory_CloseHandle");}
+            catch(...) {remember_close(ERROR_WRITE_FAULT,"sync_session.directory_CloseHandle");}
         }
         for(auto& lease:leases)try {
-            const auto code=lease->finish();if(code&&!close_error){close_error=code;close_operation=lease->finish_operation();}
-        }catch(...) {if(!close_error){close_error=ERROR_GEN_FAILURE;close_operation="sync_session.lock_thread_join";}}
+            const auto code=lease->finish();if(code)remember_close(code,lease->finish_operation());
+        }catch(...) {remember_close(ERROR_GEN_FAILURE,"sync_session.lock_thread_join");}
         leases.clear();
         if(close_error&&owner)detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Failed,ErrorDomain::Win32,close_error,close_operation);
     }
@@ -675,17 +682,23 @@ public:
         return closed?-1:reinterpret_cast<std::intptr_t>((r?right:left).back().handle.get());
     }
     Observation<bool> revalidate() override {
+        CloseContext context(owner);
+        return context.run<bool>([&]() -> Observation<bool> {
         if(closed)return reject<bool>("sync_session.finished");
         auto held=validate_storage(store,*owner);if(!held.value())return held;
         for(const auto* c:{&left,&right}) { auto r=validate(*c); if(!r.value()) return r; }
         return private_security(store.back().handle.get(),true);
+            });
     }
+
     Observation<bool> before(SyncSessionIo io) {
         auto r=revalidate(); if(!r.value()) return r;
         if(faults.before && !faults.before(io)) return fail<bool>(ERROR_WRITE_FAULT,"sync_session.injected");
         return Observation<bool>::available(true);
     }
     Observation<std::optional<std::vector<std::byte>>> read(std::string_view name,std::size_t limit) override {
+        CloseContext context(owner);
+        return context.run<std::optional<std::vector<std::byte>>>([&]() -> Observation<std::optional<std::vector<std::byte>>> {
         using T=std::optional<std::vector<std::byte>>;
         auto n=basename(name); if(!n) return reject<T>("sync_session.basename",ObservationState::Failed);
         auto valid=revalidate(); if(!valid.value()) return propagate<T>(valid);
@@ -704,8 +717,11 @@ public:
             if(!got) return reject<T>("sync_session.short_read"); at+=got;
         }
         return Observation<T>::available(std::move(bytes));
+            });
     }
     Observation<bool> remove(std::string_view name) override {
+        CloseContext context(owner);
+        return context.run<bool>([&]() -> Observation<bool> {
         auto n=basename(name); if(!n) return reject<bool>("sync_session.basename",ObservationState::Failed);
         auto r=before(SyncSessionIo::Remove); if(!r.value()) return r;
         auto f=relative(store.back().handle.get(),*n,DELETE|FILE_READ_ATTRIBUTES|READ_CONTROL,FILE_OPEN,false);
@@ -716,8 +732,11 @@ public:
         if(!SetFileInformationByHandle(f.value()->get(),FileDispositionInfo,&info,sizeof(info)))
             return fail<bool>(GetLastError(),"sync_session.delete_handle");
         return Observation<bool>::available(true);
+            });
     }
     Observation<bool> stage(std::string_view name,std::span<const std::byte> bytes) override {
+        CloseContext context(owner);
+        return context.run<bool>([&]() -> Observation<bool> {
         auto n=basename(name);
         if(!n || (!name.ends_with(".next") && !name.ends_with(".intent-stage")))
             return reject<bool>("sync_session.stage_name",ObservationState::Failed);
@@ -743,11 +762,14 @@ public:
         r=before(SyncSessionIo::FileFlush); if(!r.value()) return r;
         if(!FlushFileBuffers(writable.get())) return fail<bool>(GetLastError(),"sync_session.file_flush");
         r=before(SyncSessionIo::FileClose);if(!r.value()) return r;
-        const auto handle=writable.release();
-        if(!CloseHandle(handle)) return fail<bool>(GetLastError(),"sync_session.stage_CloseHandle");
+        if(!consume_transient(writable,"sync_session.stage_CloseHandle",context))
+            return context.failure.result<bool>();
         return Observation<bool>::available(true);
+            });
     }
     Observation<bool> publish(std::string_view from,std::string_view to) override {
+        CloseContext context(owner);
+        return context.run<bool>([&]() -> Observation<bool> {
         auto a=basename(from),b=basename(to); if(!a || !b) return reject<bool>("sync_session.basename",ObservationState::Failed);
         auto r=before(SyncSessionIo::Publish); if(!r.value()) return r;
         auto f=relative(store.back().handle.get(),*a,DELETE|FILE_READ_ATTRIBUTES|READ_CONTROL,FILE_OPEN,false);
@@ -770,6 +792,7 @@ public:
         const auto status=call(f.value()->get(),&io,info,static_cast<ULONG>(buffer.size()),10 /* FileRenameInformation */);
         if(status<0) return Observation<bool>::unavailable(ObservationState::Failed,{ErrorDomain::NtStatus,status,"sync_session.rename_handle"});
         return Observation<bool>::available(true);
+            });
     }
     Observation<bool> flush_directory() override {
         auto r=before(SyncSessionIo::ParentFlush); if(!r.value()) return r;
@@ -796,6 +819,8 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     if(!faults.max_write_bytes || faults.max_write_bytes>1024*1024)
         return reject<P>("sync_session.write_limit",ObservationState::Failed);
     if(!owner)return reject<P>("sync_session.null_storage_owner",ObservationState::Failed);
+    CloseContext context(owner);
+    return context.run<P>([&]() -> Observation<P> {
     auto s=held_storage_chain(owner); if(!s.value()) return propagate<P>(s);
     auto l=chain(left,false,owner); if(!l.value()) return propagate<P>(l);
     auto r=chain(right,false,owner); if(!r.value()) return propagate<P>(r);
@@ -813,6 +838,7 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     auto check=b->revalidate(); if(!check.value()) return propagate<P>(check);
     check=b->flush_directory(); if(!check.value()) return propagate<P>(check);
     return Observation<P>::available(std::move(b));
+    });
 }
 bool detail::certify_native_sync_backend(const SyncSessionBackend& backend)noexcept {return dynamic_cast<const WindowsBackend*>(&backend)!=nullptr;}
 } // namespace ck::files

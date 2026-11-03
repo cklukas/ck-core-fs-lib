@@ -28,14 +28,52 @@
 
 namespace ck::files {
 namespace {
+// Each operation drains its transient native consumers before granting bytes or
+// namespace success. Root receives the fixed first error before diagnostics.
+struct CloseContext;
+thread_local CloseContext* active_close_context=nullptr;
+struct CloseContext {
+    PreparedJournalRoot::Pointer owner;
+    CloseContext* previous;
+    int code=0;
+    const char* operation=nullptr;
+    explicit CloseContext(PreparedJournalRoot::Pointer root):owner(std::move(root)),previous(active_close_context) {
+        active_close_context=this;
+    }
+    ~CloseContext(){active_close_context=previous;}
+    void record(int error,const char* tag) noexcept {
+        for(auto* c=this;c&&c->owner.get()==owner.get();c=c->previous)
+            if(!c->code){c->code=error;c->operation=tag;}
+        if(owner)detail::record_prepared_journal_consumer_failure(*owner,
+            ObservationState::Failed,ErrorDomain::Posix,error,tag);
+    }
+    template<class T,class F> Observation<T> run(F&& body) {
+        // On exceptions the body's native owners drain during unwinding. The
+        // scalar Root latch survives even when allocating diagnostics cannot.
+        auto result=body();
+        detail::PreparedJournalConsumerFailure first;
+        if(owner&&detail::read_prepared_journal_consumer_failure(*owner,first))
+            return Observation<T>::unavailable(first.state,{first.domain,first.code,first.operation.data()});
+        if(code)return Observation<T>::unavailable(ObservationState::Failed,{ErrorDomain::Posix,code,operation});
+        return result;
+    }
+};
+PreparedJournalRoot::Pointer close_owner() noexcept {
+    return active_close_context?active_close_context->owner:PreparedJournalRoot::Pointer{};
+}
 struct Fd {
     int fd=-1;
     PreparedJournalRoot::Pointer owner;
-    explicit Fd(int v=-1,PreparedJournalRoot::Pointer keep={}):fd(v),owner(std::move(keep)) {}
-    int close_native() noexcept {
+    explicit Fd(int v=-1,PreparedJournalRoot::Pointer keep=close_owner()):fd(v),owner(std::move(keep)) {}
+    int close_native(const char* operation="sync_session.directory_close") noexcept {
         const int current=std::exchange(fd,-1);int code=0;
         if(current>=0 && ::close(current))code=errno;
-        if(code&&owner)detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Failed,ErrorDomain::Posix,code,"sync_session.directory_close");
+        if(code) {
+            if(active_close_context&&(!owner||owner.get()==active_close_context->owner.get()))
+                active_close_context->record(code,operation);
+            else if(owner)detail::record_prepared_journal_consumer_failure(*owner,
+                ObservationState::Failed,ErrorDomain::Posix,code,operation);
+        }
         owner.reset();return code;
     }
     ~Fd() { (void)close_native(); }
@@ -242,13 +280,19 @@ public:
     bool owns_root_lifecycle=false,root_finished=false;
     bool closed=false;
     int close_error=0;
+    void remember_close(int error) noexcept {
+        if(!close_error)close_error=error;
+        if(owner)detail::record_prepared_journal_consumer_failure(*owner,
+            ObservationState::Failed,ErrorDomain::Posix,error,"sync_session.directory_close");
+    }
     void close_native() noexcept {
         if(closed)return;closed=true;
         for(auto* chain:{&store,&left,&right})for(auto& node:*chain) {
             if(node.fd.fd<0)continue;
-            const int error=node.fd.close_native();if(error&&!close_error)close_error=error;
-            try {if(faults.before&&!faults.before(SyncSessionIo::NativeHandleClose)&&!close_error)close_error=EIO;}
-            catch(...) {if(!close_error)close_error=EIO;}
+            const int error=node.fd.close_native();
+            if(error)remember_close(error);
+            try {if(faults.before&&!faults.before(SyncSessionIo::NativeHandleClose))remember_close(EIO);}
+            catch(...) {remember_close(EIO);}
         }
         if(close_error&&owner)detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Failed,ErrorDomain::Posix,close_error,"sync_session.directory_close");
     }
@@ -297,6 +341,8 @@ public:
         return Observation<bool>::available(true);
     }
     Observation<std::optional<std::vector<std::byte>>> read(std::string_view name,std::size_t limit) override {
+        CloseContext context(owner);
+        return context.run<std::optional<std::vector<std::byte>>>([&]() -> Observation<std::optional<std::vector<std::byte>>> {
         using T=std::optional<std::vector<std::byte>>;
         if(!valid_name(name)) return reject<T>("sync_session.basename",ObservationState::Failed);
         auto r=revalidate(); if(!r.value()) return propagate<T>(r);
@@ -317,8 +363,11 @@ public:
             return reject<T>("sync_session.read_changed");
         r=private_file(f.fd); if(!r.value()) return propagate<T>(r);
         return Observation<T>::available(std::move(bytes));
+            });
     }
     Observation<bool> stage(std::string_view name,std::span<const std::byte> bytes) override {
+        CloseContext context(owner);
+        return context.run<bool>([&]() -> Observation<bool> {
         if(!valid_name(name)) return reject<bool>("sync_session.basename",ObservationState::Failed);
         auto r=before(SyncSessionIo::Remove); if(!r.value()) return r;
         // Only stage names are replaceable here. Never truncate a named current
@@ -346,11 +395,14 @@ public:
         r=before(SyncSessionIo::FileClose);if(!r.value()) return r;
         // Relinquish ownership BEFORE close. A delayed failure/EINTR must never
         // trigger a second close on a descriptor another thread could reuse.
-        const auto descriptor=std::exchange(f.fd,-1);
-        if(::close(descriptor)) return failure<bool>(errno,"sync_session.stage_close");
+        const auto error=f.close_native("sync_session.stage_close");
+        if(error)return failure<bool>(error,"sync_session.stage_close");
         return Observation<bool>::available(true);
+            });
     }
     Observation<bool> publish(std::string_view from,std::string_view to) override {
+        CloseContext context(owner);
+        return context.run<bool>([&]() -> Observation<bool> {
         if(!valid_name(from)||!valid_name(to)) return reject<bool>("sync_session.basename",ObservationState::Failed);
         auto r=before(SyncSessionIo::Publish); if(!r.value()) return r;
         Fd source(openat(store.back().fd.fd,std::string(from).c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK));
@@ -362,6 +414,7 @@ public:
         if(renameat(store.back().fd.fd,std::string(from).c_str(),store.back().fd.fd,std::string(to).c_str()))
             return failure<bool>(errno,"sync_session.rename");
         return Observation<bool>::available(true);
+            });
     }
     Observation<bool> remove(std::string_view name) override {
         if(!valid_name(name)) return reject<bool>("sync_session.basename",ObservationState::Failed);
@@ -396,6 +449,8 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     if(!faults.max_write_bytes || faults.max_write_bytes>1024*1024)
         return reject<P>("sync_session.write_limit",ObservationState::Failed);
     if(!owner)return reject<P>("sync_session.null_storage_owner",ObservationState::Failed);
+    CloseContext context(owner);
+    return context.run<P>([&]() -> Observation<P> {
     auto s=held_storage_chain(owner); if(!s.value()) return propagate<P>(s);
     auto l=chain(left); if(!l.value()) return propagate<P>(l);
     auto r=chain(right); if(!r.value()) return propagate<P>(r);
@@ -422,6 +477,7 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     // Establish parent-flush support before advertising durable storage.
     checked=b->flush_directory(); if(!checked.value()) return propagate<P>(checked);
     return Observation<P>::available(std::move(b));
+    });
 }
 bool detail::certify_native_sync_backend(const SyncSessionBackend& backend)noexcept {return dynamic_cast<const PosixBackend*>(&backend)!=nullptr;}
 } // namespace ck::files

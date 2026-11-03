@@ -771,3 +771,38 @@ This closes the anonymous-target **capture** gate for that narrow provider
 scope. It does not qualify Full Tree publication, the next combined revision,
 other ext4 inode formats, or another security environment. The existing
 birthtime and unsupported security-class gates remain in force.
+
+
+## Session baseline readers and native teardown close failures
+
+A native regression reproduced false acceptance of baseline bytes when their
+read descriptor closed with an error after the Available result was built.
+Transient baseline consumers now drain inside a Root-bound operation scope
+before read or publication success returns. Their first native close failure
+enters the Root's fixed-size latch before diagnostics, callback failures, further
+cleanup, or allocation failure. Writer ownership is consumed before close and
+never retried. Terminal directory and Windows volume-lock close errors retain
+the same first-error ordering. Borrowed Roots remain owned by their Session.
+
+The exact three-file packet passed **384 new native checks plus 5,100 existing
+Session checks on Linux ext4**, and **406 new plus 5,367 existing checks on
+ownership-enforcing APFS**. Native controls consume the actual close, then
+report EIO; persistent allocation failure begins after that consumed close.
+They cover normal and oversized baseline reads, flushed writers, directory
+teardown, first-error precedence, lock release, and descriptor reuse without a
+second close. The original-code control fails the baseline-acceptance assertion.
+This is native error/ownership testing, not hardware or power-cut testing.
+
+The fresh GCC 14 Debug SDK took 411 seconds/132 steps and its corrected fixture
+rebuild took two steps. The matching Apple Clang Debug SDK took 245.56 seconds/
+130 steps; APFS writer tests retain the required F_FULLFSYNC path. Strict
+POSIX compilation passed with recorded inherited warning-category exclusions.
+Packet SHA-256:
+`7b04e0fac5845607db4cf54186fee05273a8eb453552a1b183c2f5198fcddd7c`;
+frozen source manifest:
+`bb75a12b23d21e87a1d46e0aa2d96823d98047431d9ea79705552c15ed05dc31`.
+
+The Windows implementation and native fixtures are present but **unqualified**:
+SSH timed out before any build launched. Matching sanitizer and combined SDK
+qualification also remain pending. The bounded review found no additional
+concrete overlap-lock bypass or durable-intent ordering defect.
