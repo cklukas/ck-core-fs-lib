@@ -118,6 +118,31 @@ and installed audits, actual interposition probe, native C resolution roundtrip,
 and installed ISO C11 consumer all pass. Only the shared runtime was relinked;
 the native static archive bytes and source/header cohort were unchanged.
 
+## Linux native mount identity
+
+The frozen Root 0.4 candidate, based on `e89504e`, passed all 40 native tests
+and its installed consumer separately on ext4, XFS, and top-level Btrfs.
+Every run used UID/GID 1000, no supplementary groups, and cleared capability
+sets on Linux ARM64 7.1.4 with GCC 14. Its source manifest is
+`0d5290bf66c2f913c969c3b282a027b8fc50d0fb9c5c11a527cc52fbc38cc598`;
+the installed library hash is
+`eb62a2849796b48092513e2307991c44aca7b34e5f38a9fb8d7d6e684faff3bd`.
+This is normal Root qualification, separate from the 0.5 integration and
+export-map derivatives above.
+
+Mount witnesses retain statmount superblock device fields separately from
+statx/fstat VFS identity, with native mount IDs, filesystem IDs, attributes,
+mount-root endpoints and before/after checks. The Btrfs run observed SB `0:60`
+and VFS `0:61`; no filesystem-specific bypass is used. Btrfs qualification
+covers top-level subvolid 5. Mounted non-root subvolumes remain refused.
+
+The lifecycle fixture's old duplicated directory stream missed populated
+Btrfs entries during teardown. Its qualified derivative opens a fresh iterator
+through held `fd/"."`, checks inode/device identity and retains every assertion.
+All 108 production artifact hashes and production compiler commands stayed
+unchanged through that fixture rebuild. Failed runs and their diagnostic
+evidence remain recorded; no sleep or weakened assertion was used.
+
 The later coherent Windows and macOS integration runs still fail Tree receipt
 validation after publication. Passing source and metadata components therefore
 do not establish receipt-bound execution completion. The Linux mount candidate
@@ -133,7 +158,8 @@ run is required before counting that correction as qualified.
 - Explicitly consume the base native copy source before terminal completion;
   qualify its close faults while preserving Move's source-retirement ordering.
 - Qualify Windows named conflict resolution and all-stream admission.
-- Complete native Linux mount-ancestry qualification on ext4, XFS and Btrfs.
+- Qualify the final integrated revision and matching sanitizers across the
+  recorded ext4, XFS and Btrfs layouts.
 - Retain the macOS strong-publication failures until a suitable native
   primitive is available and qualified.
 - Qualify the final coherent SDK with its installed C consumers and matching

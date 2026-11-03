@@ -3,6 +3,9 @@
 #pragma once
 #include "held_child.hpp"
 #include "prepared_journal_root.hpp"
+#ifdef __linux__
+#include "platform/prepared_journal_root_bridge.hpp"
+#endif
 #include <span>
 #include <vector>
 
@@ -50,7 +53,11 @@ private:
     static Observation<Pointer> create_impl(PreparedJournalRoot::Pointer,
         std::shared_ptr<const DirectoryCursor>, bool selected_file, std::stop_token);
     static Observation<bool> check_group(std::span<const JournalScopeGuard* const>,std::stop_token);
+#ifdef __linux__
+    Observation<bool> check_scan_ancestry(const std::vector<detail::RootScopeIdentity>&,std::stop_token) const;
+#else
     Observation<bool> check_scan_ancestry(const std::vector<ObjectIdentity>&,std::stop_token) const;
+#endif
     PreparedJournalRoot::Pointer root_;
     std::shared_ptr<const DirectoryCursor> scan_;
     ObjectIdentity identity_;

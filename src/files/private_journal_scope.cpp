@@ -43,7 +43,7 @@ bool directory(const BasicMetadata& value) {
 bool stable(const detail::ScopeDirectoryMetadata& a,const detail::ScopeDirectoryMetadata& b) {
     return qualified(a.identity)&&qualified(b.identity)&&a.link_count&&b.link_count&&
         compare_identity(a.identity,b.identity)==IdentityComparison::Same&&a.mount_id==b.mount_id&&
-        a.modified==b.modified&&a.changed==b.changed;
+        a.mount_id_unique==b.mount_id_unique&&a.modified==b.modified&&a.changed==b.changed;
 }
 Observation<bool> compare_private(const ObjectIdentity& root,const ObjectIdentity& other) {
     const auto relation=native_identity(root,other);
@@ -146,10 +146,19 @@ Observation<bool> JournalScopeGuard::check_group(std::span<const JournalScopeGua
     // The genuine native bridge revalidates Root BEFORE and AFTER collecting
     // the fresh held ancestry. All following operations are readonly; finish
     // with one further Root validation before returning a shared assessment.
+#ifdef __linux__
+    auto ancestry=detail::inspect_prepared_journal_scope_ancestry(*root);
+#else
     auto ancestry=detail::inspect_prepared_journal_ancestry(*root);
+#endif
     if(!ancestry.value())return forward<bool>(*ancestry.unavailable_detail());
+#ifdef __linux__
+    if(ancestry.value()->size()<2||ancestry.value()->size()>4096||ancestry.value()->front().mount_id==0||
+        compare_identity(root->identity(),ancestry.value()->front().object)!=IdentityComparison::Same)
+#else
     if(ancestry.value()->size()<2||ancestry.value()->size()>4096||
         compare_identity(root->identity(),ancestry.value()->front())!=IdentityComparison::Same)
+#endif
         return refuse<bool>("journal_scope.root_ancestry_unqualified");
     for(const auto* guard:guards) {
         auto checked=guard->check_scan_ancestry(*ancestry.value(),stop);
@@ -158,9 +167,18 @@ Observation<bool> JournalScopeGuard::check_group(std::span<const JournalScopeGua
     }
     return require_true(root->revalidate(),"journal_scope.root_changed");
 }
+#ifdef __linux__
+Observation<bool> JournalScopeGuard::check_scan_ancestry(const std::vector<detail::RootScopeIdentity>& ancestry,std::stop_token stop) const {
+#else
 Observation<bool> JournalScopeGuard::check_scan_ancestry(const std::vector<ObjectIdentity>& ancestry,std::stop_token stop) const {
+#endif
     if(stop.stop_requested())return cancelled();
+#ifdef __linux__
+    const auto& private_scope=ancestry.front();
+    const auto& private_id=private_scope.object;
+#else
     const auto& private_id=ancestry.front();
+#endif
     auto opened=detail::open_scope_directory_cursor(root_,scan_);
     if(!opened.value())return forward<bool>(*opened.unavailable_detail());
     auto cursor=std::move(opened).take_value();
@@ -169,10 +187,27 @@ Observation<bool> JournalScopeGuard::check_scan_ancestry(const std::vector<Objec
     if(!qualified(source.value()->identity)||!source.value()->link_count||
         compare_identity(identity_,source.value()->identity)!=IdentityComparison::Same)
         return refuse<bool>("journal_scope.scan_changed",ObservationState::Changed,AdapterError::MetadataChanged);
+#ifdef __linux__
+    if(!source.value()->mount_id_unique)
+        return refuse<bool>("journal_scope.scan_unique_mount_unqualified");
+    // A whole-filesystem bind can report the same physical root string while
+    // carrying a different mount ID. It is still an alias of the protected
+    // object and cannot become a separate scope merely because '/' matched.
+    const bool same_root_object=compare_identity(private_id,source.value()->identity)==IdentityComparison::Same;
+    const bool same_root_scope=same_root_object && private_scope.mount_id==source.value()->mount_id_unique;
+    if(same_root_object || same_root_scope)
+        return refuse<bool>("journal_scope.private_root_alias");
+#endif
     // Root below/equal to the scan root in its retained acquisition ancestry.
     for(std::size_t index=0;index<ancestry.size();++index) {
         if(selected_file_&&index!=0)continue;
-        auto assessed=compare_private(ancestry[index],identity_);
+        auto assessed=compare_private(
+#ifdef __linux__
+            ancestry[index].object,
+#else
+            ancestry[index],
+#endif
+            identity_);
         if(!assessed.value())return assessed;
     }
     std::vector<ObjectIdentity> visited{identity_};
@@ -197,11 +232,21 @@ Observation<bool> JournalScopeGuard::check_scan_ancestry(const std::vector<Objec
         // alias. A different-volume boundary is qualified only when the same
         // native boundary appears in the Root's retained ancestry (or the
         // original subject lives on a different physical volume entirely).
-        if(before.mount_id!=now.value()->mount_id) {
+        if(before.mount_id!=now.value()->mount_id
+#ifdef __linux__
+            || before.mount_id_unique!=now.value()->mount_id_unique
+#endif
+            ) {
             const bool same_volume=before.identity.volume==id.volume;
             const bool subject_on_root_volume=identity_.volume==private_id.volume;
             const bool known_boundary=std::any_of(ancestry.begin(),ancestry.end(),[&](const auto& known){
-                return native_identity(known,before.identity)==IdentityComparison::Same;
+                return native_identity(
+#ifdef __linux__
+                    known.object,
+#else
+                    known,
+#endif
+                    before.identity)==IdentityComparison::Same;
             });
             if(same_volume||(subject_on_root_volume&&!known_boundary))
                 return refuse<bool>("journal_scope.mount_alias_unqualified");

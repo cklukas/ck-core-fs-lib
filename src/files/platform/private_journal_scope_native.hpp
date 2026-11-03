@@ -12,6 +12,9 @@ struct ScopeDirectoryMetadata final {
     ObjectIdentity identity;
     std::uint64_t mount_id,link_count;
     FileTimestamp modified,changed;
+    // Linux-only unique mount identity for the internal Root scope domain;
+    // zero on providers that expose only the legacy mount field.
+    std::uint64_t mount_id_unique = 0;
 };
 class ScopeDirectoryCursor {
 public:

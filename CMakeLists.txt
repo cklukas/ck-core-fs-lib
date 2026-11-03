@@ -163,7 +163,9 @@ else()
     src/files/platform/sync_session_posix.cpp
     src/files/platform/home_posix.cpp)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_sources(ck_files_platform PRIVATE src/files/platform/linux_anonymous_staging.cpp)
+    target_sources(ck_files_platform PRIVATE
+      src/files/platform/linux_anonymous_staging.cpp
+      src/files/platform/linux_mount_root.cpp)
   endif()
 endif()
 target_link_libraries(ck_files_platform PUBLIC ck_core_fs_engine)
@@ -342,6 +344,14 @@ if(BUILD_TESTING)
   add_test(NAME native_main_content_job COMMAND ck_fs_native_main_content_job_tests)
   set_tests_properties(native_main_content_job PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ck_fs_linux_mount_root_tests tests/linux_mount_root_tests.cpp)
+    target_link_libraries(ck_fs_linux_mount_root_tests PRIVATE ck_files_platform)
+    target_compile_options(ck_fs_linux_mount_root_tests PRIVATE -UNDEBUG)
+    add_test(NAME linux_mount_root COMMAND ck_fs_linux_mount_root_tests ${CK_CORE_FS_NATIVE_TEST_ROOT})
+    set_tests_properties(linux_mount_root PROPERTIES TIMEOUT 180
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  endif()
   add_executable(ck_fs_native_regular_metadata_job_tests tests/native_regular_metadata_job_tests.cpp)
   target_link_libraries(ck_fs_native_regular_metadata_job_tests PRIVATE ck_core_fs_native)
   add_test(NAME native_regular_metadata_job COMMAND ck_fs_native_regular_metadata_job_tests)

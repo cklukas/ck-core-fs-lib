@@ -9,6 +9,9 @@
 #include "posix_private_storage.hpp"
 #include "native_journal_directory_bridge.hpp"
 #include "journal_root_test_faults.hpp"
+#ifdef __linux__
+#include "linux_mount_root.hpp"
+#endif
 
 #include <cerrno>
 #include <fcntl.h>
@@ -278,6 +281,9 @@ struct JournalDirectory final {
     ino_t object;
     std::uint64_t mount;
     bool read_only;
+#ifdef __linux__
+    detail::LinuxMountRootWitness mount_root;
+#endif
 };
 #ifdef __linux__
 // One kernel observation supplies the same held/parent inode, directory,
@@ -320,7 +326,55 @@ bool journal_node_matches(int fd,const char* name,int flags,const JournalDirecto
             ancestor?"journal_root.ancestor_mount_changed":"journal_root.held_mount_changed"};
         return false;
     }
+#ifdef __linux__
+    // For an ancestor edge, the statx result names fd/name, not fd itself.
+    // Query the native root witness on a held FD for that same target; using
+    // fd here would compare the current mount against the next node's facts.
+    Fd target(ancestor ? openat(fd,name,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW) : -1);
+    const int witness_fd = ancestor ? target.value() : fd;
+    if (ancestor) {
+        if (witness_fd < 0) {
+            const int code=errno;
+            error={state(code),ErrorDomain::Posix,code,"journal_root.ancestor_open"};
+            return false;
+        }
+        struct stat target_stat{};
+        if(fstat(witness_fd,&target_stat)) {
+            const int code=errno;
+            error={state(code),ErrorDomain::Posix,code,"journal_root.ancestor_stat"};
+            return false;
+        }
+        if(!S_ISDIR(target_stat.st_mode) || !target_stat.st_nlink ||
+            target_stat.st_dev!=makedev(value.stx_dev_major,value.stx_dev_minor) ||
+            target_stat.st_ino!=value.stx_ino || target_stat.st_nlink!=value.stx_nlink) {
+            error={ObservationState::Changed,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::MetadataChanged),"journal_root.ancestor_changed"};
+            return false;
+        }
+    }
+    auto mount_root=detail::query_linux_mount_root(witness_fd);
+    if(!mount_root.value()) {
+        const auto& unavailable=*mount_root.unavailable_detail();
+        error={unavailable.state,unavailable.error.domain,unavailable.error.code,
+            "journal_root.mount_root"};
+        return false;
+    }
+    if(*mount_root.value()!=expected.mount_root) {
+        error={ObservationState::Changed,ErrorDomain::Adapter,
+            static_cast<std::int64_t>(AdapterError::MetadataChanged),"journal_root.mount_root_changed"};
+        return false;
+    }
+#endif
     return true;
+}
+bool same_mount_witness_except_endpoint_flag(const detail::LinuxMountRootWitness& a,
+    const detail::LinuxMountRootWitness& b) noexcept {
+    return a.mount_id==b.mount_id && a.parent_mount_id==b.parent_mount_id &&
+        a.mount_id_old==b.mount_id_old && a.parent_mount_id_old==b.parent_mount_id_old &&
+        a.mnt_attr==b.mnt_attr && a.sb_device_major==b.sb_device_major &&
+        a.sb_device_minor==b.sb_device_minor &&
+        a.vfs_device_major==b.vfs_device_major && a.vfs_device_minor==b.vfs_device_minor &&
+        a.filesystem_magic==b.filesystem_magic;
 }
 #endif
 Observation<std::uint64_t> journal_mount(int fd,const char* component,int flags) {
@@ -365,12 +419,16 @@ Observation<JournalDirectory> journal_directory(Fd fd) {
     const bool read_only=(fs.f_flags&ST_RDONLY)!=0;
 #endif
 #ifdef __linux__
-    auto mount=journal_mount(fd.value(),"",AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW);
+    auto mount_root=detail::query_linux_mount_root(fd.value());
+    if(!mount_root.value())return Observation<JournalDirectory>::unavailable(mount_root.state(),mount_root.unavailable_detail()->error);
+    JournalDirectory result{std::move(fd),s.st_dev,s.st_ino,mount_root.value()->mount_id_old,read_only,
+        *mount_root.value()};
 #else
     auto mount=journal_mount(fd.value(),"",0);
-#endif
     if(!mount.value())return Observation<JournalDirectory>::unavailable(mount.state(),mount.unavailable_detail()->error);
-    return Observation<JournalDirectory>::available({std::move(fd),s.st_dev,s.st_ino,*mount.value(),read_only});
+    JournalDirectory result{std::move(fd),s.st_dev,s.st_ino,*mount.value(),read_only};
+#endif
+    return Observation<JournalDirectory>::available(std::move(result));
 }
 Observation<bool> journal_edge(int parent,const NativeName& component,const JournalDirectory& expected) {
     struct stat current{};
@@ -461,6 +519,22 @@ public:
         checked=check();if(!checked.value())return R::unavailable(checked.state(),checked.unavailable_detail()->error);
         return R::available(std::move(ids));
     }
+#ifdef __linux__
+    Observation<std::vector<detail::RootScopeIdentity>> inspect_scope_ancestry() const {
+        using R=Observation<std::vector<detail::RootScopeIdentity>>;std::lock_guard lock(mutex_);
+        auto checked=check();if(!checked.value())return R::unavailable(checked.state(),checked.unavailable_detail()->error);
+        std::vector<detail::RootScopeIdentity> ids;ids.reserve(chain_.size());
+        for(const auto& node:chain_) {
+            struct stat value{};
+            if(fstat(node.fd.value(),&value))return failure<std::vector<detail::RootScopeIdentity>>(errno,"journal_root.scope_ancestry_identity");
+            ids.push_back({{identity_.scope,IdentityScheme::PosixDeviceInode,
+                NativeIdentifier::from_u64(value.st_dev),NativeIdentifier::from_u64(value.st_ino),std::nullopt},
+                node.mount_root.mount_id});
+        }
+        checked=check();if(!checked.value())return R::unavailable(checked.state(),checked.unavailable_detail()->error);
+        return R::available(std::move(ids));
+    }
+#endif
     Observation<bool> revalidate() const override {std::lock_guard lock(mutex_);return check();}
     Observation<int> duplicate_native_directory() const {
         std::lock_guard lock(mutex_);auto checked=check();
@@ -624,6 +698,13 @@ Observation<std::vector<ObjectIdentity>> inspect_prepared_journal_ancestry(Prepa
     if(!native)return rejected<std::vector<ObjectIdentity>>(AdapterError::UnqualifiedIdentity,"journal_root.foreign_provider",ObservationState::Unsupported);
     return native->inspect_ancestry();
 }
+#ifdef __linux__
+Observation<std::vector<RootScopeIdentity>> inspect_prepared_journal_scope_ancestry(PreparedJournalRoot& root) {
+    const auto* native=dynamic_cast<const PosixPreparedJournalRoot*>(&root);
+    if(!native)return rejected<std::vector<RootScopeIdentity>>(AdapterError::UnqualifiedIdentity,"journal_root.foreign_provider",ObservationState::Unsupported);
+    return native->inspect_scope_ancestry();
+}
+#endif
 bool record_prepared_journal_consumer_failure(PreparedJournalRoot& root,ObservationState state,
     ErrorDomain domain,std::int64_t code,std::string_view operation) noexcept {
     auto* native=dynamic_cast<PosixPreparedJournalRoot*>(&root);if(!native)return false;
@@ -721,6 +802,21 @@ Observation<PreparedJournalRoot::Pointer> prepare_native_journal_root(
         if(!up.value())return R::unavailable(up.state(),up.unavailable_detail()->error);
         const auto& next=*up.value();const auto& current=chain.back();
         if(next.device==current.device && next.object==current.object && next.mount==current.mount) {
+#ifdef __linux__
+            // The terminal self-parent is itself a fresh physical-root
+            // witness; never terminate merely on inode/mount-ID equality.
+            // The held current FD is the endpoint whose root qualification is
+            // required. The extra '..' probe must match its complete native
+            // mount witness, but its statx endpoint attribute is not
+            // independently authoritative after path resolution clamps at
+            // namespace root. Do not require either statmount parent ID to
+            // equal its own mount ID: statmount reports the kernel mount-tree
+            // parent, which can be outside the caller's visible namespace.
+            if(!current.mount_root.fd_is_mount_root ||
+                !same_mount_witness_except_endpoint_flag(next.mount_root,current.mount_root))
+                return rejected<PreparedJournalRoot::Pointer>(AdapterError::MetadataChanged,
+                    "journal_root.terminal_mount_root_changed",ObservationState::Changed);
+#endif
             auto redundant=std::move(up).take_value();
             const int closed=::close(redundant.fd.release());const int code=errno;
             if(closed)return failure<PreparedJournalRoot::Pointer>(code,"journal_root.ancestor_probe_close");
@@ -728,9 +824,17 @@ Observation<PreparedJournalRoot::Pointer> prepare_native_journal_root(
         }
         if(chain.size()>=request.max_ancestors)return rejected<PreparedJournalRoot::Pointer>(AdapterError::InventoryLimit,"journal_root.ancestor_limit",ObservationState::Unsupported);
 #ifdef __linux__
-        // Without a qualified physical-ancestor route for bind/submount roots,
-        // a namespace '..' walk cannot prove all durable ancestors were held.
-        if(next.mount!=current.mount)return rejected<PreparedJournalRoot::Pointer>(AdapterError::PlanTopologyUnsafe,"journal_root.ancestor_mount_crossing",ObservationState::Unsupported);
+        // A mount-ID transition is safe only when statmount proved the new
+        // mount's physical filesystem root is exactly "/". Subdirectory bind
+        // mounts are rejected by query_linux_mount_root before this point.
+        // Bind both unique and legacy parent IDs to the actual held ancestor;
+        // otherwise a stacked/hidden mount could make '..' appear complete.
+        if(next.mount!=current.mount &&
+            (!current.mount_root.fd_is_mount_root ||
+             current.mount_root.parent_mount_id_old!=next.mount ||
+             current.mount_root.parent_mount_id!=next.mount_root.mount_id))
+            return rejected<PreparedJournalRoot::Pointer>(AdapterError::PlanTopologyUnsafe,
+                "journal_root.ancestor_parent_mount_mismatch",ObservationState::Unsupported);
 #elif defined(__APPLE__)
         // APFS/HFS native volume roots have object ID 2. A firmlink entering
         // below that root would hide physical ancestors and is refused.

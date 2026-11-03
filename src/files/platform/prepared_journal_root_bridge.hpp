@@ -23,6 +23,16 @@ bool record_prepared_journal_consumer_failure(PreparedJournalRoot&,ObservationSt
 // Clears output even for absent/foreign providers. Never waits or allocates.
 bool read_prepared_journal_consumer_failure(const PreparedJournalRoot&,
     PreparedJournalConsumerFailure&) noexcept;
+// Internal Linux scope identity. Object IDs alone are insufficient across a
+// whole-filesystem bind alias; the native mount ID is part of the retained
+// Root scope domain and is never exposed as public ABI.
+#ifdef __linux__
+struct RootScopeIdentity final {
+    ObjectIdentity object;
+    std::uint64_t mount_id = 0;
+};
+Observation<std::vector<RootScopeIdentity>> inspect_prepared_journal_scope_ancestry(PreparedJournalRoot&);
+#endif
 // Worker-only Root->namespace-endpoint evidence from checked native handles.
 // Genuine factory class only. IDs are minted in Root's scope after kernel
 // queries and validation on both sides; DTOs alone grant no scope authority.

@@ -111,9 +111,22 @@ public:
         const auto modified=FileTimestamp::from_unix(value.stx_mtime.tv_sec,value.stx_mtime.tv_nsec);
         const auto changed=FileTimestamp::from_unix(value.stx_ctime.tv_sec,value.stx_ctime.tv_nsec);
         if(!modified||!changed)return scope_unqualified<ScopeDirectoryMetadata>("journal_scope.topology_time");
+        struct statx unique{};
+        // Linux UAPI bit 0x4000 is STATX_MNT_ID_UNIQUE; keep this usable
+        // with older libc headers while negotiating support through stx_mask.
+        constexpr unsigned unique_required=STATX_TYPE|STATX_INO|STATX_NLINK|0x00004000U;
+        if(statx(fd_.get(),"",AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT,unique_required,&unique))
+            return scope_error<ScopeDirectoryMetadata>(errno,"journal_scope.topology_statx_unique");
+        if((unique.stx_mask&unique_required)!=unique_required ||
+            !S_ISDIR(unique.stx_mode)||!unique.stx_nlink ||
+            unique.stx_mnt_id < (1ULL << 31) ||
+            unique.stx_ino!=value.stx_ino || unique.stx_dev_major!=value.stx_dev_major ||
+            unique.stx_dev_minor!=value.stx_dev_minor)
+            return scope_unqualified<ScopeDirectoryMetadata>("journal_scope.topology_unique_fields");
         return R::available({{scope_,IdentityScheme::PosixDeviceInode,
             NativeIdentifier::from_u64(static_cast<std::uint64_t>(makedev(value.stx_dev_major,value.stx_dev_minor))),
-            NativeIdentifier::from_u64(value.stx_ino),std::nullopt},value.stx_mnt_id,value.stx_nlink,*modified,*changed});
+            NativeIdentifier::from_u64(value.stx_ino),std::nullopt},value.stx_mnt_id,value.stx_nlink,
+            *modified,*changed,unique.stx_mnt_id});
 #else
         return scope_unqualified<ScopeDirectoryMetadata>("journal_scope.topology_mount_id_unavailable");
 #endif

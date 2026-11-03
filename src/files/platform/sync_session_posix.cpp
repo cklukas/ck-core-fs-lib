@@ -4,6 +4,9 @@
 #include "../sha256.hpp"
 #include "posix_private_storage.hpp"
 #include "prepared_journal_root_bridge.hpp"
+#ifdef __linux__
+#include "linux_mount_root.hpp"
+#endif
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -20,7 +23,6 @@
 #else
 #include <sys/vfs.h>
 #include <sys/sysmacros.h>
-#include <sstream>
 #endif
 
 namespace ck::files {
@@ -98,7 +100,12 @@ Observation<SyncDigest> identity(int fd) {
 #endif
     return Observation<SyncDigest>::available(h.digest());
 }
-struct Node { Fd fd; std::string name; SyncDigest id; dev_t dev; ino_t ino; };
+struct Node {
+    Fd fd; std::string name; SyncDigest id; dev_t dev; ino_t ino;
+#ifdef __linux__
+    detail::LinuxMountRootWitness mount_root;
+#endif
+};
 using Chain=std::vector<Node>;
 Observation<Chain> chain(const NativeAbsolutePath& p) {
     if(!p.posix_bytes() || !p.is_valid()) return reject<Chain>("sync_session.posix_path",ObservationState::Unsupported);
@@ -123,7 +130,23 @@ Observation<Chain> chain(const NativeAbsolutePath& p) {
                 return reject<bool>("sync_session.hidden_native_ancestors",ObservationState::Unsupported);
         }
 #endif
-        out.push_back({std::move(fd),std::move(name),*id.value(),s.st_dev,s.st_ino});
+        Node node{std::move(fd),std::move(name),*id.value(),s.st_dev,s.st_ino};
+#ifdef __linux__
+        auto mount_root=detail::query_linux_mount_root(node.fd.fd);
+        if(!mount_root.value()) return propagate<bool>(mount_root);
+        node.mount_root=*mount_root.value();
+        // The initial absolute endpoint must be the actual mount namespace
+        // root. Intermediate directory FDs are deliberately allowed to have
+        // fd_is_mount_root == false.
+        if(out.empty() && !node.mount_root.fd_is_mount_root)
+            return reject<bool>("sync_session.namespace_root_not_mount_root",ObservationState::Unsupported);
+        if(!out.empty() && node.mount_root.mount_id_old!=out.back().mount_root.mount_id_old &&
+            (!node.mount_root.fd_is_mount_root ||
+             node.mount_root.parent_mount_id_old!=out.back().mount_root.mount_id_old ||
+             node.mount_root.parent_mount_id!=out.back().mount_root.mount_id))
+            return reject<bool>("sync_session.parent_mount_mismatch",ObservationState::Unsupported);
+#endif
+        out.push_back(std::move(node));
         return Observation<bool>::available(true);
     };
     auto r=add(Fd(open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW)),{});
@@ -143,6 +166,18 @@ Observation<bool> validate(const Chain& c) {
     for(std::size_t i=0;i<c.size();++i) {
         auto id=identity(c[i].fd.fd); if(!id.value()) return propagate<bool>(id);
         if(*id.value()!=c[i].id) return reject<bool>("sync_session.held_identity");
+#ifdef __linux__
+        auto mount_root=detail::query_linux_mount_root(c[i].fd.fd);
+        if(!mount_root.value()) return propagate<bool>(mount_root);
+        if(*mount_root.value()!=c[i].mount_root) return reject<bool>("sync_session.mount_root_changed");
+        if(i==0 && !mount_root.value()->fd_is_mount_root)
+            return reject<bool>("sync_session.namespace_root_changed",ObservationState::Changed);
+        if(i && c[i].mount_root.mount_id_old!=c[i-1].mount_root.mount_id_old &&
+            (!c[i].mount_root.fd_is_mount_root ||
+             c[i].mount_root.parent_mount_id_old!=c[i-1].mount_root.mount_id_old ||
+             c[i].mount_root.parent_mount_id!=c[i-1].mount_root.mount_id))
+            return reject<bool>("sync_session.parent_mount_changed",ObservationState::Changed);
+#endif
         struct stat s{};
         const int rc=i ? fstatat(c[i-1].fd.fd,c[i].name.c_str(),&s,AT_SYMLINK_NOFOLLOW) : lstat("/",&s);
         if(rc) return failure<bool>(errno,"sync_session.held_edge");
@@ -195,38 +230,6 @@ bool valid_name(std::string_view n) {
 Observation<bool> private_file(int fd) {
     return detail::qualify_posix_private_storage(fd,detail::PosixPrivateStorageKind::RegularFile);
 }
-#ifndef __APPLE__
-// Bind mounts can hide true ancestors from '..' traversal. Reject duplicate
-// device mounts and mounted subdirectories, and pin the mount table snapshot.
-Observation<std::string> mount_table() {
-    Fd f(open("/proc/self/mountinfo",O_RDONLY|O_CLOEXEC));
-    if(f.fd<0) return failure<std::string>(errno,"sync_session.mountinfo");
-    std::string out; char b[4096];
-    for(;;) { const auto n=::read(f.fd,b,sizeof(b));
-        if(n<0) { if(errno==EINTR) continue; return failure<std::string>(errno,"sync_session.mount_read"); }
-        if(!n) break; if(out.size()+n>4*1024*1024) return reject<std::string>("sync_session.mount_limit",ObservationState::Unsupported);
-        out.append(b,n);
-    }
-    return Observation<std::string>::available(std::move(out));
-}
-Observation<bool> qualify_mounts(const std::string& text,const Chain& c) {
-    std::map<std::pair<unsigned,unsigned>,std::vector<std::string>> roots;
-    std::istringstream input(text); std::string line;
-    while(std::getline(input,line)) {
-        std::istringstream row(line); std::string id,parent,device,root;
-        if(!(row>>id>>parent>>device>>root)) return reject<bool>("sync_session.mount_parse",ObservationState::Unsupported);
-        unsigned ma=0,mi=0; char tail=0;
-        if(std::sscanf(device.c_str(),"%u:%u%c",&ma,&mi,&tail)!=2) return reject<bool>("sync_session.mount_device",ObservationState::Unsupported);
-        roots[{ma,mi}].push_back(root);
-    }
-    for(const auto& node:c) {
-        const auto it=roots.find({major(node.dev),minor(node.dev)});
-        if(it==roots.end() || it->second.size()!=1 || it->second.front()!="/")
-            return reject<bool>("sync_session.ambiguous_mount_ancestry",ObservationState::Unsupported);
-    }
-    return Observation<bool>::available(true);
-}
-#endif
 class PosixBackend final:public SyncSessionBackend {
 public:
     // Destroy native duplicates/locks before releasing the lifecycle owner.
@@ -278,18 +281,11 @@ public:
         return close_error?failure<bool>(close_error,"sync_session.directory_close"):Observation<bool>::available(true);
     }
     SyncSessionFaults faults;
-#ifndef __APPLE__
-    std::string mounts;
-#endif
     const SyncDigest& left_identity() const noexcept override { return left.back().id; }
     const SyncDigest& right_identity() const noexcept override { return right.back().id; }
     std::intptr_t root_handle(bool r) const noexcept override { return closed?-1:(r?right:left).back().fd.fd; }
     Observation<bool> revalidate() override {
         if(closed)return reject<bool>("sync_session.finished");
-#ifndef __APPLE__
-        auto m=mount_table(); if(!m.value()) return propagate<bool>(m);
-        if(*m.value()!=mounts) return reject<bool>("sync_session.mount_topology_changed");
-#endif
         auto held=validate_storage(store,*owner);if(!held.value())return held;
         for(const auto* c:{&left,&right}) { auto r=validate(*c); if(!r.value()) return r; }
         return detail::qualify_posix_private_storage(store.back().fd.fd,detail::PosixPrivateStorageKind::Directory);
@@ -409,10 +405,6 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     if(contains(b->left,b->right_identity()) || contains(b->right,b->left_identity()) ||
         contains(b->store,b->left_identity()) || contains(b->store,b->right_identity()))
         return reject<P>("sync_session.overlapping_pair_or_store",ObservationState::Failed);
-#ifndef __APPLE__
-    auto m=mount_table(); if(!m.value()) return propagate<P>(m); b->mounts=*m.value();
-    for(const auto* c:{&b->store,&b->left,&b->right}) { auto q=qualify_mounts(b->mounts,*c); if(!q.value()) return propagate<P>(q); }
-#endif
     // Deduplicate both roots' ancestor objects before flock: taking another
     // open-description lock for the same inode can conflict with ourselves.
     struct Lock { int fd; bool exclusive; };

@@ -165,7 +165,16 @@ class OwnedTree {
 #else
     int root_;
     static void remove_contents(int fd) {
-        auto *directory = fdopendir(dup(fd));
+        // A duplicate shares the old open file description. Btrfs can retain
+        // its pre-population directory-index bound. Obtain a fresh iterator
+        // through the held directory itself, and verify its exact identity.
+        struct stat before{};
+        assert(fstat(fd, &before) == 0 && S_ISDIR(before.st_mode));
+        const int iterator = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        assert(iterator >= 0);
+        struct stat held{};
+        assert(fstat(iterator, &held) == 0 && held.st_dev == before.st_dev && held.st_ino == before.st_ino);
+        auto *directory = fdopendir(iterator); // transfers the new owning FD
         assert(directory);
         errno = 0;
         while (auto *entry = readdir(directory)) {

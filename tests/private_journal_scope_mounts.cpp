@@ -4,17 +4,20 @@
 #include "private_journal_scope.hpp"
 #include "reviewed_tree_plan.hpp"
 #include "native_filesystem.hpp"
+#include "platform/linux_mount_root.hpp"
 
 #include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <fcntl.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/prctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -73,11 +76,14 @@ void require_mapping(const char* path, const char* expected_text) {
 }
 class Mounts {
 public:
-    ~Mounts() { for (auto at = paths_.rbegin(); at != paths_.rend(); ++at) ::umount2(at->c_str(), MNT_DETACH); }
+    ~Mounts() { for (auto at = paths_.rbegin(); at != paths_.rend(); ++at) ::umount2(at->path.c_str(), MNT_DETACH); }
     void add(const std::string& source, const std::string& target, const char* type,
              unsigned long flags, const char* options = nullptr) {
         // Allocate bookkeeping before the native effect, including on allocation failure.
-        paths_.push_back(target);
+        const bool recursive_root_clone = source == "/" && (flags & (MS_BIND | MS_REC)) == (MS_BIND | MS_REC);
+        if (recursive_root_clone) require(target != "/" && target.ends_with("/source/whole-fs"),
+            "recursive root clone target must be the fixture-owned mountpoint");
+        paths_.push_back({target, recursive_root_clone});
         if (::mount(source.c_str(), target.c_str(), type, flags, options)) {
             const int error = errno;
             paths_.pop_back();
@@ -89,12 +95,24 @@ public:
     }
     void finish() {
         while (!paths_.empty()) {
-            if (::umount2(paths_.back().c_str(), 0)) throw std::runtime_error("fixture unmount failed");
+            if (::umount2(paths_.back().path.c_str(), 0)) {
+                const int error = errno;
+                // All product cursors into aliases have left scope. Only this
+                // fixture's recursive clone may detach its cloned children;
+                // source mounts and the host namespace are never targets.
+                if (error != EBUSY || !paths_.back().recursive_root_clone ||
+                    namespace_id("/proc/self/ns/mnt") != mount_namespace_ ||
+                    ::umount2(paths_.back().path.c_str(), MNT_DETACH))
+                    throw std::runtime_error("fixture unmount failed");
+                std::puts("CASE fixture_recursive_clone_cleanup DETACHED owned subtree");
+            }
             paths_.pop_back();
         }
     }
 private:
-    std::vector<std::string> paths_;
+    struct OwnedMount { std::string path; bool recursive_root_clone; };
+    std::vector<OwnedMount> paths_;
+    const std::string mount_namespace_ = namespace_id("/proc/self/ns/mnt");
 };
 constexpr std::array<std::byte, 8> sentinel{
     std::byte{0x42}, std::byte{0}, std::byte{0xff}, std::byte{3},
@@ -111,17 +129,73 @@ void check_sentinel(PreparedJournalRoot& root, const ObjectIdentity& expected, c
         "protected journal content changed");
     require(take(file->finish_io(), "protected journal close"), "protected journal close returned false");
 }
+void namespace_root_endpoint_positive() {
+    const int fd=::open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    require(fd>=0,"namespace root endpoint open");
+    auto witness=take(ck::files::detail::query_linux_mount_root(fd),
+        "namespace root endpoint witness",true);
+    const int close_result=::close(fd);
+    require(close_result==0,"namespace root endpoint close");
+    require(witness.fd_is_mount_root,
+        "visible namespace root must be a statx mount-root endpoint");
+    std::puts("CASE namespace_root_endpoint WITNESS");
+}
+void chroot_mount_root_negative(const std::string& chroot_path) {
+    int channel[2]{};
+    require(::pipe(channel)==0,"chroot fixture pipe");
+    const pid_t child_pid=::fork();
+    require(child_pid>=0,"chroot fixture fork");
+    if(child_pid==0) {
+        ::close(channel[0]);
+        char marker='E';
+        if(::chroot(chroot_path.c_str())==0 && ::chdir("/")==0) {
+            auto hidden=NativeAbsolutePath::from_posix("/");
+            if(hidden.value()) {
+                const int fd=::open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+                if(fd>=0) {
+                    auto witness=ck::files::detail::query_linux_mount_root(fd);
+                    const int close_result=::close(fd);
+                    if(close_result==0 && witness.value()) {
+                        // statmount still reports mnt_root == "/" for the
+                        // containing mount, but statx must identify this FD as
+                        // a real mount root before Root may terminate here.
+                        if(!witness.value()->fd_is_mount_root) {
+                            auto prepared=acquire_native_journal_root(*hidden.value());
+                            marker=prepared.value()?'A':'R';
+                        } else marker='S';
+                    } else if(!witness.value()) marker='U';
+                    else marker='E';
+                }
+            }
+        }
+        (void)::write(channel[1],&marker,1);
+        ::close(channel[1]);
+        _exit(marker=='R'||marker=='U'?0:1);
+    }
+    ::close(channel[1]);
+    char marker=0;
+    const ssize_t received=::read(channel[0],&marker,1);
+    ::close(channel[0]);
+    int status=0;
+    require(::waitpid(child_pid,&status,0)==child_pid,"chroot fixture wait");
+    require(received==1&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"chroot fixture child failed");
+    if(marker=='U')throw Unqualified("chroot mount-root attribute query unavailable");
+    require(marker=='R',"chroot-hidden subdirectory was accepted as Root endpoint");
+    std::puts("CASE chroot_hidden_mount_root REFUSED");
+}
 int run(const NativeAbsolutePath& scratch) {
     NativeFileSystem fs;
     auto parent = Cursor(take(fs.open_native_directory(scratch), "native scratch cursor", true));
+    namespace_root_endpoint_positive();
     auto source = child(parent, "source");
     auto upper = child(parent, "upper");
     auto work = child(parent, "work");
     auto whole = child(source, "whole");
+    auto whole_fs = child(source, "whole-fs");
     auto inside = child(source, "inside");
     auto view = child(source, "view");
     auto unrelated = child(source, "journals"); // Same basename is not private identity.
-    (void)upper; (void)work; (void)whole; (void)inside; (void)view;
+    (void)upper; (void)work; (void)whole; (void)whole_fs; (void)inside; (void)view;
     PreparedJournalRootRequest request;
     request.parent = parent;
     request.child = name("journals");
@@ -226,6 +300,7 @@ int run(const NativeAbsolutePath& scratch) {
         std::puts("CASE private_hardlink_tree_before_preview PASS Unsupported Adapter 18");
     }
     const auto source_path = address(scratch, "source"), private_path = address(scratch, "journals");
+    chroot_mount_root_negative(bytes(source_path));
     // Remove only our two hostile fixture links before the journal provider's
     // independent unique-link privacy check reopens the protected sentinel.
     require(::unlink(bytes(address(source_path, "private-hardlink")).c_str()) == 0,
@@ -234,13 +309,26 @@ int run(const NativeAbsolutePath& scratch) {
         "remove Tree private hardlink fixture");
     Mounts mounts;
     mounts.add(bytes(private_path), bytes(address(source_path, "whole")), nullptr, MS_BIND);
+    // Bind the namespace's entire filesystem root. statmount will report
+    // mnt_root == "/", but that fact alone must not authorize this alias.
+    mounts.add("/", bytes(address(source_path, "whole-fs")), nullptr, MS_BIND | MS_REC);
     mounts.add(bytes(address(private_path, "nested")), bytes(address(source_path, "inside")), nullptr, MS_BIND);
     mounts.add(bytes(address(private_path, "private-state")), bytes(address(source_path, "file-alias")), nullptr, MS_BIND);
     const auto options = "lowerdir=" + bytes(private_path) + ",upperdir=" + bytes(address(scratch, "upper")) +
         ",workdir=" + bytes(address(scratch, "work")) + ",userxattr";
     mounts.add("overlay", bytes(address(source_path, "view")), "overlay", 0, options.c_str());
-    for (const auto* component : {"whole", "inside"}) {
+    for (const auto* component : {"whole", "inside", "whole-fs"}) {
         auto cursor = Cursor(take(fs.open_native_directory(address(source_path, component)), "native directory alias"));
+        if (!std::strcmp(component, "whole-fs")) {
+            auto alias = take(cursor->inspect_basic(), "whole filesystem bind metadata");
+            auto private_root = take(state->inspect_basic(), "private Root metadata");
+            require(alias.identity.value() && private_root.identity.value() &&
+                compare_identity(*alias.identity.value(), *private_root.identity.value()) != IdentityComparison::Same,
+                "whole filesystem bind unexpectedly aliases private Root object");
+            require(alias.mount_id.value() && private_root.mount_id.value() &&
+                *alias.mount_id.value() != *private_root.mount_id.value(),
+                "whole filesystem bind did not create a distinct mount identity");
+        }
         refused(component, JournalScopeGuard::create(root, cursor));
         auto entry = take(HeldChild::observe(source, name(component)), "held directory alias");
         refused("directory_alias_per_entry", guard->check_entry(*entry));
