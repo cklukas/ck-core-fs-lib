@@ -474,6 +474,23 @@ if(BUILD_TESTING)
     if(NOT CK_CORE_FS_METADATA_TARGET_NATIVE_FS MATCHES "^(NTFS|ReFS)$")
       message(FATAL_ERROR "Native metadata stream target fixture must select NTFS or ReFS")
     endif()
+    add_executable(ck_fs_native_legacy_batch_drain_windows_tests
+      tests/native_legacy_batch_drain_windows_tests.cpp)
+    target_link_libraries(ck_fs_native_legacy_batch_drain_windows_tests PRIVATE ck_core_fs_native dbghelp)
+    if(MSVC)
+      target_compile_options(ck_fs_native_legacy_batch_drain_windows_tests PRIVATE /UNDEBUG)
+      target_link_options(ck_fs_native_legacy_batch_drain_windows_tests PRIVATE /ENTRY:wmainCRTStartup)
+    endif()
+    foreach(mode cancel-before-start cancel-source-error cancel-source-error-oom
+        cancel-journal-error-oom cancel-prior-root-oom cancel-prior-root-source-error-oom
+        started-cancel started-cancel-source-error-oom uncertain-first-source-error complete)
+      add_test(NAME native_legacy_batch_drain_windows_${mode}
+        COMMAND ck_fs_native_legacy_batch_drain_windows_tests --mode ${mode}
+          --expect-filesystem "${CK_CORE_FS_METADATA_TARGET_NATIVE_FS}")
+      set_tests_properties(native_legacy_batch_drain_windows_${mode} PROPERTIES TIMEOUT 180
+        LABELS "windows;native;metadata;batch"
+        ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    endforeach()
     # These are native Windows cases. Do not register their non-Windows
     # fallback entry points as positive qualification.
     foreach(suite native_copy_source_close_windows target_read_seed native_tree_execution tree_fixture_native_root native_tree_complete)

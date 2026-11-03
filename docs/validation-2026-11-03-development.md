@@ -506,6 +506,36 @@ Darwin syntax compilation in 8.02 seconds. This is compile-only coverage, not a
 macOS native execution result. Strict ckdocs built all 17 then-current pages;
 newer name-feedback documentation requires the next site validation.
 
+## Coherent Windows legacy batch and installed C checkpoint
+
+A fresh MSVC x64 normal SDK compiled 157 steps / 141 compile commands in
+1,545.53 seconds using matching `/MDd /Od /Ob0 /RTC1 /Zi /EHsc /GR /utf-8`
+inputs. Product/header hashes match the earlier `51e7835` cohort; newer name
+feedback, reader-clone, CurrentCaller and hierarchical-session changes are not
+included. No prior v2 objects or SDK archives were reused.
+
+All ten actual three-item legacy batch modes passed on **both NTFS and ReFS**
+(20 total). They exercise pre-created journals and retained ADS read handles,
+pre-start and started cancellation, actual source/journal close errors,
+persistent allocation denial, prior Root error precedence, stopping later items
+after an uncertain first item, and successful payload/ADS/mtime/identity/owner
+verification. Pending journals stay unchanged; later items stay unread and
+unpublished. Native handles drain before terminal return, repeated terminal
+polls do no I/O/allocation retry, and separately owned events reuse the retired
+numeric handles without being closed again.
+
+The same frozen SDK passed nine portable Batch/Execution/C API OOM entries,
+the earlier 28 source-close gates, native metadata/stream/source-version checks
+and 302 hard-link checks per filesystem. Categories overlap and are not an
+additive test count. The installed strict C consumer and all **170 declared C
+exports** passed. Earlier fixture-only failures are retained: direct NT import
+forwarding, exact legacy operation tag, pending-state expectations under shared
+Root failure, and TokenUser versus actual TokenOwner.
+
+The regression is now a permanent Windows CMake target. Its misleading inherited
+header comment was corrected; executable test logic matches the frozen
+qualification. Matching ASan and the final combined revision remain pending.
+
 ## Remaining gates
 
 - Qualify the final combined postorder Tree and bounded metadata workers on
