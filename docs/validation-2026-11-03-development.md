@@ -292,6 +292,30 @@ This qualifies the batch composition and its real-handle regression. Native
 multi-item copy/metadata integration and final cross-platform qualification
 remain separate gates.
 
+## Hard-linked source fixture corrections
+
+The permanent hard-link fixture uses bounded wide Windows environment queries,
+extended native paths and exact UTF-16 names. Native normal checks passed on
+NTFS and ReFS: 302 with the workstation path policy, 292 with the default policy,
+and 55 each for explicitly configured UNC refusal. Unreachable, missing or
+wrong aliases remain UNQUALIFIED rather than passing. The same fixture compiled
+with strict GCC 14 warnings and passed 114 checks on actual Linux ext4 against
+the unchanged earlier read-only hard-link SDK.
+
+A previous fixture asserted that every rapid link-only `2 -> 3 -> 2` cycle must
+change the timestamp. Its ReFS failure and native diagnostics are retained:
+actual metadata events can share ChangeTime. The corrected deterministic
+negative test opens the real third alias, verifies identity, appends a byte,
+flushes and closes it, removes that alias and observes link count two again.
+Both source verifiers must reject the actual size/content change; both surviving
+aliases contain the expected bytes. No sleep or timestamp forcing is used, and
+always detecting an intermediate link-only ABA is not claimed. Windows
+[ChangeTime](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_basic_info)
+and [timestamp documentation](https://learn.microsoft.com/en-us/windows/win32/sysinfo/file-times)
+define time observations rather than a distinct event counter. Source observation
+is not an enforced mutation freeze. Writable target and private-journal alias
+refusals remain required.
+
 ## Remaining gates
 
 - Integrate and qualify postorder directory metadata replay and bounded
