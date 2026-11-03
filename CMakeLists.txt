@@ -368,6 +368,24 @@ if(BUILD_TESTING)
   set_tests_properties(regular_metadata_review PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   add_executable(ck_fs_native_directory_replay_job_tests tests/native_directory_replay_job_tests.cpp)
+  if(WIN32)
+    set(CK_CORE_FS_METADATA_TARGET_NATIVE_FS "NTFS" CACHE STRING
+      "Expected NTFS/ReFS provider for native metadata stream target tests")
+    if(NOT CK_CORE_FS_METADATA_TARGET_NATIVE_FS MATCHES "^(NTFS|ReFS)$")
+      message(FATAL_ERROR "Native metadata stream target fixture must select NTFS or ReFS")
+    endif()
+    add_executable(ck_fs_native_metadata_stream_target_tests
+      tests/native_metadata_stream_target_windows_tests.cpp)
+    target_link_libraries(ck_fs_native_metadata_stream_target_tests PRIVATE ck_core_fs_native)
+    if(MSVC)
+      target_link_options(ck_fs_native_metadata_stream_target_tests PRIVATE /ENTRY:wmainCRTStartup)
+    endif()
+    add_test(NAME native_metadata_stream_target COMMAND ck_fs_native_metadata_stream_target_tests
+      --expect-filesystem "${CK_CORE_FS_METADATA_TARGET_NATIVE_FS}")
+    set_tests_properties(native_metadata_stream_target PROPERTIES TIMEOUT 180
+      LABELS "windows;native;metadata"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  endif()
   add_executable(ck_fs_directory_postorder_worker_tests tests/directory_postorder_worker_tests.cpp)
   target_link_libraries(ck_fs_directory_postorder_worker_tests PRIVATE ck_core_fs_native)
   if(MSVC)
