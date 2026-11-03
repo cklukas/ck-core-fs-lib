@@ -238,6 +238,14 @@ if(BUILD_TESTING)
   endif()
   enable_testing()
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ck_fs_linux_ordinary_metadata_tests tests/linux_ordinary_metadata_tests.cpp)
+    target_link_libraries(ck_fs_linux_ordinary_metadata_tests PRIVATE ck_core_fs_native)
+    target_compile_options(ck_fs_linux_ordinary_metadata_tests PRIVATE -UNDEBUG)
+    # Native mode needs the explicit capability-bearing qualification fixture;
+    # the default policy audit does not stand in for those native runs.
+    add_test(NAME linux_ordinary_metadata_policy COMMAND ck_fs_linux_ordinary_metadata_tests --policy)
+  endif()
   # ELF export surface is checked independently of the interposition probe.
   if(CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF")
     add_test(NAME elf_export_surface COMMAND ${Python3_EXECUTABLE}

@@ -26,7 +26,8 @@ ancestry correction. Existing 0.3 Actions remain unchanged in this increment.
 | Required committed Linux normal/ASan/UBSan/TSan CI | PASS at `e05a8fc` |
 | Complete matching Root11 Windows ASan qualification | 30/30 PASS after complete corrected rebuild |
 | Complete matching Root11 macOS TSan qualification | 25/30 PASS with qualified corrected runtime; same five publication gates |
-| Actual Linux XFS/Btrfs runtime qualification | Failing: XFS 18/35, Btrfs 16/35; mount-ancestry and provider gates remain |
+| Ordinary metadata on actual ext4/XFS/Btrfs | PASS, 517 native checks per filesystem; complete scope remains unavailable |
+| Actual Linux XFS/Btrfs whole SDK qualification | Failing: XFS 20/35, Btrfs 18/35; mount-ancestry gates remain |
 
 The initial Windows ASan attempt omitted C++ exception-unwind support. It was
 replaced by a complete matching rebuild with `/EHsc`, `/GR` and `/MD`. Both
@@ -156,7 +157,19 @@ loop devices detached successfully; unrelated devices were untouched.
 
 XFS passed 18/35 tests and Btrfs passed 16/35. Journal-root preparation refuses
 mount crossings because namespace parent traversal alone cannot establish
-physical ancestor coverage. Ordinary metadata also retains an ext4-only
-provider gate; Btrfs session ancestry has an additional ambiguity refusal.
-These are failing positive qualifications. The guards remain mandatory while
-native mount-root evidence and provider semantics are implemented and tested.
+physical ancestor coverage. Btrfs session ancestry has an additional ambiguity
+refusal. These are failing positive qualifications; their guards remain
+mandatory while native mount-root evidence is implemented and tested.
+
+The subsequent narrow Ordinary metadata increment passed 517 native checks
+each on ext4, XFS and Btrfs, as the same ordinary UID with zero capabilities.
+It retains actual held-descriptor identity, access, owner, ACL, xattr and
+storage-policy checks. Only ext4 extent/directory-index representation and
+XFS's attribute-fork representation are accepted. Compression, NOCOW, DAX,
+inheritance, project/extent/COW policies and unknown bits remain refused.
+Complete/birthtime preservation is not newly qualified.
+
+With that increment, ext4 passed all 35 SDK suites; XFS passed 20/35 and Btrfs
+18/35. The independent default policy audit adds 282 checks. Its pass is
+separate from the native capability-bearing fixture results and cannot stand
+in for whole-filesystem qualification.

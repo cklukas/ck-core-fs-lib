@@ -45,6 +45,7 @@
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <linux/magic.h>
+#include "linux_ordinary_metadata.hpp"
 #include <linux/fs.h>
 #include <linux/capability.h>
 #if __has_include(<linux/fscrypt.h>)
@@ -650,7 +651,10 @@ public:
         OwnedDescriptor readable(-1);
 #if defined(__linux__)
         struct statfs filesystem{};
-        if (fstatfs(descriptor_.get(), &filesystem) != 0 || filesystem.f_type != EXT4_SUPER_MAGIC)
+        if (fstatfs(descriptor_.get(), &filesystem) != 0)
+            return refuse("regular_metadata.unaudited_linux_filesystem");
+        const auto provider=detail::linux_ordinary_metadata_provider(filesystem.f_type);
+        if (provider==detail::LinuxOrdinaryMetadataProvider::Unknown)
             return refuse("regular_metadata.unaudited_linux_filesystem");
         // Acquire metadata-query read rights from the verified held-fd proxy,
         // never the original basename, and without privilege/elevation.
@@ -663,14 +667,13 @@ public:
             original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino || !S_ISREG(reopened.st_mode))
             return refuse("regular_metadata.held_handle_identity");
         int flags = 0;
-        // EXTENTS is an ordinary ext4 representation, not replayable policy.
-        // All other flags, including unknown bits, require separate review.
+        // Provider-specific representation bits are distinct from policy.
         if (ioctl(readable.get(), FS_IOC_GETFLAGS, &flags) != 0 ||
-            (static_cast<unsigned>(flags) & ~static_cast<unsigned>(FS_EXTENT_FL)) != 0)
+            !detail::linux_ordinary_inode_flags(provider,static_cast<std::uint32_t>(flags)))
             return refuse("regular_metadata.inode_flags");
         struct fsxattr extended{};
-        if (ioctl(readable.get(), FS_IOC_FSGETXATTR, &extended) != 0 || extended.fsx_xflags != 0 ||
-            extended.fsx_projid != 0 || extended.fsx_extsize != 0 || extended.fsx_cowextsize != 0)
+        if (ioctl(readable.get(), FS_IOC_FSGETXATTR, &extended) != 0 ||
+            !detail::linux_ordinary_storage_policy(provider,extended))
             return refuse("regular_metadata.project_storage_policy");
         const auto names = flistxattr(readable.get(), nullptr, 0);
 #else
@@ -765,7 +768,12 @@ public:
         OwnedDescriptor readable(-1);
 #if defined(__linux__)
         struct statfs filesystem{};
-        if (fstatfs(descriptor_.get(), &filesystem) != 0 || filesystem.f_type != EXT4_SUPER_MAGIC)
+        if (fstatfs(descriptor_.get(), &filesystem) != 0)
+            return refuse("regular_metadata.unaudited_linux_filesystem");
+        const auto provider=detail::linux_ordinary_metadata_provider(filesystem.f_type);
+        if (provider==detail::LinuxOrdinaryMetadataProvider::Unknown ||
+            (policy.scope!=RegularMetadataScope::OrdinaryCallerVisibleV1 &&
+             provider!=detail::LinuxOrdinaryMetadataProvider::Ext4))
             return refuse("regular_metadata.unaudited_linux_filesystem");
         // Acquire metadata-query read rights from the verified held-fd proxy,
         // never the original basename, and without privilege/elevation.
@@ -778,14 +786,13 @@ public:
             original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino || !S_ISREG(reopened.st_mode))
             return refuse("regular_metadata.held_handle_identity");
         int flags = 0;
-        // EXTENTS is an ordinary ext4 representation, not replayable policy.
-        // All other flags, including unknown bits, require separate review.
+        // Provider-specific representation bits are distinct from policy.
         if (ioctl(readable.get(), FS_IOC_GETFLAGS, &flags) != 0 ||
-            (static_cast<unsigned>(flags) & ~static_cast<unsigned>(FS_EXTENT_FL)) != 0)
+            !detail::linux_ordinary_inode_flags(provider,static_cast<std::uint32_t>(flags)))
             return refuse("regular_metadata.inode_flags");
         struct fsxattr extended{};
-        if (ioctl(readable.get(), FS_IOC_FSGETXATTR, &extended) != 0 || extended.fsx_xflags != 0 ||
-            extended.fsx_projid != 0 || extended.fsx_extsize != 0 || extended.fsx_cowextsize != 0)
+        if (ioctl(readable.get(), FS_IOC_FSGETXATTR, &extended) != 0 ||
+            !detail::linux_ordinary_storage_policy(provider,extended))
             return refuse("regular_metadata.project_storage_policy");
 
 #else
