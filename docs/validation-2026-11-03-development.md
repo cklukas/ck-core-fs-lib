@@ -183,6 +183,18 @@ prefix existed, and the copied runtime and protected source SDK retained their
 SHA-256 identities. These packaging checks reuse the previously qualified Linux
 runtime; they do not qualify subsequent native-execution changes.
 
+## Consumed-close checks before baseline commit
+
+The Linux pre-CAS regression now identifies actual live descriptor cohorts,
+proves which held source and query owners close, and consumes each injected
+close before returning `EIO`. It no longer depends on compiler return addresses.
+The qualified normal cohort passed its query-FD, held-child-FD and directory
+close cases, recovery checks and no-retry assertions. The same fixture also
+passed after compiling it at `-O2 -g0 -UNDEBUG` with strict GCC 14 warnings,
+linked against the unchanged normal `-O0` SDK. This is an optimized-fixture
+check, not qualification of an optimized product build. CTest now registers
+`native_sync_resolution_posix_close` on Linux.
+
 ## Remaining gates
 
 - Integrate and qualify postorder directory metadata replay and bounded

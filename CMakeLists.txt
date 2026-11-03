@@ -508,6 +508,13 @@ if(BUILD_TESTING)
     add_test(NAME native_sync_resolution COMMAND ck_fs_native_sync_resolution_tests)
     set_tests_properties(native_sync_resolution PROPERTIES TIMEOUT 180
       ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    add_executable(ck_fs_native_sync_resolution_posix_close_tests tests/native_sync_resolution_posix_close_tests.cpp)
+    target_link_libraries(ck_fs_native_sync_resolution_posix_close_tests PRIVATE ck_core_fs_native ${CMAKE_DL_LIBS})
+    target_compile_options(ck_fs_native_sync_resolution_posix_close_tests PRIVATE -UNDEBUG)
+    add_test(NAME native_sync_resolution_posix_close COMMAND ck_fs_native_sync_resolution_posix_close_tests)
+    set_tests_properties(native_sync_resolution_posix_close PROPERTIES TIMEOUT 180
+      LABELS "linux;native;finalization"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
     add_executable(ck_fs_native_sync_resolution_c_tests tests/native_sync_resolution_c_tests.c)
     target_link_libraries(ck_fs_native_sync_resolution_c_tests PRIVATE ck_file_engine_c)
     target_compile_options(ck_fs_native_sync_resolution_c_tests PRIVATE -UNDEBUG)

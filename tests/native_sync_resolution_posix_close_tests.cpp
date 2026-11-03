@@ -11,74 +11,122 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <sys/syscall.h>
+#include <array>
+#include <climits>
+#include <cstdarg>
 
 #ifndef __linux__
 #error This native injected-consumed-close qualification requires Linux.
 #endif
 namespace close_watch {
 enum class Mode { None, Query, HeldChild, Directory };
+struct Fds {
+    std::array<int,64> values{};unsigned size=0;
+    bool contains(int fd)const{for(unsigned i=0;i<size;++i)if(values[i]==fd)return true;return false;}
+    void add(int fd){CHECK(size<values.size()&&!contains(fd));values[size++]=fd;}
+};
 thread_local Mode mode=Mode::None;
 thread_local dev_t device=0;
 thread_local ino_t file_inode=0,directory_inode=0;
-thread_local bool calibrate_query=false,calibrate_held=false,armed=false,saw_query=false;
-thread_local void* query_site=nullptr;
-thread_local void* held_site=nullptr;
-thread_local unsigned query_calibrations=0,held_calibrations=0,hits=0,consumed_calls=0;
-thread_local int consumed=-1;
-thread_local bool retried=false;
+thread_local bool armed=false,tracking=false,acquiring=false,ordered=false,invalid_acquisition=false;
+thread_local Fds files,directories;
+thread_local int query_fd=-1,held_fd=-1,consumed=-1;
+thread_local DIR* consumed_directory=nullptr;
+thread_local unsigned file_closes=0,hits=0,consumed_calls=0;
+thread_local bool retried=false,closed_once=false;
 bool file(const struct stat& s){return s.st_dev==device&&s.st_ino==file_inode&&S_ISREG(s.st_mode);}
-int close_at(int fd,void* site) {
-    struct stat s{};const bool selected=fstat(fd,&s)==0&&file(s);
-    if(selected&&site==query_site)saw_query=true;
-    const bool inject=selected&&armed&&((mode==Mode::Query&&site==query_site)||
-        (mode==Mode::HeldChild&&saw_query&&site==held_site));
-    if(selected&&armed&&fd==consumed)retried=true;
+Fds snapshot(bool regular) {
+    // Real current descriptors, not return addresses, symbol names or a guessed
+    // descriptor-number ordering. The proc cursor is unrelated to our fixture.
+    Fds out;DIR* proc=opendir("/proc/self/fd");CHECK(proc);
+    int read_error=0;for(;;) {
+        errno=0;auto* entry=readdir(proc);if(!entry){read_error=errno;break;}
+        char* end=nullptr;const long number=strtol(entry->d_name,&end,10);
+        if(end==entry->d_name||*end||number<0||number>INT_MAX)continue;
+        struct stat s{};const int fd=static_cast<int>(number);
+        if(fstat(fd,&s)!=0)continue;
+        if(regular?file(s):(s.st_dev==device&&s.st_ino==directory_inode&&S_ISDIR(s.st_mode)))out.add(fd);
+    }
+    CHECK(closedir(proc)==0);CHECK(read_error==0);return out;
+}
+void reset(){armed=tracking=acquiring=ordered=invalid_acquisition=false;mode=Mode::None;files={};directories={};query_fd=held_fd=consumed=-1;consumed_directory=nullptr;file_closes=hits=consumed_calls=0;retried=closed_once=false;}
+void acquired(int fd,int flags)noexcept {
+    if(!acquiring||fd<0||files.size==2)return;
+    struct stat s{};if(fstat(fd,&s)!=0||!file(s))return;
+    // Native observer opens HeldChild, THEN its independent native_source.
+    // qualify_owners below proves that assignment with actual independent
+    // closes and live-owner checks; a changed acquisition contract fails.
+    if((flags&O_ACCMODE)!=O_RDONLY||(flags&O_PATH)||files.contains(fd))invalid_acquisition=true;
+    files.values[files.size++]=fd;
+    if(files.size==2){held_fd=files.values[0];query_fd=files.values[1];acquiring=false;}
+}
+int opened_at(int parent,const char* path,int flags,mode_t permissions) {
+    const int fd=static_cast<int>(syscall(SYS_openat,parent,path,flags,permissions));const int saved=errno;
+    acquired(fd,flags);errno=saved;return fd;
+}
+int close_file(int fd) {
+    if(tracking&&fd==consumed){retried=true;++consumed_calls;}
+    struct stat s{};const bool selected=tracking&&files.contains(fd)&&fstat(fd,&s)==0&&file(s);
+    if(selected&&ordered) {
+        if(file_closes==0)query_fd=fd;
+        else if(file_closes==1)held_fd=fd;
+    }
+    const bool inject=selected&&armed&&((mode==Mode::Query&&fd==query_fd&&file_closes==0)||
+        (mode==Mode::HeldChild&&fd==held_fd&&file_closes==1&&query_fd!=held_fd));
     const auto result=static_cast<int>(syscall(SYS_close,fd));const int saved=errno;
-    if(selected&&result==0) {
-        if(calibrate_query){query_site=site;++query_calibrations;}
-        if(calibrate_held){held_site=site;++held_calibrations;}
-        if(inject){armed=false;consumed=fd;++hits;++consumed_calls;errno=EIO;return -1;}
+    if(selected&&result==0){++file_closes;
+        if(inject){armed=false;consumed=fd;++hits;consumed_calls=1;
+            closed_once=fcntl(fd,F_GETFD)==-1&&errno==EBADF;errno=EIO;return -1;}
     }
     errno=saved;return result;
 }
 int close_directory(DIR* directory) {
-    using Fn=int(*)(DIR*);
-    static const auto real=std::bit_cast<Fn>(dlsym(RTLD_NEXT,"closedir"));
-    if(!real)std::abort();
+    if(tracking&&directory==consumed_directory){retried=true;++consumed_calls;errno=EBADF;return -1;}
+    using Fn=int(*)(DIR*);static const auto real=std::bit_cast<Fn>(dlsym(RTLD_NEXT,"closedir"));if(!real)std::abort();
     const int fd=dirfd(directory);struct stat s{};
-    const bool selected=fstat(fd,&s)==0&&s.st_dev==device&&s.st_ino==directory_inode;
-    const bool inject=selected&&armed&&saw_query&&mode==Mode::Directory;
+    const bool selected=tracking&&directories.contains(fd)&&fstat(fd,&s)==0&&s.st_dev==device&&s.st_ino==directory_inode&&S_ISDIR(s.st_mode);
+    const bool inject=selected&&armed&&mode==Mode::Directory&&file_closes==2&&query_fd!=held_fd;
     const int result=real(directory);const int saved=errno;
-    if(inject&&result==0){armed=false;consumed=fd;++hits;++consumed_calls;errno=EIO;return -1;}
+    if(inject&&result==0){armed=false;consumed=fd;consumed_directory=directory;++hits;consumed_calls=1;
+        closed_once=fcntl(fd,F_GETFD)==-1&&errno==EBADF;errno=EIO;return -1;}
     errno=saved;return result;
 }
-void reset(){armed=false;mode=Mode::None;saw_query=false;hits=consumed_calls=0;consumed=-1;retried=false;}
+void before_commit(Mode selected) {
+    reset();files=snapshot(true);directories=snapshot(false);CHECK(files.size==2&&directories.size>0);
+    for(unsigned i=0;i<files.size;++i){const int flags=fcntl(files.values[i],F_GETFL);CHECK(flags>=0&&(flags&O_ACCMODE)==O_RDONLY&&!(flags&O_PATH));const int fd_flags=fcntl(files.values[i],F_GETFD);CHECK(fd_flags>=0&&(fd_flags&FD_CLOEXEC));}
+    // fresh() replaces this exact inventory: its drain closes native_source
+    // first, then HeldChild, then DIR. New scan/transient FDs are NOT selected.
+    mode=selected;tracking=ordered=armed=true;
 }
-extern "C" int close(int fd){return close_watch::close_at(fd,__builtin_extract_return_addr(__builtin_return_address(0)));}
+const char* operation(Mode selected){return selected==Mode::Query?"metadata_capture.source_close":selected==Mode::HeldChild?"metadata_capture.temporary_close":"metadata_capture.temporary_closedir";}
+}
+extern "C" int close(int fd){return close_watch::close_file(fd);}
 extern "C" int closedir(DIR* directory){return close_watch::close_directory(directory);}
+extern "C" int openat(int parent,const char* path,int flags,...) {
+    mode_t permissions=0;if((flags&O_CREAT)||((flags&O_TMPFILE)==O_TMPFILE)){va_list args;va_start(args,flags);permissions=va_arg(args,mode_t);va_end(args);}
+    return close_watch::opened_at(parent,path,flags,permissions);
+}
+extern "C" int openat64(int parent,const char* path,int flags,...) {
+    mode_t permissions=0;if((flags&O_CREAT)||((flags&O_TMPFILE)==O_TMPFILE)){va_list args;va_start(args,flags);permissions=va_arg(args,mode_t);va_end(args);}
+    return close_watch::opened_at(parent,path,flags,permissions);
+}
 namespace {
-void calibrate(Fixture& f) {
-    using namespace close_watch;
+void qualify_owners(Fixture& f) {
+    using namespace close_watch;reset();
     struct stat s{};CHECK(lstat((f.root/"left"/"a").c_str(),&s)==0);device=s.st_dev;file_inode=s.st_ino;
     CHECK(lstat((f.root/"left").c_str(),&s)==0);directory_inode=s.st_ino;
-    NativeFileSystem filesystem;
-    auto parent=std::shared_ptr<const DirectoryCursor>(get(filesystem.open_native_directory(f.native("left"))));
-    const auto access=EntryAccess::ContentRead|EntryAccess::MetadataAndAttributes|EntryAccess::MetadataAndSecurity;
-    auto original=std::shared_ptr<const OpenedEntry>(get(parent->open_child(name("a"),access)));
-    MetadataCaptureLimits limits;limits.read={4096};
-    auto capture=get(MetadataCaptureJob::begin(original,f.request().metadata,limits));
-    for(unsigned i=0;i<10000&&capture->progress().phase!=MetadataCapturePhase::Complete;++i)get(capture->advance());
-    auto proof=get(capture->result());
-    query_calibrations=0;calibrate_query=true;CHECK(get(proof->finish_io()));calibrate_query=false;
-    CHECK(query_calibrations==1&&query_site);
-    CHECK(original->inspect_basic().value()&&parent->inspect_basic().value());
-    CHECK(get(proof->finish_io())&&get(capture->finish_io()));CHECK(query_calibrations==1);
-    auto held=get(HeldChild::observe_with_access(parent,name("a"),access));
-    held_calibrations=0;calibrate_held=true;held.reset();calibrate_held=false;
-    CHECK(held_calibrations==1&&held_site&&held_site!=query_site);
-    CHECK(original->inspect_basic().value()&&parent->inspect_basic().value());
-    // Both sites come from REAL native owners; no guessed hidden ELF symbols.
-    reset();
+    NativeFileSystem filesystem;auto parent=std::shared_ptr<const DirectoryCursor>(get(filesystem.open_native_directory(f.native("left"))));
+    CHECK(snapshot(true).size==0);tracking=acquiring=true;
+    NativeSyncProofBudget budget;auto proof=get(observe_native_sync_file(parent,name("a"),f.request().metadata,NativeSyncProofLimits{},budget));
+    CHECK(!acquiring&&!invalid_acquisition&&files.size==2&&query_fd>=0&&held_fd>=0&&query_fd!=held_fd&&file_closes==0);
+    const auto current=snapshot(true);CHECK(current.size==2&&current.contains(query_fd)&&current.contains(held_fd));
+    for(int fd:{query_fd,held_fd}){struct stat owner{};CHECK(fstat(fd,&owner)==0&&file(owner));}
+    detail::finish_native_metadata_capture(proof.native_source.get(),proof.metadata);
+    CHECK(file_closes==1&&fcntl(query_fd,F_GETFD)==-1&&errno==EBADF);
+    CHECK(proof.held->inspect_basic().value()&&parent->inspect_basic().value());
+    detail::finish_native_metadata_capture(proof.native_source.get(),proof.metadata);CHECK(file_closes==1);
+    proof.held.reset();CHECK(file_closes==2&&fcntl(held_fd,F_GETFD)==-1&&errno==EBADF);
+    CHECK(snapshot(true).size==0&&parent->inspect_basic().value());reset();
 }
 std::string baseline_bytes(const Fixture& f) {
     std::string bytes;unsigned found=0;
@@ -95,21 +143,22 @@ unsigned publication_journals(const Fixture& f) {
 }
 void injected_commit(close_watch::Mode mode) {
     using namespace close_watch;
-    Fixture f;f.seed();calibrate(f);f.conflict();const auto before=baseline_bytes(f);
+    Fixture f;f.seed();qualify_owners(f);f.conflict();const auto before=baseline_bytes(f);
     auto request=f.request();request.before_event=[mode](auto event){
-        if(event==NativeSyncCoordinatorEvent::BeforeBaselineCommit){reset();close_watch::mode=mode;armed=true;}
+        if(event==NativeSyncCoordinatorEvent::BeforeBaselineCommit)before_commit(mode);
         return true;
     };
     auto job=get(NativeSyncResolution::open(std::move(request)));auto review=get(job->assess(choice()));CHECK(get(job->approve(*review)));
     for(unsigned i=0;i<3000&&job->result().state!=NativeSyncCoordinatorState::NeedsReview&&job->result().state!=NativeSyncCoordinatorState::Complete;++i)job->advance();
-    armed=false;
-    CHECK(hits==1&&consumed_calls==1&&!retried);
+    armed=false;tracking=false;
+    CHECK(hits==1&&consumed_calls==1&&!retried&&closed_once);
+    CHECK(query_fd>=0&&held_fd>=0&&query_fd!=held_fd);
     CHECK(job->result().state==NativeSyncCoordinatorState::NeedsReview&&job->result().completed_operations==4);
     CHECK(job->snapshot().generation==1&&baseline_bytes(f)==before&&publication_journals(f)==4);
-    CHECK(job->result().failure&&job->result().failure->error.domain==ErrorDomain::Posix&&job->result().failure->error.code==EIO);
-    auto closed=job->finish_io();CHECK(!closed.value()&&closed.unavailable_detail()->error.code==EIO);
-    const auto count=consumed_calls;closed=job->finish_io();CHECK(!closed.value()&&consumed_calls==count);
-    job.reset();reset();
+    CHECK(job->result().failure&&job->result().failure->error.domain==ErrorDomain::Posix&&job->result().failure->error.code==EIO&&job->result().failure->error.operation==operation(mode));
+    tracking=true;auto closed=job->finish_io();CHECK(!closed.value()&&closed.unavailable_detail()->error.code==EIO);
+    const auto count=consumed_calls;closed=job->finish_io();CHECK(!closed.value()&&consumed_calls==count&&!retried);
+    job.reset();CHECK(consumed_calls==count&&!retried);reset();
     job=get(NativeSyncResolution::open(f.request()));
     CHECK(job->snapshot().generation==2&&job->rows().size()==3&&job->protected_originals().size()==2);
     CHECK(job->result().completed_operations==0&&publication_journals(f)==4);CHECK(get(job->finish_io()));job.reset();
@@ -118,14 +167,15 @@ void injected_commit(close_watch::Mode mode) {
 }
 void injected_recovery() {
     using namespace close_watch;
-    Fixture f;f.seed();calibrate(f);f.conflict();auto request=f.request();
+    Fixture f;f.seed();qualify_owners(f);f.conflict();auto request=f.request();
     request.before_event=[](auto event){return event!=NativeSyncCoordinatorEvent::BeforeBaselineCommit;};
     auto job=get(NativeSyncResolution::open(std::move(request)));auto review=get(job->assess(choice()));CHECK(get(job->approve(*review)));
     for(unsigned i=0;i<3000&&job->result().state!=NativeSyncCoordinatorState::NeedsReview;++i)job->advance();
     CHECK(job->snapshot().generation==1&&publication_journals(f)==4);CHECK(get(job->finish_io()));job.reset();
-    const auto before=baseline_bytes(f);reset();mode=Mode::Query;armed=true;
-    auto failed=NativeSyncResolution::open(f.request());armed=false;
-    CHECK(!failed.value()&&hits==1&&consumed_calls==1&&failed.unavailable_detail()->error.domain==ErrorDomain::Posix&&failed.unavailable_detail()->error.code==EIO);
+    const auto before=baseline_bytes(f);reset();mode=Mode::Query;tracking=acquiring=armed=true;
+    auto failed=NativeSyncResolution::open(f.request());armed=false;tracking=false;
+    CHECK(!failed.value()&&hits==1&&consumed_calls==1&&failed.unavailable_detail()->error.domain==ErrorDomain::Posix&&failed.unavailable_detail()->error.code==EIO&&failed.unavailable_detail()->error.operation==operation(Mode::Query));
+    CHECK(!acquiring&&!invalid_acquisition&&files.size==2&&query_fd!=held_fd&&closed_once&&!retried);
     CHECK(baseline_bytes(f)==before&&publication_journals(f)==4);reset();
     job=get(NativeSyncResolution::open(f.request()));CHECK(job->snapshot().generation==2&&job->rows().size()==3);
     CHECK(job->result().completed_operations==0&&publication_journals(f)==4);CHECK(get(job->finish_io()));
