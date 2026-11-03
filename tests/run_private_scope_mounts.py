@@ -1,8 +1,10 @@
-"""Qualify private-Root mount aliases inside an unprivileged Linux namespace.
+"""Qualify private-Root mount aliases under the ordinary caller's host identity.
 
 Exit 77 means UNQUALIFIED, never PASS. CTest must not turn that into success;
-required qualification runners need working unprivileged namespaces/OverlayFS.
-No sysctl, privilege escalation, or host mount changes are attempted.
+required runners need isolated namespaces/OverlayFS. The default bootstrap is
+unprivileged. CI may explicitly select privileged-id-map: a dedicated parent
+maps only its own child back to the caller's host UID/GID before the test runs.
+No sysctl, host security policy, or host mount changes are attempted.
 """
 from pathlib import Path
 import os
@@ -24,13 +26,14 @@ def namespace_id(name):
 
 def main():
     if len(sys.argv) != 3:
-        print("usage: run_private_scope_mounts.py BINARY ABSOLUTE_SCRATCH_ROOT", file=sys.stderr)
+        print("usage: run_private_scope_mounts.py BINARY|--probe ABSOLUTE_SCRATCH_ROOT", file=sys.stderr)
         return 1
     if sys.platform != "linux":
         return unqualified("Linux user/mount namespaces are required")
-    if os.geteuid() == 0:
+    if os.geteuid() == 0 or os.getuid() != os.geteuid() or os.getgid() != os.getegid():
         return unqualified("run as an ordinary host user; host root is not unprivileged qualification")
-    executable = Path(sys.argv[1]).absolute()
+    probe_only = sys.argv[1] == "--probe"
+    executable = Path("/bin/true" if probe_only else sys.argv[1]).absolute()
     parent = Path(sys.argv[2])
     if not parent.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
         print("FAIL private_scope_mounts: executable and absolute scratch root are required", file=sys.stderr)
@@ -38,6 +41,15 @@ def main():
     unshare = shutil.which("unshare")
     if not unshare or not Path("/bin/true").is_file():
         return unqualified("unshare or /bin/true is unavailable")
+    mode = os.environ.get("CK_FS_NAMESPACE_BOOTSTRAP", "unprivileged")
+    if mode not in ("unprivileged", "privileged-id-map"):
+        print("FAIL private_scope_mounts: unknown explicit bootstrap mode", file=sys.stderr)
+        return 1
+    if mode == "privileged-id-map":
+        sudo = shutil.which("sudo")
+        helper = Path(__file__).resolve().with_name("bootstrap_private_scope_namespace.py")
+        if not sudo or not helper.is_file() or not Path("/usr/bin/python3").is_file():
+            return unqualified("explicit identity-map bootstrap prerequisites are unavailable")
     try:
         original_user, original_mount = namespace_id("user"), namespace_id("mnt")
     except OSError as error:
@@ -50,14 +62,23 @@ def main():
             return unqualified("scratch pathname contains an OverlayFS option separator")
         environment = dict(os.environ, TMPDIR=scratch, TEMP=scratch, TMP=scratch,
                            PYTHONDONTWRITEBYTECODE="1")
-        isolate = [unshare, "--user", "--map-root-user", "--mount", "--propagation", "private"]
+        if mode == "unprivileged":
+            isolate = [unshare, "--user", "--map-root-user", "--mount", "--propagation", "private"]
+        else:
+            isolate = [sudo, "-n", "--preserve-env=TMPDIR,TEMP,TMP,ASAN_OPTIONS,UBSAN_OPTIONS,TSAN_OPTIONS",
+                       "/usr/bin/python3", "-I", str(helper), str(os.getuid()), str(os.getgid()),
+                       original_user, original_mount, str(os.getpid())]
         try:
             probe = subprocess.run(isolate + ["/bin/true"], env=environment,
                                    capture_output=True, text=True, timeout=15)
             if probe.returncode:
                 return unqualified(f"isolated namespace creation refused: {probe.stderr.strip()}")
+            if probe_only:
+                print(f"PASS namespace bootstrap: mode={mode}; native tests have not run", flush=True)
+                return 0
             result = subprocess.run(isolate + [str(executable), "--isolated", scratch,
-                                              original_user, original_mount], env=environment,
+                                              original_user, original_mount, str(os.getuid()),
+                                              str(os.getgid()), mode], env=environment,
                                     capture_output=True, text=True, timeout=150)
         except (OSError, subprocess.TimeoutExpired) as error:
             print(f"FAIL private_scope_mounts: {error}", file=sys.stderr)

@@ -58,3 +58,26 @@ unoptimized timeout failures remain recorded and are not claimed to pass.
 No final release tag or frontend dependency pin is established by this
 checkpoint. Platform qualification and the existing publication/preservation
 gates remain mandatory.
+
+## Isolated Linux mount fixture
+
+The initial GitHub Linux runs passed 33 of 34 native tests. The remaining
+fixture could not write its UID mapping under the hosted runner's namespace
+policy. This is an unqualified fixture result, not a product pass or a skipped
+test.
+
+The fixture now supports an explicitly selected `privileged-id-map` bootstrap.
+Its privileged parent maps only its own waiting child to the ordinary caller's
+host UID/GID. The child clears supplementary groups, drops the host identity,
+creates a private mount namespace, sets no-new-privileges and executes the
+native test. Before native operations, the test verifies both namespace
+identities, all real/effective IDs and the exact one-row UID/GID maps. The
+parent uses PID handles to terminate its own payload on caller exit or timeout.
+No host mounts or host security settings change. The default bootstrap remains
+unprivileged; neither mode turns an unavailable fixture into success.
+
+Both complete native mount matrices passed against the frozen Root11 GCC 14
+implementation on Linux. Invalid modes, host-root execution and zero-host-UID
+mapping were rejected. Caller-exit cancellation also terminated the isolated
+payload. GitHub CI selects the explicit bootstrap and checks its prerequisites
+before compiling; its subsequent full qualification results remain required.

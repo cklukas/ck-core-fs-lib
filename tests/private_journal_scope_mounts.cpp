@@ -9,10 +9,12 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -52,6 +54,22 @@ std::string namespace_id(const char* path) {
     struct stat value{};
     if (::stat(path, &value)) throw Unqualified(std::string("namespace identity unavailable: ") + path);
     return std::to_string(value.st_dev) + ":" + std::to_string(value.st_ino);
+}
+void require_mapping(const char* path, const char* expected_text) {
+    std::size_t consumed=0;
+    const auto expected=std::stoull(expected_text,&consumed);
+    require(consumed==std::strlen(expected_text)&&expected>0&&expected<UINT32_MAX,
+        "ordinary host identity required");
+    std::ifstream input(path);
+    require(input.is_open(),"namespace mapping handle unavailable");
+    std::uint64_t inner=0,outer=0,count=0;
+    std::string trailing;
+    require(bool(input>>inner>>outer>>count)&&inner==0&&outer==expected&&count==1&&
+        !(input>>trailing)&&input.eof()&&!input.bad(),
+        "namespace must map only uid/gid 0 to the exact ordinary host caller");
+    input.clear();
+    input.close();
+    require(!input.fail(),"namespace mapping handle close failed");
 }
 class Mounts {
 public:
@@ -283,10 +301,18 @@ int run(const NativeAbsolutePath& scratch) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
-        require(argc == 5 && std::string(argv[1]) == "--isolated", "use run_private_scope_mounts.py");
+        require(argc == 8 && std::string(argv[1]) == "--isolated", "use run_private_scope_mounts.py");
         if (namespace_id("/proc/self/ns/user") == argv[3] || namespace_id("/proc/self/ns/mnt") == argv[4])
             throw Unqualified("both a new user namespace and a new mount namespace are required");
-        if (::geteuid() != 0) throw Unqualified("namespace uid mapping did not provide namespace-local uid 0");
+        if (::getuid()!=0 || ::geteuid()!=0 || ::getgid()!=0 || ::getegid()!=0)
+            throw Unqualified("namespace mapping did not provide namespace-local real/effective uid/gid 0");
+        require_mapping("/proc/self/uid_map",argv[5]);
+        require_mapping("/proc/self/gid_map",argv[6]);
+        const std::string mode=argv[7];
+        require(mode=="unprivileged"||mode=="privileged-id-map","unknown namespace bootstrap mode");
+        if(mode=="privileged-id-map")
+            require(::getgroups(0,nullptr)==0&&::prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==1,
+                "privileged bootstrap must clear supplementary groups and prohibit new privileges");
         std::puts("PRIVATE_SCOPE_MOUNTS_STARTED");
         return run(take(NativeAbsolutePath::from_posix(argv[2]), "scratch address"));
     } catch (const Unqualified& error) {
