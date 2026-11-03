@@ -36,3 +36,13 @@ there is one filesystem implementation and one set of platform safety behavior.
 
 Prefer the C ABI for a language or process boundary. Use the C++ targets only
 when the consumer can follow the library's C++ toolchain and ABI policy.
+
+`metadata_ownership_digest.hpp` provides a pure comparison key for known
+ownership observations. POSIX keys include uid/gid; Windows keys include the
+exact requested owner/group SIDs, independent of self-relative descriptor
+packing or Access/Full query format. Unknown or unrequested ownership is
+refused, and inconsistent descriptor observations remain Changed. This key
+supports equality checks when a CurrentCaller preservation policy omits actual
+owners from its cross-object metadata digest. It authenticates no native issuer
+and grants no replay or mutation authority; native producers must qualify their
+snapshots separately.

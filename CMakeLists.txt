@@ -96,6 +96,7 @@ target_sources(ck_core_fs_engine PRIVATE
   src/files/conflict_rules.cpp
   src/files/sync_baseline.cpp
   src/files/metadata_replay.cpp
+  src/files/metadata_ownership_digest.cpp
   src/files/sync_session.cpp)
 target_sources(ck_core_fs_engine PRIVATE src/files/native_trash.cpp)
 target_compile_definitions(ck_core_fs_engine PRIVATE CK_FS_POLICY_STATIC)
@@ -244,7 +245,7 @@ if(BUILD_TESTING)
   add_executable(ck_fs_sync_baseline_tests tests/sync_baseline_tests.cpp)
   target_link_libraries(ck_fs_sync_baseline_tests PRIVATE ck_core_fs_engine)
   add_test(NAME sync_baseline COMMAND ck_fs_sync_baseline_tests)
-  foreach(suite io_finalization recovery_evidence)
+  foreach(suite io_finalization recovery_evidence metadata_ownership_digest)
     add_executable(ck_fs_${suite}_tests tests/${suite}_tests.cpp)
     target_link_libraries(ck_fs_${suite}_tests PRIVATE ck_core_fs_engine)
     if(MSVC)
