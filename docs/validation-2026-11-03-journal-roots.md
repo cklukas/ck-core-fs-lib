@@ -25,7 +25,7 @@ ancestry correction. Existing 0.3 Actions remain unchanged in this increment.
 | Required committed Linux normal/ASan/UBSan/TSan CI | PASS at `e05a8fc` |
 | Complete matching Root11 Windows ASan qualification | 30/30 PASS after complete corrected rebuild |
 | Complete matching Root11 macOS TSan qualification | 25/30 PASS with qualified corrected runtime; same five publication gates |
-| Actual Linux XFS/Btrfs runtime qualification | Pending |
+| Actual Linux XFS/Btrfs runtime qualification | Failing: XFS 18/35, Btrfs 16/35; mount-ancestry and provider gates remain |
 
 The initial Windows ASan attempt omitted C++ exception-unwind support. It was
 replaced by a complete matching rebuild with `/EHsc`, `/GR` and `/MD`. Both
@@ -115,6 +115,31 @@ wrapper. The baseline changed 12 bytes in a foreign buffer. The candidate
 SDK binds internal calls locally and hides private C++ symbols. Its actual
 GCC 14 build passed 35/35 suites and the installed C consumer; the same probe
 reported zero intercepted calls and zero foreign writes. The strict export
-audit still found five weak standard-library helpers containing private type
-arguments. That remaining packaging correction is under qualification. No
-final dependency pin or release is authorized by the candidate result.
+audit initially found five weak standard-library helpers containing private
+type arguments. Localizing private archive symbols removes those exports;
+the final SDK retains all 110 public C functions and passes the same probe,
+35/35 suites and the installed consumer. The final SDK SHA-256 is
+`973bddbe78326975853c1663357007916c1779f93f3beedaa999b27238e524f6`.
+Its relink took 0.76 seconds: all 142 object hashes and timestamps, all 719
+compile-closure inputs, and every compile command remained unchanged. This
+establishes a link-only rebuild rather than inferring freshness from duration.
+A separate export-surface test checks all public declarations and rejects
+private type names even inside standard-library template arguments.
+
+No final dependency pin or release is established by this packaging increment.
+
+## Actual XFS and Btrfs fixtures
+
+Disposable one-GiB images were formatted with xfsprogs 6.13.0 and btrfs-progs
+6.14 on Linux 7.1.4. The privileged fixture process mounted each image only in
+its private mount namespace. Every product test ran as host UID/GID 1000,
+with no supplementary groups, no capabilities and no-new-privileges. Binary
+hashes remained unchanged. Both filesystems unmounted and their exact owned
+loop devices detached successfully; unrelated devices were untouched.
+
+XFS passed 18/35 tests and Btrfs passed 16/35. Journal-root preparation refuses
+mount crossings because namespace parent traversal alone cannot establish
+physical ancestor coverage. Ordinary metadata also retains an ext4-only
+provider gate; Btrfs session ancestry has an additional ambiguity refusal.
+These are failing positive qualifications. The guards remain mandatory while
+native mount-root evidence and provider semantics are implemented and tested.

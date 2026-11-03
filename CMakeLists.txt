@@ -197,6 +197,24 @@ target_link_libraries(ck_file_engine_c PRIVATE ck_core_fs_native)
 if(WIN32)
   target_compile_definitions(ck_file_engine_c PRIVATE NOMINMAX)
 endif()
+# Each C ABI runtime owns its private C++ implementation and internal calls.
+# Public C declarations explicitly retain their default export visibility.
+foreach(_ck_private_target ck_core_fs_engine ck_files_platform ck_core_fs_native ck_file_engine_c_objects)
+  set_target_properties(${_ck_private_target} PROPERTIES
+    CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+endforeach()
+if(CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF")
+  include(CheckLinkerFlag)
+  check_linker_flag(CXX "LINKER:-Bsymbolic-functions" CK_FS_HAS_BIND_INTERNAL_FUNCTIONS)
+  check_linker_flag(CXX "LINKER:--exclude-libs,ALL" CK_FS_HAS_HIDE_PRIVATE_ARCHIVES)
+  if(NOT CK_FS_HAS_BIND_INTERNAL_FUNCTIONS)
+    message(FATAL_ERROR "ELF packaging requires local binding of internal SDK function calls")
+  endif()
+  if(NOT CK_FS_HAS_HIDE_PRIVATE_ARCHIVES)
+    message(FATAL_ERROR "ELF packaging requires hiding private archive symbols")
+  endif()
+  target_link_options(ck_file_engine_c PRIVATE "LINKER:-Bsymbolic-functions" "LINKER:--exclude-libs,ALL")
+endif()
 set_target_properties(ck_file_engine_c PROPERTIES
   OUTPUT_NAME ck-core-fs-lib
   VERSION ${PROJECT_VERSION}
@@ -209,8 +227,22 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  if(CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF")
+    add_executable(ck_fs_elf_session_interposition_tests tests/elf_session_interposition_tests.c)
+    target_include_directories(ck_fs_elf_session_interposition_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(ck_fs_elf_session_interposition_tests PRIVATE ${CMAKE_DL_LIBS})
+    set_target_properties(ck_fs_elf_session_interposition_tests PROPERTIES ENABLE_EXPORTS ON)
+    add_dependencies(ck_fs_elf_session_interposition_tests ck_file_engine_c)
+    add_test(NAME elf_session_interposition COMMAND ck_fs_elf_session_interposition_tests $<TARGET_FILE:ck_file_engine_c>)
+  endif()
   enable_testing()
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  # ELF export surface is checked independently of the interposition probe.
+  if(CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF")
+    add_test(NAME elf_export_surface COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_elf_exports.py
+      ${CMAKE_NM} $<TARGET_FILE:ck_file_engine_c> ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
   set(CK_CORE_FS_SHARED_TSAN_RUNTIME "" CACHE FILEPATH "Exact shared TSan runtime selected by qualification")
   if(CK_CORE_FS_SHARED_TSAN_RUNTIME)
     if(NOT CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF" OR NOT EXISTS "${CK_CORE_FS_SHARED_TSAN_RUNTIME}")
