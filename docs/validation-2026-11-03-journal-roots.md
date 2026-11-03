@@ -15,6 +15,7 @@ ancestry correction. Existing 0.3 Actions remain unchanged in this increment.
 | --- | --- |
 | Linux production native suite and installed C consumer | PASS |
 | CDE unchanged 70-file controller, original timeout and assertions | PASS, 27.05 seconds |
+| Rebuilt ELF SDK: 18 CDE contracts and unchanged 70-file controller | PASS, 19.02 seconds; exact SDK mapping verified |
 | Windows full native suite and installed C consumer | PASS |
 | Windows NTFS/ReFS Root, scope and private hard-link checks | PASS |
 | Windows long paths, exact UTF-16 C boundary and actual UNC refusal | PASS |
@@ -125,6 +126,22 @@ compile-closure inputs, and every compile command remained unchanged. This
 establishes a link-only rebuild rather than inferring freshness from duration.
 A separate export-surface test checks all public declarations and rejects
 private type names even inside standard-library template arguments.
+
+The CDE peer requalified all 18 consumer contracts and the unchanged 70-file
+controller against that exact SDK. The controller completed in 19.02 seconds
+with its original 30-second loops and 45-second driver deadline. Runtime maps
+confirmed the single intended SDK; source and SDK hashes remained unchanged.
+These headless tests do not load Motif, whose frozen library bytes were checked
+separately.
+
+The initial instrumented ELF probe was a C-only host that loaded the C++ SDK
+with `dlopen`. ASan initialized before the C++ exception runtime was loaded and
+could not resolve its real exception interceptor. The other 35 ASan tests and
+the export audit passed. The host now has a separately instrumented C++
+exception control and a startup dependency on that runtime, while the probe
+itself remains compiled as C. An independent, fully matching ASan/UBSan C/C++
+plugin test passes and verifies that the C++ runtime loads before `main`.
+The complete committed SDK CI rerun remains required.
 
 No final dependency pin or release is established by this packaging increment.
 

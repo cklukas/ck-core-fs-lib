@@ -19,6 +19,7 @@
 #endif
 static unsigned fake_calls;
 static unsigned char *foreign;
+extern int elf_probe_cpp_runtime_ready(void);
 #if CK_FS_ELF_TEST_INTERPOSE
 ckfss_status ckfss_session_open(const ckfss_options *options,ckfss_session **out,ckfss_error *error) {
     (void)options;++fake_calls;if(error)memset(error,0,sizeof(*error));*out=(ckfss_session*)foreign;return CKFSS_OK;
@@ -30,6 +31,7 @@ static int symbol(void *module,const char *name,void *destination,size_t size) {
 }
 int main(int argc,char **argv) {
     if(argc!=2)return 10;
+    if(!elf_probe_cpp_runtime_ready())return 16;
     foreign=calloc(1,1024*1024);if(!foreign)return 11;
 #if CK_FS_ELF_TEST_INTERPOSE
     ckfss_status (*exported)(const ckfss_options*,ckfss_session**,ckfss_error*)=NULL;
