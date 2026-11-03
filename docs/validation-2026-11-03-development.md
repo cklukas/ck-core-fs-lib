@@ -668,3 +668,42 @@ results do not qualify hierarchical mutation or the next SDK revision.
 The proposed ckgit runner remains disabled. Its observed job bind topology
 currently fails the native ancestry guard, and the installed runner lacks
 project-specific job admission. A configured workflow alone is not running CI.
+
+
+## Additive nested-path ledger, corrected Windows cohort
+
+The four-file ledger packet adds an explicit hierarchical encoding and native
+`create_hierarchy` factory. Existing flat encoding retains its 444-byte golden
+fixture and SHA-256 `f7ad55d2f5ebb97126a667c6d4d008a39a1b17309d241625a5152e8f090ae1cd`.
+The new schema bounds exact native component chains, records file/directory
+kinds, requires ancestor and retained-artifact parent closure, and rejects
+mixed schemas within one journal. Ancestor alias rejection compares the raw
+object identifier independently of optional generation, preventing a different
+generation field from disguising a self-ancestor. The original failing cases
+and corrected regression controls are retained.
+
+The corrected MSVC normal cohort passed 3,071 codec checks and 132 independent
+controls. Each of NTFS and ReFS passed 27 native storage checks, 76 exact-name
+journal/schema checks, and 76 long-path checks. The actual parent paths were
+429 and 397 UTF-16 units. Tests used genuine private Roots, native append and
+flush barriers, reload/reopen, exact unpaired UTF-16 and trailing dot/space
+names, V1/V3 coexistence, and mixed-schema refusal. Reachable localhost UNC
+storage was refused by the native driver qualification gate; it is a negative
+control, not UNC persistence support. No power-loss experiment is claimed.
+
+The clean SDK used 110 observed compile commands and took 775.98 seconds;
+the recorded Ninja timing and CPU/affinity evidence explain why its duration
+cannot be compared directly with the earlier larger Debug cohort. Corrected
+source manifest SHA-256:
+`dd39b0f4cdab6c986a9ab73edefb28e803add5aa2dc00eb9a4bb3316610ebe92`.
+Receipt SHA-256:
+`908ce39e49ea5db6d48a4052a55e42b1ad0729c7c238e8b66cef035e25d09f17`.
+
+These records describe intent. They confer no native tree execution, Session
+ownership, convergence, or baseline-CAS authority. That relay remains a separate
+integration and runtime gate. Matching final combined and sanitizer results
+remain pending.
+
+The imported ledger implementation and both permanent fixture translation units
+also passed Apple Clang C++20 syntax checks in 5.81 seconds. This is compilation
+coverage only; no Darwin native persistence or final combined SDK result follows.

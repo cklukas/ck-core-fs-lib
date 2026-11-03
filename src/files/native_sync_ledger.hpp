@@ -40,6 +40,9 @@ struct NativeSyncLedgerLimits final {
     SyncBaselineLimits baseline{};
 };
 Observation<std::vector<std::byte>> encode_native_sync_ledger(const NativeSyncLedgerEvidence&,NativeSyncLedgerLimits={});
+// Additive schema: exact bounded native chains + explicit File/Directory
+// statuses. Flat encode/create keep their original wire bytes and restrictions.
+Observation<std::vector<std::byte>> encode_native_sync_hierarchy_ledger(const NativeSyncLedgerEvidence&,NativeSyncLedgerLimits={});
 Observation<NativeSyncLedgerEvidence> decode_native_sync_ledger(std::span<const std::byte>,NativeSyncLedgerLimits={});
 struct NativeSyncLoadedLedger final {
     NativeName name;
@@ -53,6 +56,8 @@ public:
         OperationJournalId,const NativeSyncLedgerEvidence&,NativeSyncLedgerLimits={});
     static Observation<std::unique_ptr<NativeSyncLedger>> reopen(PreparedJournalRoot::Pointer,NativeName,
         OperationJournalId,NativeSyncLedgerLimits={});
+    static Observation<std::unique_ptr<NativeSyncLedger>> create_hierarchy(PreparedJournalRoot::Pointer,NativeName,
+        OperationJournalId,const NativeSyncLedgerEvidence&,NativeSyncLedgerLimits={});
     // Compatibility factories perform initial acquisition only; production
     // sessions/coordinators always pass their existing owner instead.
     static Observation<std::unique_ptr<NativeSyncLedger>> create(const NativeAbsolutePath&,NativeName,
