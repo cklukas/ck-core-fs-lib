@@ -245,6 +245,14 @@ present. Root's own final drain is tested after consumer references are released
 The NativeCopy fixture deliberately supplies a no-op metadata phase to isolate
 base-source finalization; it does not qualify metadata replay or native Move.
 
+A fresh, consistently instrumented GCC 14 ASan+UBSan cohort subsequently
+passed **36/36 focused cases in 3.99 seconds**. All 132 product and five test
+translation units were built with matching headers and instrumentation; the
+clean build took 1,016.47 seconds. No normal/old SDK objects or sanitizer
+suppressions were used. Independent clean and intentional heap-overflow controls
+verified the actual runtime and the custom allocator test boundary. This does
+not qualify a whole Tree or the later Batch/Legacy candidate.
+
 The regression fixtures are registered with CTest, including separate portable
 protocol/finalizer OOM tests that consume real native pipe handles. Linux probes
 require an explicit fixture root and inspect its actual ext4/XFS/Btrfs provider;
