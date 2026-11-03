@@ -54,6 +54,37 @@ requested stop. An unrequested cancellation fails; unavailable native errors
 still retain precedence. The expanded 103-check suite passed normal and
 matching ASan/UBSan builds with warnings treated as errors.
 
+## Subsequent focused native components
+
+These later tests use separate frozen dependency closures. They do not inherit
+the combined Windows snapshot's sanitizer results.
+
+| Component | Native normal evidence | Boundary |
+| --- | --- | --- |
+| Fresh regular-file execution source | Linux ARM64/ext4, ordinary UID: PASS in 2.64s; Windows x64/NTFS: PASS in 8.42s | Reviewed V3 metadata and main SHA, Original/CurrentCaller, two rechecks retaining the original open proof, bounded reads, cancellation and actual consumed-close faults; no target or Tree composition claim |
+| Private target stream bridge | NTFS and ReFS: 12/12 each | Genuine private targets only, independent readers opened before final security, per-handle timestamp suppression, empty streams, flush/close/allocation faults and Root latching; normal only |
+| Regular metadata worker | Linux ext4, ordinary UID: four native cases PASS | Original/CurrentCaller replay, cancellation, consumed close failure, two fresh source observations and read-free publication verification; component linkage only |
+| Directory metadata workers | Ownership-enforced macOS APFS: 1,467 checks PASS | Existing-directory proof-backed worker, bounded read/write steps and retained source proof; new POSIX directory publication remains Unsupported; no whole Tree claim |
+| Explicit metadata-loss source observation | macOS APFS, Linux ext4, Windows NTFS/ReFS: focused producer and Scanner suites PASS | Two-pass main-content SHA only; unavailable metadata remains Unknown; no implicit weaker metadata policy or replay authority |
+| Read-only hard-linked source capture | Linux: 102 checks; NTFS and ReFS: 299 each | Writable target single-link checks remain; no promotion of unavailable Complete security coverage |
+
+The regular source closure's three-file manifest is
+`b3e43c2e68b514189ba5ad5f268f25b1ed91f4c71c12c360cf5f324431759310`
+(header),
+`69f459207aee006f1b19111ae32f9e9807e6dba57d5e272207c9220039fa646f`
+(implementation), and
+`205dd7d5cbda6ccbfed59823e3370a7f970fae2979e6af229e4ab772c7621d99`
+(fixture). The explicit-loss producer/Scanner frozen manifest is
+`0da17b28cc220a63b24a27cbfa3e7186fe6a5b80e27e336572b65f54dbdcfcce`.
+
+The later coherent Windows and macOS integration runs still fail Tree receipt
+validation after publication. Passing source and metadata components therefore
+do not establish receipt-bound execution completion. The Linux mount candidate
+passed ext4 and XFS but exposed a real Btrfs identity-domain bug: statmount's
+superblock device is distinct from the held object's VFS device. Its correction
+retains and revalidates both domains separately; a fresh coherent three-filesystem
+run is required before counting that correction as qualified.
+
 ## Remaining gates
 
 - Integrate and qualify postorder directory metadata replay and bounded
