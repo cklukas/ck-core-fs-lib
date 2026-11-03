@@ -259,6 +259,18 @@ require an explicit fixture root and inspect its actual ext4/XFS/Btrfs provider;
 unknown or mismatched providers fail. Windows normal, matching sanitizers, and
 subsequent pending-batch/legacy-metadata drainage remain separate gates.
 
+## C ABI error reporting under allocation exhaustion
+
+The basic C error copier now accepts a non-owning string view. Previously an
+invalid directory argument could construct an owning C++ string inside its
+`noexcept` error handler. The Linux normal static-wrapper regression reproduced
+termination (exit 3) under persistent C++ allocation failure; the corrected
+wrapper returns `INVALID_ARGUMENT`, reset output handles and the scalar error
+without attempting a C++ allocation. The underlying frozen SDK and other
+wrapper objects retained their hashes. Its explicit C allocation remains
+fallible, with a null diagnostic pointer permitted. This focused result is not
+a final SDK or sanitizer qualification. CTest registers `c_api_error_oom`.
+
 ## Remaining gates
 
 - Integrate and qualify postorder directory metadata replay and bounded

@@ -55,7 +55,10 @@ void clear_error(ckfe_error *error) noexcept {
     std::memset(error, 0, sizeof(*error));
 }
 
-char *copy_text(const std::string &text) noexcept {
+// Error handlers also run after C++ allocation failure. A view avoids an
+// implicit owning-string construction (including MSVC Debug proxy allocation)
+// before the explicit, fallible C allocation below.
+char *copy_text(std::string_view text) noexcept {
     auto *result = static_cast<char *>(std::malloc(text.size() + 1));
     if (!result) return nullptr;
     std::memcpy(result, text.data(), text.size());
