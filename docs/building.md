@@ -38,3 +38,26 @@ success is independently established on Linux ARM64; the current macOS fixture
 is refused for opaque `com.apple.provenance` metadata. Cancellation tests using
 small files qualify only their observed cancellation/completion outcomes, not
 latency during blocked native I/O.
+
+## Native Windows Tree and security qualification
+
+Windows builds register the native Tree, independent target-reader, wide fixture
+boundary and consumed-source-close tests only on Windows. The no-op portability
+entry points in their translation units do not count as platform qualification.
+Select the actual provider with
+`-DCK_CORE_FS_METADATA_TARGET_NATIVE_FS=NTFS` or `ReFS` and set an explicit
+`CK_CORE_FS_NATIVE_TEST_ROOT` on that provider. Workstation roots must remain
+beneath `V:\tmp`, including volume-mounted ReFS fixtures.
+
+The ordinary target-reader test runs without enabling privileged security
+replay. Explicitly configure `-DCK_CORE_FS_TEST_PRIVILEGED_METADATA=ON` to register
+the Complete target-reader and Tree security cases. Those tests require genuine
+SeSecurityPrivilege; missing access is a failed qualification, never a silent
+success or automatic elevation. No system security configuration is changed.
+
+The new normal Tree test has measured unoptimized baselines of approximately
+458 seconds on NTFS and 697 seconds on ReFS. Its 1,200-second deadline and the
+600-second controls deadline are distinct from existing suite deadlines. A
+normal result does not qualify a sanitizer build. All product and consumer
+translation units must use matching headers, runtime, instrumentation and C++
+layouts; the unreleased Tree request layouts changed in this checkpoint.

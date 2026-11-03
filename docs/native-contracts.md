@@ -42,6 +42,22 @@ nonblocking query becomes true only after the worker's native resources and
 admission slot are released; no backend I/O follows it. It does not convert a
 failed operation into success or erase retained staging and recovery evidence.
 
+The unreleased native Tree execution path issues a private seal only from the
+accepted immutable review. The seal binds the comparison, metadata policy,
+operation ID and genuine held roots. Each mutation obtains a row-specific
+permit; caller-authored inventories, native IDs and display paths cannot mint
+one. Source metadata is revalidated before staging, target metadata is observed
+independently, and directories replay metadata after their children and streams.
+
+Completion evidence becomes available only after final whole-tree verification
+and successful native drainage. It retains read-only continuity pins and belongs
+on the native worker, including its release. Its context check is memory-only:
+it establishes historical membership in this exact Tree/review/row, not current
+filesystem equality or permission to advance a two-way baseline. A session must
+perform its own fresh native validation and commit protocol. See the
+[development validation record](validation-2026-11-03-development.md) for the
+qualified Windows scopes and pending combined/platform gates.
+
 ## Retained replacement
 
 The incoming file is copied and its data and requested metadata are verified
