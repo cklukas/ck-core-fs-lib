@@ -61,3 +61,17 @@ The new normal Tree test has measured unoptimized baselines of approximately
 normal result does not qualify a sanitizer build. All product and consumer
 translation units must use matching headers, runtime, instrumentation and C++
 layouts; the unreleased Tree request layouts changed in this checkpoint.
+
+## Static library boundaries
+
+Portable policy, digest, cleanup and budget primitives belong to Core. Native
+capture/replay/preservation/copy workers and session-root acquisition belong to
+Platform with their native provider implementations. Tree/action/session
+composition belongs to Native. Link the exported target matching the API you
+use; Core alone intentionally does not supply native workers.
+
+`tests/installed_layers` builds independent consumers of Core, Platform, Native
+and the C facade against one freshly installed prefix. Each consumer links one
+exported target. The archive-dependency test rejects reverse implementation
+edges. Repeating archives, grouping them or forcing whole-archive linkage is not
+a substitute for the dependency boundary.

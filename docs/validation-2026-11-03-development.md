@@ -567,6 +567,29 @@ coherent combined build. This prerequisite does not implement recursive mutation
 Tree-to-Session completion relay, nested durable ledgers or physical power-loss
 qualification.
 
+## Directed static-library ownership
+
+Actual native staging and a standalone Core consumer reproduced a reverse
+Engine-to-Platform dependency on the native Root consumer-failure bridges. The
+archive audit identified twelve reverse references. Native workers now reside
+in Platform, with portable metadata digest/cleanup/budget primitives split into
+Core units. Held-child replay and native session-root acquisition are separated
+from their portable implementations. Existing dependency declarations and class
+layouts remain unchanged; no repeated archives, archive groups or whole-archive
+flags are used.
+
+The isolated GCC14/ext4 normal packet passed **11/11 selected native tests** and
+**4/4 installed Core/Platform/Native/C API consumers**, including actual anonymous
+staging publication and its mandatory unprivileged/thread-FD controls. Link maps,
+archive membership and the runtime path to that exact installed `.so.0.5` were
+verified. The initial fresh baseline took 674.51 seconds; the ownership correction
+rebuilt in 88.57 seconds. A stale candidate input timestamp exposed duplicate
+moved helpers during the first attempt; all changed inputs were then marked dirty
+and rebuilt before qualification. Failed attempts are retained.
+
+The integrating branch merges these ownership hunks with its newer Session epoch
+changes. Windows, Darwin, sanitizers and the final combined cohort remain pending.
+
 ## Remaining gates
 
 - Qualify the final combined postorder Tree and bounded metadata workers on

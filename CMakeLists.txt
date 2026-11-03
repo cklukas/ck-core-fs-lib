@@ -50,9 +50,7 @@ set(CK_CORE_FS_SOURCES
   src/files/native_delete_recovery_evidence.cpp
   src/files/native_filesystem.cpp
   src/files/native_name.cpp
-  src/files/native_operation_copy_job.cpp
   src/files/native_operation_delete_tree.cpp
-  src/files/native_operation_move_job.cpp
   src/files/native_operation_recovery.cpp
   src/files/native_operation_recovery_evidence.cpp
   src/files/native_path.cpp
@@ -92,13 +90,11 @@ set(CK_CORE_FS_SOURCES
 add_library(ck_core_fs_engine STATIC ${CK_CORE_FS_SOURCES})
 target_sources(ck_core_fs_engine PRIVATE
   src/files/preservation_policy.cpp
-  src/files/regular_metadata_preservation.cpp
+  src/files/metadata_replay_primitives.cpp
+  src/files/metadata_capture_support.cpp
   src/files/comparison_plan.cpp
   src/files/conflict_rules.cpp
   src/files/sync_baseline.cpp
-  src/files/metadata_replay.cpp
-  src/files/metadata_capture_job.cpp
-  src/files/native_regular_metadata_job.cpp
   src/files/metadata_ownership_digest.cpp
   src/files/sync_session.cpp
   src/files/sync_session_reader_epoch.cpp)
@@ -140,6 +136,14 @@ endif()
 
 add_library(ck_files_platform STATIC)
 target_sources(ck_files_platform PRIVATE
+  src/files/native_operation_copy_job.cpp
+  src/files/native_operation_move_job.cpp
+  src/files/regular_metadata_preservation.cpp
+  src/files/metadata_replay.cpp
+  src/files/metadata_capture_job.cpp
+  src/files/native_regular_metadata_job.cpp
+  src/files/held_child_metadata.cpp
+  src/files/sync_session_native.cpp
   src/files/private_journal_scope.cpp
   src/files/private_journal_membership.cpp
   src/files/platform/native_sync_session_lease.cpp)
@@ -418,6 +422,9 @@ if(BUILD_TESTING)
   set_tests_properties(native_main_content_job PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME archive_layer_dependencies COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/audit_archive_layers.py ${CMAKE_NM}
+      $<TARGET_FILE:ck_core_fs_engine> $<TARGET_FILE:ck_files_platform> $<TARGET_FILE:ck_core_fs_native>)
     add_executable(ck_fs_native_target_read_seed_linux_tests tests/native_target_read_seed_linux_tests.cpp)
     target_link_libraries(ck_fs_native_target_read_seed_linux_tests PRIVATE ck_files_platform)
     target_compile_options(ck_fs_native_target_read_seed_linux_tests PRIVATE -UNDEBUG)

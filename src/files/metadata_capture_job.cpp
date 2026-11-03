@@ -21,11 +21,6 @@ bool security_same(const NativeSecurityValue&a,const NativeSecurityValue&b){retu
 void add(std::uint64_t&n,std::uint64_t v){if(v>std::numeric_limits<std::uint64_t>::max()-n)fail("metadata_capture.size_overflow",ObservationState::Unknown,AdapterError::InventoryLimit);n+=v;}
 }
 namespace detail {
-namespace { thread_local const MetadataCaptureFailureLatch* active_cleanup=nullptr; }
-MetadataCaptureCleanupScope::MetadataCaptureCleanupScope(const MetadataCaptureFailureLatch* p)noexcept:previous_(active_cleanup){active_cleanup=p;}
-MetadataCaptureCleanupScope::~MetadataCaptureCleanupScope(){active_cleanup=previous_;}
-const MetadataCaptureFailureLatch* current_metadata_capture_cleanup()noexcept{return active_cleanup;}
-void record_metadata_capture_close(MetadataCaptureCleanupError e)noexcept{if(active_cleanup)active_cleanup->record_first(e);}
 struct MetadataCaptureCleanupState final:MetadataCaptureFailureLatch {
     std::shared_ptr<MetadataCaptureBudget> budget;
     std::shared_ptr<const MetadataCaptureFailureLatch> outer;
@@ -52,7 +47,6 @@ namespace {
 Observation<bool> cleanup_result(std::optional<MetadataCaptureCleanupError> e){if(e)return Observation<bool>::unavailable(e->state,{e->domain,e->code,e->operation});return Observation<bool>::available(true);}
 [[noreturn]]void cleanup_fail(MetadataCaptureCleanupError e){throw Failure{{e.state,{e.domain,e.code,e.operation}}};}
 }
-bool MetadataCaptureLimits::valid()const noexcept{return read.valid()&&max_retained_handles>=8&&max_metadata_bytes>0;}
 NativeMetadataProof::NativeMetadataProof(MetadataReplaySnapshot s,std::optional<std::array<std::byte,32>>h,std::shared_ptr<const OpenedEntry>source,std::shared_ptr<detail::MetadataCaptureLease>lease,MetadataCaptureProgress p):snapshot_(std::move(s)),main_(h),source_(std::move(source)),lease_(std::move(lease)),progress_(p){}
 NativeMetadataProof::~NativeMetadataProof(){try{(void)finish_io();}catch(...){}}
 std::optional<MetadataCaptureCleanupError> NativeMetadataProof::cleanup_error()const noexcept{return lease_->cleanup->error();}

@@ -3,7 +3,6 @@
 #include "sync_session.hpp"
 #include "sync_session_reader_epoch.hpp"
 #include "sha256.hpp"
-#include "native_filesystem.hpp"
 #include <algorithm>
 #include <limits>
 
@@ -260,15 +259,5 @@ Observation<SyncBaselineAdvance> SyncSession::commit(std::uint64_t expected,
     snapshot_.generation=expected+1; snapshot_.state=SyncSessionState::Ready;
     loaded_digest_=hash(bytes); uncertain_=false;
     return advanced;
-}
-Observation<PreparedJournalRoot::Pointer> acquire_native_sync_storage_root(const NativeAbsolutePath& address) {
-    NativeFileSystem fs;
-    auto directory=fs.open_native_directory(address);
-    if(!directory.value())return propagate<PreparedJournalRoot::Pointer>(directory);
-    PreparedJournalRootRequest request;
-    request.parent=std::move(directory).take_value();
-    request.navigation_hint=address;
-    JournalRootPreparationProgress progress;
-    return prepare_native_journal_root(std::move(request),progress);
 }
 } // namespace ck::files
