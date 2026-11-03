@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: LGPL-2.0-or-later
+# The shared runtime exposes only its public C API families. In particular,
+# default-visible libstdc++ template instantiations from facade object files
+# must not become process-wide ABI or interpose another SDK's implementation.
+{
+  global:
+    ckfe_*;
+    ckfea_*;
+    ckfer_*;
+    ckfet_*;
+    ckfjr_*;
+    ckfsp_*;
+    ckfss_*;
+  local:
+    *;
+};

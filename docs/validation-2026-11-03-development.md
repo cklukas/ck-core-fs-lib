@@ -103,6 +103,21 @@ rather than constructing another diagnostic with an empty string: MSVC debug
 iterator storage can allocate even for that fallback. The unchanged Windows
 native test passed 117 ordinary-path and 118 long-path checks after this fix.
 
+## ELF Debug export boundary
+
+The Debug installed consumer passed, but a stricter export audit then exposed
+30 default-visible C++ standard-library definitions from facade object files.
+Archive hiding alone does not cover those direct objects. An ELF export map
+now limits the runtime to the seven public C API families; the audit compares
+the entire defined export set with public header declarations, including
+standard-library names rather than only `ck::files` names.
+
+The recorded Debug baseline fails the stronger audit. The mapped derivative
+exports exactly the same 170 C functions and zero C++ symbols. The build-tree
+and installed audits, actual interposition probe, native C resolution roundtrip,
+and installed ISO C11 consumer all pass. Only the shared runtime was relinked;
+the native static archive bytes and source/header cohort were unchanged.
+
 The later coherent Windows and macOS integration runs still fail Tree receipt
 validation after publication. Passing source and metadata components therefore
 do not establish receipt-bound execution completion. The Linux mount candidate

@@ -14,14 +14,13 @@ if not declared:
     raise RuntimeError("no public C declarations found")
 raw = subprocess.check_output([nm, "-D", "--defined-only", library], text=True)
 symbols = {line.split()[-1] for line in raw.splitlines() if line.split()}
-demangled = subprocess.check_output(
-    [nm, "-D", "-C", "--defined-only", library], text=True)
-private = [line for line in demangled.splitlines() if "ck::files::" in line]
 missing = sorted(declared - symbols)
-undeclared = sorted(symbol for symbol in symbols if symbol.startswith("ck")
-                    and symbol not in declared)
-if private or missing or undeclared:
-    raise RuntimeError(f"ELF export mismatch: private={private}, "
-                       f"missing={missing}, undeclared={undeclared}")
+# Standard-library instantiations can interpose another SDK too. Checking only
+# names containing ck::files misses those default-visible facade definitions.
+unexpected = sorted(symbols - declared)
+if missing or unexpected:
+    raise RuntimeError(f"ELF export mismatch: missing={missing}, "
+                       f"unexpected_count={len(unexpected)}, "
+                       f"unexpected={unexpected[:20]}")
 print(f"ELF export audit PASS: {len(declared)} public C functions; "
       "zero private C++ exports, including template arguments")
