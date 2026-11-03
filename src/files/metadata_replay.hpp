@@ -40,7 +40,7 @@ struct MetadataReplayChannelSnapshot final {
     std::array<std::byte,32> digest{};
     std::shared_ptr<const MetadataReplayChannelSource> source;
 };
-enum class MetadataSecurityCoverage { Unknown, WindowsPersistentSecurityV1 };
+enum class MetadataSecurityCoverage { Unknown, WindowsPersistentSecurityV1, LinuxPersistentSecurityV1 };
 // Evidence is produced after native queries, not selected by policy. Native
 // target adapters validate their own evidence type and recheck the held source
 // before replay and publication. Coverage excludes OS-derived transient trust

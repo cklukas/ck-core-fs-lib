@@ -415,6 +415,19 @@ if(BUILD_TESTING)
   set_tests_properties(native_main_content_job PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ck_fs_directory_reader_lifecycle_tests tests/directory_reader_lifecycle_tests.cpp)
+    target_link_libraries(ck_fs_directory_reader_lifecycle_tests PRIVATE ck_core_fs_native ${CMAKE_DL_LIBS})
+    target_compile_options(ck_fs_directory_reader_lifecycle_tests PRIVATE -UNDEBUG)
+    add_test(NAME directory_reader_lifecycle COMMAND ck_fs_directory_reader_lifecycle_tests)
+    set_tests_properties(directory_reader_lifecycle PROPERTIES TIMEOUT 180
+      LABELS "linux;native;directory"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    # This fixture creates real ACL/trusted/security metadata before dropping
+    # to explicitly restricted credentials. Its dedicated namespace/provider
+    # launcher is required; it is not an ordinary cap0 CTest or a skip-as-pass.
+    add_executable(ck_fs_linux_complete_metadata_tests tests/linux_complete_metadata_tests.cpp)
+    target_link_libraries(ck_fs_linux_complete_metadata_tests PRIVATE ck_core_fs_native ${CMAKE_DL_LIBS})
+    target_compile_options(ck_fs_linux_complete_metadata_tests PRIVATE -UNDEBUG)
     add_executable(ck_fs_linux_mount_root_tests tests/linux_mount_root_tests.cpp)
     target_link_libraries(ck_fs_linux_mount_root_tests PRIVATE ck_files_platform)
     target_compile_options(ck_fs_linux_mount_root_tests PRIVATE -UNDEBUG)

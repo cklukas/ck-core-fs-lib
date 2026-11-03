@@ -99,8 +99,14 @@ void parser_controls() {
     put(differing_parent, parent_mount_id_old_offset, std::uint32_t{9});
     const auto differing_result = parse_linux_mount_root(std::span<const std::byte>(differing_parent));
     assert(differing_result.witness && differing_result.witness->parent_mount_id_old == 9);
-    check([](auto& bytes) { bytes[kLinuxStatmountHeaderBytes] = std::byte{0x78}; }, LinuxMountRootParseError::RootIsNotSlash);
+    check([](auto& bytes) { bytes[kLinuxStatmountHeaderBytes] = std::byte{0x78}; }, LinuxMountRootParseError::InvalidRootString);
     check([](auto& bytes) { put(bytes, mount_root_offset, std::uint32_t{512}); }, LinuxMountRootParseError::InvalidRootOffset);
+    check([](auto& bytes) { bytes[kLinuxStatmountHeaderBytes + 1] = std::byte{0x61}; }, LinuxMountRootParseError::InvalidRootString);
+    auto subvolume = valid;
+    constexpr char nested[] = "/subvolume";
+    put(subvolume, size_offset, std::uint32_t{kLinuxStatmountHeaderBytes + sizeof(nested)});
+    std::memcpy(subvolume.data() + kLinuxStatmountHeaderBytes, nested, sizeof(nested));
+    assert(parse_linux_mount_root(subvolume).error == LinuxMountRootParseError::RootIsNotSlash);
     auto short_bytes = valid;
     const auto short_result = parse_linux_mount_root(std::span<const std::byte>(short_bytes.data(), 511));
     assert(!short_result.witness && short_result.error == LinuxMountRootParseError::ShortHeader);

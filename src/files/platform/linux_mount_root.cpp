@@ -209,10 +209,8 @@ LinuxMountRootParseResult parse_linux_mount_root(std::span<const std::byte> byte
         result.parent_mount_id < kLinuxUniqueMountIdMinimum || !result.mount_id_old ||
         !result.parent_mount_id_old)
         return {{}, LinuxMountRootParseError::InvalidMountIds};
-    if (!load(bytes, kMountAttributesOffset, result.mnt_attr) ||
-        (result.mnt_attr & kLinuxMountAttrIdmap) != 0 ||
-        (result.mnt_attr & ~kLinuxMountAttrKnownMask) != 0)
-        return {{}, LinuxMountRootParseError::InvalidMountAttributes};
+    if (!load(bytes, kMountAttributesOffset, result.mnt_attr))
+        return {{}, LinuxMountRootParseError::ShortHeader};
 
     std::uint32_t root_offset = 0;
     if (!load(bytes, kMountRootOffset, root_offset) ||
@@ -220,7 +218,16 @@ LinuxMountRootParseResult parse_linux_mount_root(std::span<const std::byte> byte
         size - kLinuxStatmountHeaderBytes - root_offset < 2)
         return {{}, LinuxMountRootParseError::InvalidRootOffset};
     const auto* root = reinterpret_cast<const char*>(bytes.data() + kLinuxStatmountHeaderBytes + root_offset);
-    if (root[0] != '/' || root[1] != '\0')
+    const auto root_bytes = size - kLinuxStatmountHeaderBytes - root_offset;
+    const auto* end = static_cast<const char*>(std::memchr(root, 0, root_bytes));
+    if (root[0] != '/' || !end)
+        return {{}, LinuxMountRootParseError::InvalidRootString};
+    // Valid kernel features/layouts are unqualified, not malformed replies.
+    // Check the structural string before reporting unsupported attributes.
+    if ((result.mnt_attr & kLinuxMountAttrIdmap) != 0 ||
+        (result.mnt_attr & ~kLinuxMountAttrKnownMask) != 0)
+        return {{}, LinuxMountRootParseError::InvalidMountAttributes};
+    if (end != root + 1)
         return {{}, LinuxMountRootParseError::RootIsNotSlash};
     return {result, LinuxMountRootParseError::None};
 }
@@ -266,6 +273,10 @@ Observation<LinuxMountRootWitness> query_linux_mount_root(int fd) {
         if (!parsed.witness) {
             if (parsed.error == LinuxMountRootParseError::MissingMask)
                 return unsupported_query<LinuxMountRootWitness>("linux_mount_root.fields_unavailable");
+            if (parsed.error == LinuxMountRootParseError::RootIsNotSlash)
+                return unsupported_query<LinuxMountRootWitness>("linux_mount_root.nonroot_mount_layout");
+            if (parsed.error == LinuxMountRootParseError::InvalidMountAttributes)
+                return unsupported_query<LinuxMountRootWitness>("linux_mount_root.mount_attributes_unqualified");
             return invalid_query<LinuxMountRootWitness>("linux_mount_root.parse");
         }
         auto witness = *parsed.witness;

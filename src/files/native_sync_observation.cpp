@@ -1,6 +1,8 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_sync_observation.hpp"
+#include "metadata_capture_job.hpp"
+#include "platform/native_directory_reader.hpp"
 #ifdef _WIN32
 #include "platform/native_windows_journal_volume.hpp"
 #endif
@@ -22,6 +24,24 @@
 #endif
 namespace ck::files {
 namespace {
+#ifndef _WIN32
+struct DirectoryReaderCloseSink final:MetadataCaptureFailureLatch {
+    std::optional<MetadataCaptureCleanupError>& first;
+    const MetadataCaptureFailureLatch* outer;
+    explicit DirectoryReaderCloseSink(std::optional<MetadataCaptureCleanupError>&e)noexcept
+        :first(e),outer(detail::current_metadata_capture_cleanup()){}
+    void record_first(MetadataCaptureCleanupError e)const noexcept override {
+        if(!first){first=e;if(outer)outer->record_first(e);}
+    }
+};
+struct DirectoryReaderOwner final {
+    std::unique_ptr<DirectoryCursor> reader;
+    std::optional<MetadataCaptureCleanupError> error;
+    void close()noexcept {DirectoryReaderCloseSink sink(error);detail::MetadataCaptureCleanupScope scope(&sink);reader.reset();}
+    ~DirectoryReaderOwner(){close();}
+};
+#endif
+
 struct NativeFailure { UnavailableObservation detail; };
 [[noreturn]] void native_fail(const char* op,ObservationState state=ObservationState::Changed,
     AdapterError code=AdapterError::MetadataChanged) {
@@ -317,8 +337,22 @@ Observation<std::unique_ptr<NativeSyncInventory>> observe_native_sync_root(std::
         if(!out.root_metadata.identity.value()||!out.root_metadata.kind.value()||*out.root_metadata.kind.value()!=ObjectKind::Directory||
             !out.root_metadata.changed.value()||!out.root_metadata.modified.value())native_fail("native_sync.root_version",ObservationState::Unsupported);
         require_true(qualify_native_sync_root_channels(*root,policy.limits));
+#ifndef _WIN32
+        DirectoryReaderOwner enumeration;
+        const auto check_close=[&]{if(enumeration.error){const auto&e=*enumeration.error;
+            throw NativeFailure{{e.state,{e.domain,e.code,e.operation}}};}};
+#endif
+        try {
+#ifndef _WIN32
+        { DirectoryReaderCloseSink sink(enumeration.error);detail::MetadataCaptureCleanupScope scope(&sink);
+          enumeration.reader=native_value(detail::open_posix_directory_reader(*root)); }
+        check_close();
+        auto* reader=enumeration.reader.get();
+#else
+        auto* reader=const_cast<DirectoryCursor*>(root.get());
+#endif
         std::size_t total=0;
-        for(;;){check_stop(stop);auto batch=const_cast<DirectoryCursor&>(*root).read(128,stop);
+        for(;;){check_stop(stop);auto batch=reader->read(128,stop);
             if(batch.state==DirectoryReadState::Error)throw NativeFailure{*batch.error};
             if(batch.state==DirectoryReadState::Cancelled)check_stop(stop);
             for(auto& name:batch.names){std::array names{name};const auto key=native_sync_key(names);
@@ -329,7 +363,16 @@ Observation<std::unique_ptr<NativeSyncInventory>> observe_native_sync_root(std::
             if(batch.state==DirectoryReadState::End)break;}
         require_true(qualify_native_sync_root_channels(*root,policy.limits));
         auto after=native_value(root->inspect_basic());if(!native_sync_same_version(out.root_metadata,after))native_fail("native_sync.inventory_changed");
+#ifndef _WIN32
+        enumeration.close();check_close();
+#endif
         return owned;
+        }catch(...){
+#ifndef _WIN32
+            enumeration.close();check_close();
+#endif
+            throw;
+        }
     });
 }
 Observation<bool> compare_native_sync_inventories(const NativeSyncInventory& a,const NativeSyncInventory& b) {

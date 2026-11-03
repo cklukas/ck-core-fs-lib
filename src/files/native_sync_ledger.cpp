@@ -288,7 +288,7 @@ Observation<bool> NativeSyncLedger::finish_io() {
 Observation<std::vector<NativeSyncLoadedLedger>> load_native_sync_ledgers(PreparedJournalRoot::Pointer root,NativeSyncLedgerLimits limits,std::stop_token token) {
     return attempt<std::vector<NativeSyncLoadedLedger>>([&]{
         if(!root)fail("native_sync.null_storage_owner",ObservationState::Failed,AdapterError::InvalidAccess);
-        auto cursor=value(open_prepared_journal_directory(root));auto before=directory_version(*root);
+        auto before=directory_version(*root);auto cursor=value(open_prepared_journal_directory(root));
         std::vector<NativeSyncLoadedLedger> out;std::size_t total=0,all_names=0;
         for(;;) {stop(token);auto batch=cursor->read(128,token);
             if(batch.state==DirectoryReadState::Error)throw Failure{*batch.error};

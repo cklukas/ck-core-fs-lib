@@ -396,6 +396,54 @@ exact-once cleanup and handle reuse are covered; actual native Move publication
 remains a typed refusal. Neither this earlier result nor the isolated Tree
 results qualify the final combined revision.
 
+## Linux native reader, layout and Complete security packets
+
+Fresh descriptor-based enumeration fixes stale root listings and journal-ledger
+loads. The read-only observer opens a new description through the genuine held
+directory, checks native identity and version, and closes it under the native
+error observer. Ledger loading now records its version checkpoint before opening
+the enumerator. Actual ext4 and top-level Btrfs controls passed repeated
+inventory, newly inserted entries, insertion during enumeration, changed-state
+refusal, fresh retry and consumed `closedir` EIO. The counterfactual old observer
+missed two real entries and the old ledger loader returned an empty result after
+insertion. Darwin helper runtime qualification remains pending.
+
+A valid non-root Btrfs mount layout and unsupported mount attributes now produce
+typed Unsupported results. Malformed root strings and buffers remain failures.
+Native top-level/non-root Btrfs cases and eight wrapped kernel-reply controls
+passed. This does not enable arbitrary Btrfs subvolume layouts.
+
+A separate three-file Complete issuer packet appends
+`LinuxPersistentSecurityV1` without changing existing enum ordinals, structs,
+vtable layouts or the public C ABI. Its private native proof binds exact policy,
+owner identities, ACLs and xattr bytes, genuine initial-user-namespace evidence,
+actual kernel LSM IDs, filesystem and inode/storage classes. Public caller-made
+evidence or modified snapshots cannot issue that proof. Legacy issuance checks
+live access time; progressive issuance binds its private pre-read sample.
+
+The qualified scope is **ext4 inodes without birthtime, with capability-only LSM
+and genuine initial-namespace CAP_SYS_ADMIN**, plus explicit policy permission
+for privileged metadata. Other LSMs, IMA/EVM, unknown classes, birthtime-bearing
+inodes and unsupported storage policies remain refused. No Ordinary fallback,
+security-setting change or automatic elevation is used.
+
+Normal and matching ASan/UBSan cohorts passed real Original and CurrentCaller
+roundtrips with ACL, binary user/trusted xattrs and file capabilities. Additional
+controls passed forged-atime/owner/policy/value rejection, full-identity-mapped
+child-namespace refusal, missing-capability refusal, protected-integrity refusal,
+SGID denial before effects and a genuine SGID roundtrip with CAP_FSETID. Extra
+proof-reader close EIO preserves the first scalar error and consumes each owner
+once; the borrowed source remains usable. Existing unprivileged progressive
+capture tests also passed. Fresh normal/sanitized builds compiled 111 translation
+units in 304/580 seconds; final affected-unit rebuilds took 21/53 seconds. Strict
+POSIX/test compile checks passed.
+
+The Linux Full fixture is a build target, not an unconditional unprivileged
+CTest. It requires isolated native fixture setup followed by the recorded
+restricted worker credentials. The frozen source and runtime receipts precede
+the final Main/target-reader merge; combined Tree, SDK and sanitizer gates are
+still required.
+
 ## Remaining gates
 
 - Qualify the final combined postorder Tree and bounded metadata workers on

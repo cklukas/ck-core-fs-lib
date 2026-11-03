@@ -62,6 +62,7 @@ enum class LinuxMountRootParseError {
     InvalidMountAttributes,
     InvalidRootOffset,
     RootIsNotSlash,
+    InvalidRootString,
 };
 
 struct LinuxMountRootWitness final {
