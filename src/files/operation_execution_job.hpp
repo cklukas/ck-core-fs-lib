@@ -32,8 +32,9 @@ struct OperationExecutionRequest final {
     // native callbacks and remains worker-bound.
     std::function<Observation<OperationCommitJob::Pointer>(std::stop_token)> prepare_commit;
     std::function<Observation<bool>()> cleanup_unpublished_staging;
-    // Final durable-journal close, after the commit protocol and before the
-    // public Complete state. This callback must not perform source deletion.
+    // Final native writer/journal close before ANY terminal state is exposed,
+    // including failure and cancellation. Invoked at most once, even if it
+    // throws. This callback must not publish, delete, or retire source objects.
     std::function<Observation<bool>()> finish_io;
 };
 
@@ -60,10 +61,12 @@ public:
 private:
     explicit OperationExecutionJob(OperationExecutionRequest request) noexcept : request_(std::move(request)) {}
     void fail(UnavailableObservation detail, OperationExecutionState state) noexcept;
+    OperationExecutionState advance_protocol(std::stop_token stop);
 
     OperationExecutionRequest request_;
     OperationExecutionResult result_;
     OperationCommitJob::Pointer commit_;
+    bool io_finished_ = false;
 };
 
 } // namespace ck::files

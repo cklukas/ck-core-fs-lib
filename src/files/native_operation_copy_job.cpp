@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <new>
 #include <string>
 #include <unordered_set>
 
@@ -25,6 +27,35 @@ Observation<T> rejected(AdapterError code, const char* operation,
 Observation<bool> unavailable_bool(const UnavailableObservation& detail) {
     return Observation<bool>::unavailable(detail.state, detail.error);
 }
+
+// Capturing an error must not allocate before the remaining owners close.
+// Convert to the public observation only after every close was attempted.
+struct NativeCopyFinalFailure final {
+    bool recorded=false;
+    ObservationState state=ObservationState::Unknown;
+    ErrorDomain domain=ErrorDomain::Adapter;
+    std::int64_t code=static_cast<std::int64_t>(AdapterError::InvalidNativeResult);
+    std::array<char,128> operation{};
+    void record(ObservationState s,ErrorDomain d,std::int64_t c,std::string_view op) noexcept {
+        if(recorded)return;
+        recorded=true;state=s;domain=d;code=c;
+        const auto count=std::min(op.size(),operation.size()-1);
+        if(count)std::memcpy(operation.data(),op.data(),count);
+    }
+    void record(const Observation<bool>& result,const char* fallback) noexcept {
+        if(const auto* failure=result.unavailable_detail())
+            record(failure->state,failure->error.domain,failure->error.code,failure->error.operation);
+        else if(!*result.value())record(ObservationState::Unknown,ErrorDomain::Adapter,
+            static_cast<std::int64_t>(AdapterError::InvalidNativeResult),fallback);
+    }
+    Observation<bool> result() const {
+        if(!recorded)return Observation<bool>::available(true);
+        try {return Observation<bool>::unavailable(state,{domain,code,operation.data()});}
+        catch(const std::bad_alloc&) {
+            return Observation<bool>::unavailable(state,{domain,code,{}});
+        }
+    }
+};
 
 bool same(const ObjectIdentity& left, const ObjectIdentity& right) noexcept {
     return compare_identity(left, right) == IdentityComparison::Same;
@@ -342,7 +373,28 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
     execution_request.cleanup_unpublished_staging = [state] {
         return state->cleanup_unpublished_staging();
     };
-    execution_request.finish_io = [state] { return state->request.journal_file->finish_io(); };
+    execution_request.finish_io = [state] {
+        NativeCopyFinalFailure failure;
+        if (state->staging) {
+            try {
+                auto closed=state->staging->finish_content_writes();
+                failure.record(closed,"native_operation_copy.writer_finish_false");
+            } catch (...) {
+                failure.record(ObservationState::Unknown,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"native_operation_copy.writer_finish_exception");
+            }
+        }
+        // Attempt the journal close even when the writer failed. Each native
+        // owner consumes its handle once; retain the first observed failure.
+        try {
+            auto closed=state->request.journal_file->finish_io();
+            failure.record(closed,"native_operation_copy.journal_finish_false");
+        } catch (...) {
+            failure.record(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"native_operation_copy.journal_finish_exception");
+        }
+        return failure.result();
+    };
     execution_request.prepare_commit = [state, append](std::stop_token) {
         OperationCommitRequest commit;
         commit.operation = state->request.operation;

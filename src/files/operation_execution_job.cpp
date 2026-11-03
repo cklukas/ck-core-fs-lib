@@ -3,6 +3,7 @@
 #include "operation_execution_job.hpp"
 
 #include <cstdint>
+#include <new>
 
 namespace ck::files {
 namespace {
@@ -41,6 +42,49 @@ OperationProgress OperationExecutionJob::progress() const noexcept {
 }
 
 OperationExecutionState OperationExecutionJob::advance(std::stop_token stop) {
+    // A completed child can advance its parent to the next nonterminal phase
+    // even with stop requested. Drain those synchronous transitions before
+    // releasing native owners or exposing a cancelled result.
+    try {
+        do {
+            advance_protocol(stop);
+        } while(stop.stop_requested()&&result_.state<OperationExecutionState::Complete);
+    } catch (...) {
+        // Even an allocation/provider exception must reach native finalizers.
+        // Empty diagnostic storage keeps this path allocation-free.
+        result_.state=OperationExecutionState::NeedsReconciliation;
+        if(!result_.failure)result_.failure.emplace(UnavailableObservation{ObservationState::Unknown,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),{}}});
+    }
+    if (result_.state < OperationExecutionState::Complete || io_finished_)
+        return result_.state;
+    // Consume the finalizer before calling external/native code. A throw can
+    // mean a handle was already consumed and must never trigger a close retry.
+    io_finished_ = true;
+    if (request_.finish_io) {
+        std::optional<UnavailableObservation> failure;
+        try {
+            auto finished = request_.finish_io();
+            if(const auto* detail=finished.unavailable_detail()) {
+                failure.emplace(UnavailableObservation{detail->state,{detail->error.domain,detail->error.code,{}}});
+                try {failure->error.operation=detail->error.operation;}catch(const std::bad_alloc&) {}
+            } else if(!*finished.value()) {
+                failure.emplace(UnavailableObservation{ObservationState::Unknown,{ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),{}}});
+            }
+        } catch (...) {
+            if(!failure)failure.emplace(UnavailableObservation{ObservationState::Unknown,{ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),{}}});
+        }
+        if (failure) {
+            if (!result_.failure) result_.failure = std::move(failure);
+            result_.state = OperationExecutionState::NeedsReconciliation;
+        }
+    }
+    return result_.state;
+}
+
+OperationExecutionState OperationExecutionJob::advance_protocol(std::stop_token stop) {
     if (result_.state == OperationExecutionState::Complete || result_.state == OperationExecutionState::Failed ||
         result_.state == OperationExecutionState::Cancelled || result_.state == OperationExecutionState::RetainedSource ||
         result_.state == OperationExecutionState::NeedsReconciliation)
@@ -107,20 +151,6 @@ OperationExecutionState OperationExecutionJob::advance(std::stop_token stop) {
     const auto commit_state = commit_->advance(stop);
     switch (commit_state) {
     case OperationCommitState::Complete:
-        if (request_.finish_io) {
-            try {
-                auto finished=request_.finish_io();
-                if (!finished.value() || !*finished.value()) {
-                    fail(finished.value() ? error(AdapterError::InvalidNativeResult,"operation_execution.finish_result")
-                                          : *finished.unavailable_detail(),OperationExecutionState::NeedsReconciliation);
-                    break;
-                }
-            } catch (...) {
-                fail(error(AdapterError::InvalidNativeResult,"operation_execution.finish_exception"),
-                     OperationExecutionState::NeedsReconciliation);
-                break;
-            }
-        }
         result_.state = OperationExecutionState::Complete;
         break;
     case OperationCommitState::Failed:
