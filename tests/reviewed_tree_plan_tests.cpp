@@ -132,6 +132,19 @@ std::wstring extended(const std::filesystem::path& p) {
     CHECK(s.size() > 2 && s[1] == L':' && s[2] == L'\\');
     return L"\\\\?\\" + s;
 }
+// Test-address policy only; never filesystem identity or operation authority.
+bool fixture_on_canonical_v_tmp(const std::filesystem::path& path) {
+    const auto requested=extended(path);const auto count=GetFullPathNameW(requested.c_str(),0,nullptr,nullptr);
+    CHECK(count>1&&count<=32768);std::wstring canonical(count,L'\0');
+    const auto written=GetFullPathNameW(requested.c_str(),count,canonical.data(),nullptr);CHECK(written>0&&written<count);canonical.resize(written);
+    std::replace(canonical.begin(),canonical.end(),L'/',L'\\');
+    if(canonical.size()>4&&canonical[4]==L'v')canonical[4]=L'V';
+    if(!canonical.starts_with(L"\\\\?\\V:\\tmp\\"))return false;
+    std::wstring_view tail(canonical);tail.remove_prefix(11);
+    while(!tail.empty()){auto slash=tail.find(L'\\');const auto part=tail.substr(0,slash);
+        if(part==L"."||part==L"..")return false;if(slash==tail.npos)break;tail.remove_prefix(slash+1);}
+    return true;
+}
 struct FixtureHandle {
     HANDLE value=INVALID_HANDLE_VALUE;
     ~FixtureHandle() {if(value!=INVALID_HANDLE_VALUE&&value!=nullptr&&!CloseHandle(value))std::abort();}
@@ -286,14 +299,14 @@ struct Fixture {
     static unsigned sequence;
     Fixture(bool long_path = false) {
 #ifdef _WIN32
-        const auto* tmp = std::getenv("TMPDIR");
-        if (!tmp || !*tmp) tmp = std::getenv("TEMP");
-        CHECK(tmp && *tmp && std::getenv("TEMP") && std::getenv("TMP"));
-        root = std::filesystem::path(tmp);
-        const auto* require_v = std::getenv("CK_FS_REQUIRE_V_DEV_DRIVE");
-        if (require_v && std::string(require_v) == "1") {
-            CHECK(GetFileAttributesW(L"V:\\") != INVALID_FILE_ATTRIBUTES);
-            CHECK(root.native().starts_with(L"V:\\tmp\\") || root.native().starts_with(L"V:/tmp/"));
+        const auto length=GetEnvironmentVariableW(L"TMPDIR",nullptr,0);CHECK(length>1&&length<65536);
+        std::wstring temporary(length,L'\0');CHECK(GetEnvironmentVariableW(L"TMPDIR",temporary.data(),length)==length-1);temporary.resize(length-1);
+        CHECK(GetEnvironmentVariableW(L"TEMP",nullptr,0)>1&&GetEnvironmentVariableW(L"TMP",nullptr,0)>1);
+        root=std::filesystem::path(temporary);
+        wchar_t require_v[2]{};
+        if(GetEnvironmentVariableW(L"CK_FS_REQUIRE_V_DEV_DRIVE",require_v,2)==1&&require_v[0]==L'1'){
+            CHECK(GetFileAttributesW(L"V:\\")!=INVALID_FILE_ATTRIBUTES);
+            CHECK(fixture_on_canonical_v_tmp(root));
         }
         root /= L"reviewed-tree-tests-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++sequence);
         mkdir_new(root);
@@ -1215,6 +1228,7 @@ void test_progressive_root_close(){
     std::printf("progressive Scanner actual consumed-close error reaches genuine Root first-error latch PASS\n");
 }
 }
+#ifndef CKFS_TREE_EXECUTION_TEST_SUPPORT
 int main(int argc, char** argv) {
     try {
         if(argc==2&&std::string_view(argv[1])=="--loss-main") {test_explicit_loss_main();test_loss_root_close();std::printf("explicit loss Scanner: %u checks passed\n",checks);return 0;}
@@ -1255,3 +1269,5 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "reviewed_tree_plan: %s\n", e.what()); return 1; }
 }
+
+#endif

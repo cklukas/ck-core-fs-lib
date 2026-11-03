@@ -21,6 +21,10 @@ struct NativeRegularMetadataRequest final {
     std::function<Observation<bool>(std::stop_token)> verify_membership;
     std::function<Observation<OperationMetadataStep>(bool begin,std::stop_token)> revalidate_source;
     std::function<Observation<bool>()> finish_source;
+    // Internal Tree observation only. Prepare independent target readers after
+    // streams exist, before ownership/security/final times. One bounded step
+    // per call; the Tree owns/drains these separate observers on ALL paths.
+    std::function<Observation<OperationMetadataStep>(OpenedEntry&,std::stop_token)> prepare_target_observation{};
 };
 struct NativeRegularMetadataProgress final {
     std::uint64_t source_read_calls=0,source_read_bytes=0,target_write_calls=0,target_write_bytes=0;

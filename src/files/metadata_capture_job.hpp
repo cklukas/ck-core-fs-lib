@@ -28,6 +28,7 @@ public:
 namespace detail {
 struct MetadataCaptureLease;
 struct MetadataCaptureCleanupState;
+class NativeTargetReadBudget;
 // Scoped only around this API's native work. Temporary adapter closes also
 // feed the same sticky error. No observer installed for unrelated operations.
 class MetadataCaptureCleanupScope final {
@@ -73,6 +74,7 @@ public:
 private:
     friend struct detail::MetadataCaptureLease;
     friend struct detail::MetadataCaptureCleanupState;
+    friend class detail::NativeTargetReadBudget;
     std::optional<MetadataCaptureCleanupError> cleanup_error_;
     const MetadataCaptureLimits limits_;
     std::uint64_t logical_=0;

@@ -113,8 +113,11 @@ void bounded_run(const std::filesystem::path& path){bounded_positive(path,true);
 #endif
  std::printf("postorder worker controls total=%u\n",checks);}
 }
+#ifndef CKFS_DIRECTORY_WORKER_TEST_SUPPORT
 #ifdef _WIN32
 int wmain(int argc,wchar_t** argv){CHECK(argc==2);run(std::filesystem::path(argv[1]));bounded_run(std::filesystem::path(argv[1]));}
 #else
 int main(int argc,char** argv){CHECK(argc==2);run(std::filesystem::path(argv[1]));bounded_run(std::filesystem::path(argv[1]));}
+#endif
+
 #endif

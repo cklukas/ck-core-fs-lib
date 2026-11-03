@@ -343,10 +343,63 @@ regressions, Linux mount witnesses and ELF exports/interposition. This is
 focused Linux ext4 normal qualification, not a full integrated Tree, Complete
 security, Windows or matching sanitizer result for the later combined revision.
 
+## Receipt-bound Windows native Tree integration
+
+The worker now binds a private execution seal to the immutable reviewed receipt,
+comparison, policy, journal operation and genuine held roots. Per-row permits and
+an internal own-effect ledger cannot be supplied as caller facts. Completion
+proofs require whole-tree verification and native drainage; they remain
+worker-owned historical evidence, never fresh execution, session or baseline-CAS
+consent. A different row, receipt, revision or Tree cannot reuse them.
+
+Native independent target readers are prepared before restrictive security and
+final timestamps. Directory enumeration opens a fresh native cursor after child
+and ADS effects. Actual target observations, bounded metadata budgets and source
+bookends drive postorder verification; source identifiers are never copied into
+target observations. Comparison and native replay request layouts changed, so
+all C++ consumers and affected implementation units require a coherent rebuild.
+
+The isolated Ordinary/Original Windows cohort passed **8,534 NTFS checks in
+458.03 seconds** and **8,694 ReFS checks in 697.39 seconds**. It covers strict
+regular-file copying plus created and merged directories, ADS, progressive
+metadata, target readers and sealed completion. The same executable passed
+**4,213 NTFS / 4,389 ReFS adversarial checks**: changed source before staging,
+foreign target mutation, cancellation after directory creation, and actual
+journal-close failure with and without persistent allocation failure. None of
+those failures may issue completion proof. These are native normal results;
+the frozen cohort precedes the later common Batch/Legacy cleanup fixes.
+
+The Complete/Original derivative enabled and independently queried genuine
+SeSecurityPrivilege. It passed **8,975 NTFS / 9,119 ReFS checks**, with binary EA,
+ADS, a protected read-only DACL, success/failure audit SACL and Medium/NoWriteUp
+mandatory label populated. Resource attributes, scope, process-trust label and
+access filter were queried empty. Populated roundtrip coverage for those last
+four classes is not claimed. CurrentCaller and final combined SDK/sanitizer
+qualification remain pending.
+
+The separate fixture-boundary derivative passed **333 checks per filesystem**
+with wide environment APIs, a non-ASCII and unpaired UTF-16 root, an extended
+root longer than MAX_PATH, canonical V: development-root checks and a memory-only
+wrong-drive negative. This did not rerun the expensive Tree cases. The permanent
+CMake entries preserve that distinction: native Windows-only tests, measured
+new-test deadlines, and explicit opt-in
+`CK_CORE_FS_TEST_PRIVILEGED_METADATA=ON` for Complete security cases. The ordinary
+and Complete target-reader CLI entries are now separate; their small dispatch
+change and the Complete fixture's wide setter replacement still need the next
+Windows derivative run. Non-Windows no-op entry points are not registered as
+qualification.
+
+The native Copy source-close regression is also permanent. Its earlier frozen
+product cohort passed **28/28 normal and 28/28 matching MSVC ASan cases**. Native
+NTFS/ReFS handle failures, scalar first-error preservation under persistent OOM,
+exact-once cleanup and handle reuse are covered; actual native Move publication
+remains a typed refusal. Neither this earlier result nor the isolated Tree
+results qualify the final combined revision.
+
 ## Remaining gates
 
-- Integrate and qualify postorder directory metadata replay and bounded
-  regular-file metadata execution against the exact reviewed evidence.
+- Qualify the final combined postorder Tree and bounded metadata workers on
+  Windows, Linux and macOS; retain explicit unsupported native primitives.
 - Qualify integrated base-source, legacy metadata and pending-batch drainage on
   Windows and with matching sanitizers, preserving Move retirement ordering.
 - Qualify Windows named conflict resolution and all-stream admission.

@@ -123,6 +123,21 @@ private:
     friend class ReviewedTreePlanJob;
 };
 
+// Native Tree-issued evidence only. No public state constructor, path/ID
+// rehydration, or caller-authored expected facts. Tokens intentionally retain
+// read-only native continuity pins: acquire, use and release them on the owning
+// worker; they are not memory-only frontend DTOs. This grants no new mutation,
+// rule choice, cross-Tree/session consent, or baseline/CAS authority.
+struct ReviewedTreeOwnEffectState;
+class ReviewedTreeOwnEffectToken final {
+public:
+    ReviewedTreeOwnEffectToken()=default;
+    bool is_valid()const noexcept{return state_!=nullptr;}
+private:
+    std::shared_ptr<const ReviewedTreeOwnEffectState> state_;
+    friend class ReviewedTreePlanJob;
+};
+
 // Single worker. Native inventory/hash steps and copy-job steps are bounded;
 // pure plan freezing is bounded by the configured inventory limits. Native calls can block. No UI callback
 // or display path is execution authority. Internal allocation may throw; C
@@ -167,6 +182,11 @@ public:
     Observation<ReviewedTreeReceipt> review(std::span<const ConflictRule> rules,
         std::span<const ReviewedTreeNameChoice> names, const ReviewedTreeDeletionReceipt& deletion = {}) const;
     Observation<bool> begin_execution(const ReviewedTreeReceipt& receipt);
+    // Available only after final whole-tree verification AND successful native
+    // finalization. Tokens remain tied to this exact Tree, review and row.
+    Observation<ReviewedTreeOwnEffectToken> completed_effect(const ComparisonDecisionToken&)const;
+    Observation<bool> verify_completed_effect(const ReviewedTreeOwnEffectToken&,
+        const ReviewedTreeReceipt&,const ComparisonDecisionToken&)const;
 
 private:
     struct Impl;

@@ -83,13 +83,14 @@ bool same_metadata_digest(const std::optional<ComparisonMetadataDigest>& a,
 bool same_entry(const ComparisonEntry& a, const ComparisonEntry& b) noexcept {
     return a.relative_path == b.relative_path && same_object(a.object, b.object) &&
         same_digest(a.digest, b.digest) && same_metadata_digest(a.metadata_digest, b.metadata_digest) &&
-        a.excluded == b.excluded && a.name_collision == b.name_collision;
+        a.excluded == b.excluded && a.name_collision == b.name_collision && a.directory_metadata_contract==b.directory_metadata_contract;
 }
 
 bool same_options(const ComparisonOptions& a, const ComparisonOptions& b) noexcept {
     const auto& x = a.filters; const auto& y = b.filters;
     return a.profile == b.profile && a.mode == b.mode && a.topology == b.topology &&
         a.timestamp_quantum_ns == b.timestamp_quantum_ns && a.compare_preserved_metadata == b.compare_preserved_metadata &&
+        a.directory_metadata_contract==b.directory_metadata_contract &&
         x.minimum_size == y.minimum_size &&
         x.maximum_size == y.maximum_size && x.modified_not_before == y.modified_not_before &&
         x.modified_before == y.modified_before && x.allowed_kind_mask == y.allowed_kind_mask &&
@@ -103,7 +104,7 @@ bool object_fields_valid(const ComparisonObject& o) noexcept {
 }
 
 bool entry_fields_valid(const ComparisonEntry& e) noexcept {
-    return object_fields_valid(e.object) && (!e.digest ||
+    return in_range(e.directory_metadata_contract,ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1) && object_fields_valid(e.object) && (!e.digest ||
         (in_range(e.digest->state, ComparisonDigestState::Failed) &&
          in_range(e.digest->algorithm, ComparisonDigestAlgorithm::Sha256) &&
          object_fields_valid(e.digest->before) && object_fields_valid(e.digest->after))) &&
@@ -116,7 +117,8 @@ bool entry_fields_valid(const ComparisonEntry& e) noexcept {
 
 bool options_valid(const ComparisonOptions& o) noexcept {
     const auto& f = o.filters;
-    return in_range(o.profile, ComparisonProfile::Compare) && in_range(o.mode, ComparisonMode::CompleteDigest) &&
+    return in_range(o.directory_metadata_contract,ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1) &&
+        in_range(o.profile, ComparisonProfile::Compare) && in_range(o.mode, ComparisonMode::CompleteDigest) &&
         in_range(o.topology, ComparisonTopology::Overlap) && quantum_valid(o.timestamp_quantum_ns) &&
         !(f.allowed_kind_mask >> 10) && f.maximum_depth <= maximum_key_depth &&
         (!f.minimum_size || !f.maximum_size || *f.minimum_size <= *f.maximum_size) &&
@@ -282,7 +284,10 @@ void classify(ComparisonRow& row, const ComparisonEntry* s, const ComparisonEntr
     }
     if (o.compare_preserved_metadata) {
         for (const auto* entry : {s, d}) if (entry) {
-            if (entry->object.kind == ObjectKind::Directory) {
+            if (entry->object.kind == ObjectKind::Directory &&
+                (o.directory_metadata_contract!=ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1 ||
+                 entry->directory_metadata_contract!=o.directory_metadata_contract || !entry->metadata_digest ||
+                 entry->metadata_digest->ownership!=ComparisonMetadataOwnership::Original)) {
                 unknown(row, ComparisonReason::DirectoryMetadataUnsupported); return;
             }
             if (auto problem = metadata_digest_problem(*entry)) { unknown(row, *problem); return; }
@@ -296,6 +301,11 @@ void classify(ComparisonRow& row, const ComparisonEntry* s, const ComparisonEntr
     }
     if (a.kind != b.kind) { row.relation = ComparisonRelation::TypeConflict; row.reason = ComparisonReason::TypeMismatch; return; }
     if (*a.kind == ObjectKind::Directory) {
+        if(o.compare_preserved_metadata) {
+            const auto& x=*s->metadata_digest;const auto& y=*d->metadata_digest;
+            if(x.schema!=y.schema){unknown(row,ComparisonReason::MetadataSchemaMismatch);return;}
+            if(x.policy_binding!=y.policy_binding||x.ownership!=y.ownership){unknown(row,ComparisonReason::MetadataPolicyMismatch);return;}
+        }
         row.relation = ComparisonRelation::DirectoryPair; row.reason = ComparisonReason::DirectoryPair; return;
     }
     if (o.compare_preserved_metadata) {

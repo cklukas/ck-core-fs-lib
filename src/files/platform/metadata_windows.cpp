@@ -6,6 +6,8 @@
 #include "metadata_replay.hpp"
 #include "metadata_capture_job.hpp"
 #include "native_metadata_stream_target.hpp"
+#include "native_target_read_seed.hpp"
+#include "native_target_read_budget.hpp"
 #include "native_windows_native_fsd.hpp"
 #include "sha256.hpp"
 #include "windows_name.hpp"
@@ -644,6 +646,16 @@ public:
         else {finished_=true;const HANDLE h=handle_.release();if(h&&h!=INVALID_HANDLE_VALUE&&!CloseHandle(h)){const auto e=GetLastError();capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,e,"metadata_capture.channel_CloseHandle"};report_capture_close(e,"metadata_capture.channel_CloseHandle");}}
         if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);
     }
+    Observation<std::unique_ptr<WindowsMetadataChannel>> duplicate_capture_reader()const {
+        using R=Observation<std::unique_ptr<WindowsMetadataChannel>>;
+        if(writable_||finished_)return failure<std::unique_ptr<WindowsMetadataChannel>>(ERROR_INVALID_HANDLE,"target_read.channel_closed_or_writer");
+        HANDLE raw=nullptr;
+        if(!DuplicateHandle(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,
+            FILE_READ_DATA|FILE_READ_ATTRIBUTES|SYNCHRONIZE,FALSE,0))
+            return failure<std::unique_ptr<WindowsMetadataChannel>>(GetLastError(),"target_read.channel_duplicate");
+        OwnedHandle owned(raw);
+        return R::available(std::make_unique<WindowsMetadataChannel>(std::move(owned),scope_,identifier_,owner_,false));
+    }
     const NativeFeatureIdentifier& identifier() const noexcept{return identifier_;}
     std::optional<MetadataCaptureCleanupError> capture_close_error()const noexcept{return capture_close_error_;}
     std::optional<MetadataCaptureCleanupError> writer_finish_error()const noexcept{return writer_finish_error_;}
@@ -662,6 +674,12 @@ private:
     bool finished_=false;
 };
 
+struct WindowsTargetReadManifest final {
+    MetadataReplayPolicy policy;
+    std::vector<std::shared_ptr<WindowsMetadataChannel>> readers;
+    std::shared_ptr<detail::NativeTargetReadBudget> budget;
+};
+class WindowsTargetReadSeed;
 class WindowsOpenedEntry final : public OpenedEntry {
 public:
     WindowsOpenedEntry(OwnedHandle handle, AdapterScope scope, bool layout_access = false,
@@ -808,6 +826,7 @@ public:
                 if(!capture_close_error_)capture_close_error_=e;report_capture_close(static_cast<DWORD>(e.code),e.operation);
             }
         }
+        target_read_manifest_.reset();
         if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);
     }
     // Content-only observation: no security/EA rights or metadata qualification.
@@ -822,6 +841,19 @@ public:
     }
     Observation<std::shared_ptr<const OpenedEntry>> open_progressive_metadata_source(const MetadataReplayPolicy& policy)const {
         using Result=Observation<std::shared_ptr<const OpenedEntry>>;
+        if(target_read_manifest_) {
+            const auto& bound=target_read_manifest_->policy;
+            if(finish_started_||policy.version!=bound.version||policy.scope!=bound.scope||policy.ownership!=bound.ownership||
+               policy.allow_privilege_metadata!=bound.allow_privilege_metadata||policy.limits.max_records!=bound.limits.max_records||
+               policy.limits.max_native_bytes!=bound.limits.max_native_bytes)
+                return failure<std::shared_ptr<const OpenedEntry>>(ERROR_INVALID_PARAMETER,"target_read.closed_or_policy_changed");
+            HANDLE raw=nullptr;
+            if(!DuplicateHandle(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+                return failure<std::shared_ptr<const OpenedEntry>>(GetLastError(),"target_read.source_duplicate");
+            OwnedHandle owned(raw);auto clone=std::make_shared<WindowsOpenedEntry>(std::move(owned),scope_,false,content_access_);
+            clone->target_read_manifest_=target_read_manifest_;
+            return Result::available(std::move(clone));
+        }
         if(content_write_access_)return failure<std::shared_ptr<const OpenedEntry>>(ERROR_ACCESS_DENIED,"metadata_capture.readonly_source_required");
         const auto qualified=qualify_metadata_replay(policy);if(!qualified.value()){const auto&e=*qualified.unavailable_detail();return Result::unavailable(e.state,e.error);}if(!*qualified.value())return failure<std::shared_ptr<const OpenedEntry>>(ERROR_NOT_SUPPORTED,"metadata_capture.provider_false");
         const auto basic=inspect_basic();if(!basic.value()){const auto&e=*basic.unavailable_detail();return Result::unavailable(e.state,e.error);}
@@ -1221,6 +1253,15 @@ public:
         // automatic timestamps are suppressed. A separately reopened reader
         // could change the file's access time after final timestamp replay.
         for(const auto& owned:channel_writers_)if(owned->identifier()==identifier)return Result::available(owned);
+        if(target_read_manifest_) {
+            for(const auto& prepared:target_read_manifest_->readers)if(prepared->identifier()==identifier) {
+                auto clone=prepared->duplicate_capture_reader();
+                if(!clone.value()){const auto&e=*clone.unavailable_detail();return Result::unavailable(e.state,e.error);}
+                return Result::available(std::shared_ptr<const MetadataReplayChannelSource>(std::move(clone).take_value()));
+            }
+            return Result::unavailable(ObservationState::Changed,{ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::MetadataChanged),"target_read.unprepared_stream"});
+        }
         auto opened=open_metadata_channel(identifier,false);
         if(!opened.value()){const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
         return Result::available(std::shared_ptr<const MetadataReplayChannelSource>(std::move(opened).take_value()));
@@ -1721,6 +1762,7 @@ public:
     }
 private:
     friend class WindowsDirectoryCursor;
+    friend class WindowsTargetReadSeed;
     friend class ::ck::files::NativeCreatedDirectory;
     Observation<std::unique_ptr<WindowsMetadataChannel>> open_metadata_channel(const NativeFeatureIdentifier& identifier,bool create,
         bool suppress_read_times=false) const {
@@ -1882,6 +1924,7 @@ private:
     bool rename_access_ = false;
     std::unique_ptr<WindowsPublicationContext> publication_;
     bool directory_metadata_target_=false;
+    std::shared_ptr<const WindowsTargetReadManifest> target_read_manifest_;
     mutable std::unique_ptr<WindowsContentLease> content_lease_;
     std::vector<std::shared_ptr<WindowsMetadataChannel>> channel_writers_;
 };
@@ -2227,6 +2270,7 @@ Observation<VolumeSpaceCounters> volume_space(HANDLE handle) {
 
 class WindowsDirectoryCursor final : public DirectoryCursor {
     friend class WindowsOpenedEntry;
+    friend class WindowsTargetReadSeed;
 public:
     Observation<std::shared_ptr<const OpenedEntry>> open_progressive_directory_source(const MetadataReplayPolicy& policy)const {
         using R=Observation<std::shared_ptr<const OpenedEntry>>;HANDLE h=nullptr;
@@ -3301,12 +3345,16 @@ private:
         using Result = Observation<DirectoryStep>;
         static_assert(offsetof(FILE_ID_BOTH_DIR_INFO, FileName) == detail::windows_directory_name_offset);
         static_assert(offsetof(FILE_ID_BOTH_DIR_INFO, FileNameLength) == detail::windows_directory_name_length_offset);
+        if(target_read_enumeration_finished_)return Result::available(DirectoryEnd{});
         if (!offset_) {
             buffer_.fill(std::byte{});
             const auto info_class = started_ ? FileIdBothDirectoryInfo : FileIdBothDirectoryRestartInfo;
             if (!GetFileInformationByHandleEx(handle_.get(), info_class, buffer_.data(), static_cast<DWORD>(buffer_.size()))) {
                 const DWORD code = GetLastError();
-                if (code == ERROR_NO_MORE_FILES) return Result::available(DirectoryEnd{});
+                if (code == ERROR_NO_MORE_FILES) {
+                    if(target_read_enumeration_lease_){target_read_enumeration_finished_=true;target_read_enumeration_lease_.reset();}
+                    return Result::available(DirectoryEnd{});
+                }
                 return failure<DirectoryStep>(code, "FileIdBothDirectoryInfo");
             }
             started_ = true;
@@ -3322,6 +3370,9 @@ private:
         if (!record.name) return Result::available(DirectorySkip{});
         return Result::available(std::move(*record.name));
     }
+    std::shared_ptr<const void> target_read_budget_;
+    std::shared_ptr<const void> target_read_enumeration_lease_;
+    bool target_read_enumeration_finished_=false;
     OwnedHandle handle_;
     AdapterScope scope_;
     // Fixed bound, sufficient for a full native UTF-16 component plus header.
@@ -3329,6 +3380,208 @@ private:
     alignas(8) std::array<std::byte, 128 * 1024> buffer_{};
     std::optional<std::size_t> offset_;
     bool started_ = false;
+};
+
+// Prepared target observation owners are independent of the metadata writer.
+// Their actual file descriptions suppress automatic times before security is
+// replayed. Only the native adapter constructs this implementation.
+class WindowsTargetReadSeed final:public detail::NativeTargetReadSeed,public MetadataCaptureFailureLatch {
+public:
+    WindowsTargetReadSeed(WindowsOpenedEntry* target,std::shared_ptr<const NativeMetadataProof> proof,
+        MetadataCaptureLimits limits,std::shared_ptr<MetadataCaptureBudget> budget,
+        std::shared_ptr<const MetadataCaptureFailureLatch> latch,
+        std::shared_ptr<const WindowsDirectoryCursor> container={})
+        :target_(target),proof_(std::move(proof)),limits_(limits),budget_(std::move(budget)),latch_(std::move(latch)),container_(std::move(container)){}
+    ~WindowsTargetReadSeed()override{try{(void)finish_io();}catch(...){}}
+    void record_first(MetadataCaptureCleanupError e)const noexcept override {
+        if(!close_error_)close_error_=e;
+        if(latch_)latch_->record_first(e);
+    }
+    Observation<bool> advance(std::stop_token stop)override {
+        if(failed_)return close_error_?Observation<bool>::unavailable(close_error_->state,
+            {close_error_->domain,close_error_->code,close_error_->operation}):failure_result();
+        if(finished_)return closed<bool>();
+        if(ready_)return Observation<bool>::available(true);
+        detail::MetadataCaptureCleanupScope scope(this);
+        try{
+            if(stop.stop_requested())return fail({ObservationState::Unknown,{ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InterruptedRead),"target_read.cancelled"}});
+            if(!proof_||proof_->io_finished())return fail({ObservationState::Changed,{ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidAccess),"target_read.closed_source_proof"}});
+            if(auto error=proof_->cleanup_error())return fail({error->state,{error->domain,error->code,error->operation}});
+            if(!source_){
+                auto checked=open_base();if(!checked.value()||!*checked.value())return fail(checked.value()?UnavailableObservation{
+                    ObservationState::Failed,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"target_read.base_false"}}:*checked.unavailable_detail());
+                if(close_error_)return fail(close_observation());
+                return Observation<bool>::available(false);
+            }
+            const auto& channels=proof_->snapshot().channels;
+            if(index_<channels.size()){
+                const auto& expected=channels[index_];auto bootstrap=source_->open_metadata_channel(expected.identifier,false,true);
+                if(!bootstrap.value())return fail(*bootstrap.unavailable_detail());
+                auto native=std::move(bootstrap).take_value();auto reduced=native->duplicate_capture_reader();
+                if(!reduced.value())return fail(*reduced.unavailable_detail());
+                native->finish_capture_reads();
+                if(close_error_)return fail(close_observation());
+                auto reader=std::shared_ptr<WindowsMetadataChannel>(std::move(reduced).take_value());
+                auto inspected=reader->inspect();if(!inspected.value())return fail(*inspected.unavailable_detail());
+                if(inspected.value()->identifier!=expected.identifier||inspected.value()->logical_size!=expected.logical_size)
+                    return fail({ObservationState::Changed,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"target_read.stream_changed"}});
+                manifest_->readers.push_back(std::move(reader));++index_;
+                return Observation<bool>::available(false);
+            }
+            auto catalog=source_->inspect_data_channels(manifest_->policy.limits);
+            if(!catalog.value())return fail(*catalog.unavailable_detail());
+            std::size_t named=0,main=0;
+            for(const auto& entry:catalog.value()->channels){
+                if(entry.kind==DataChannelKind::MainData){++main;continue;}
+                if(entry.kind!=DataChannelKind::NamedData||!entry.logical_size.value())return fail({ObservationState::Unsupported,
+                    {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"target_read.unknown_channel"}});
+                const auto expected=std::find_if(channels.begin(),channels.end(),[&](const auto& c){return c.identifier==entry.identifier;});
+                if(expected==channels.end()||expected->logical_size!=*entry.logical_size.value())return fail({ObservationState::Changed,
+                    {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"target_read.catalog_changed"}});
+                ++named;
+            }
+            if(catalog.value()->coverage!=DataChannelCoverage::WindowsFileStreamInfo||named!=channels.size()||main!=(directory_?0U:1U))
+                return fail({ObservationState::Changed,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"target_read.catalog_shape"}});
+            source_->target_read_manifest_=manifest_;ready_=true;target_=nullptr;proof_.reset();container_.reset();
+            return close_error_?fail(close_observation()):Observation<bool>::available(true);
+        }catch(...){
+            return fail({ObservationState::Unknown,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"target_read.prepare_exception"}});
+        }
+    }
+    Observation<std::shared_ptr<const OpenedEntry>> source()const override {
+        using R=Observation<std::shared_ptr<const OpenedEntry>>;
+        if(!ready_||finished_||failed_)return closed<std::shared_ptr<const OpenedEntry>>();
+        return R::available(source_);
+    }
+    Observation<std::shared_ptr<const DirectoryCursor>> directory_cursor()override {
+        using R=Observation<std::shared_ptr<const DirectoryCursor>>;
+        if(!ready_||finished_||failed_||!directory_)return closed<std::shared_ptr<const DirectoryCursor>>();
+        if(!active_enumerator_.expired())return Observation<std::shared_ptr<const DirectoryCursor>>::unavailable(
+            ObservationState::Unsupported,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"target_read.enumerator_still_owned"});
+        detail::MetadataCaptureCleanupScope scope(this);
+        auto lease=detail::NativeTargetReadBudget::acquire(budget_,1,sizeof(WindowsDirectoryCursor));
+        if(!lease.value()){const auto&e=*lease.unavailable_detail();return R::unavailable(e.state,e.error);}
+        HANDLE raw=nullptr;
+        if(!DuplicateHandle(GetCurrentProcess(),enumeration_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+            return failure<std::shared_ptr<const DirectoryCursor>>(GetLastError(),"target_read.cursor_duplicate");
+        OwnedHandle owned(raw);auto current=identity(owned.get(),source_->scope_);
+        if(!current.value()){const auto&e=*current.unavailable_detail();return R::unavailable(e.state,e.error);}
+        auto cursor=std::make_shared<WindowsDirectoryCursor>(std::move(owned),std::move(current),source_->scope_);
+        cursor->target_read_budget_=std::move(lease).take_value();
+        cursor->target_read_enumeration_lease_=std::make_shared<const std::byte>();
+        active_enumerator_=cursor->target_read_enumeration_lease_;
+        return R::available(std::move(cursor));
+    }
+    Observation<bool> finish_io()override {
+        if(!finished_){detail::MetadataCaptureCleanupScope scope(this);
+            if(manifest_)for(const auto& reader:manifest_->readers)reader->finish_capture_reads();
+            if(source_)source_->finish_capture_reads();
+            enumeration_.reset();source_.reset();manifest_.reset();proof_.reset();container_.reset();target_=nullptr;
+            budget_.reset();finished_=true;
+        }
+        if(close_error_)return Observation<bool>::unavailable(close_error_->state,
+            {close_error_->domain,close_error_->code,close_error_->operation});
+        return Observation<bool>::available(true);
+    }
+private:
+    template<class T>static Observation<T> closed(){return Observation<T>::unavailable(ObservationState::Changed,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"target_read.not_ready_or_closed"});}
+    UnavailableObservation close_observation()const{return {close_error_->state,{close_error_->domain,close_error_->code,close_error_->operation}};}
+    Observation<bool> failure_result()const{return Observation<bool>::unavailable(failure_state_,{failure_domain_,failure_code_,failure_operation_.data()});}
+    Observation<bool> fail(const UnavailableObservation& e){
+        if(!failed_){failed_=true;failure_state_=e.state;failure_domain_=e.error.domain;failure_code_=e.error.code;
+            std::copy_n(e.error.operation.data(),std::min(e.error.operation.size(),failure_operation_.size()-1),failure_operation_.data());}
+        (void)finish_io();return close_error_?Observation<bool>::unavailable(close_error_->state,
+            {close_error_->domain,close_error_->code,close_error_->operation}):failure_result();
+    }
+    Observation<bool> open_base(){
+        const auto& snapshot=proof_->snapshot();
+        if(!limits_.valid()||!budget_||!latch_||!snapshot.policy.valid()||!snapshot.basic.kind.value()||
+           snapshot.channels.size()>snapshot.policy.limits.max_records||snapshot.channels.size()>limits_.max_retained_handles)
+            return Observation<bool>::unavailable(ObservationState::Failed,{ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidLimit),"target_read.request"});
+        directory_=*snapshot.basic.kind.value()==ObjectKind::Directory;
+        if(!directory_&&*snapshot.basic.kind.value()!=ObjectKind::RegularFile)return Observation<bool>::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::NotApplicable),"target_read.kind"});
+        std::unique_ptr<WindowsOpenedEntry> container_view;
+        if(container_){
+            HANDLE raw=nullptr;
+            if(!directory_||!DuplicateHandle(GetCurrentProcess(),container_->handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+                return failure<bool>(GetLastError(),"target_read.container_duplicate");
+            OwnedHandle owned(raw);container_view=std::make_unique<WindowsOpenedEntry>(std::move(owned),container_->scope_);
+            auto current=container_view->inspect_basic();if(!current.value()){const auto&e=*current.unavailable_detail();return Observation<bool>::unavailable(e.state,e.error);}
+            if(!current.value()->identity.value()||!snapshot.basic.identity.value()||
+               compare_identity(*current.value()->identity.value(),*snapshot.basic.identity.value())!=IdentityComparison::Same)
+                return Observation<bool>::unavailable(ObservationState::Changed,{ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::MetadataChanged),"target_read.container_proof"});
+            target_=container_view.get();auto valid=target_->qualify_metadata_replay(snapshot.policy);if(!valid.value()||!*valid.value())return valid;
+            valid=verify_native_metadata_replay_channels(snapshot);if(!valid.value()||!*valid.value())return valid;
+        }else{
+            auto valid=target_->qualify_progressive_target(*proof_);if(!valid.value()||!*valid.value())return valid;
+        }
+        std::size_t metadata=sizeof(WindowsTargetReadSeed)+sizeof(WindowsTargetReadManifest)+sizeof(WindowsOpenedEntry);
+        for(const auto& entry:snapshot.channels){const auto* units=entry.identifier.windows_units();
+            if(!units||units->size()>snapshot.policy.limits.max_native_bytes/sizeof(char16_t))return Observation<bool>::unavailable(ObservationState::Unsupported,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidIdentifier),"target_read.stream_identifier"});
+            const auto next=sizeof(WindowsMetadataChannel)+units->size()*sizeof(char16_t);
+            if(next>limits_.max_metadata_bytes||metadata>limits_.max_metadata_bytes-next)return Observation<bool>::unavailable(ObservationState::Unsupported,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InventoryLimit),"target_read.manifest_budget"});
+            metadata+=next;
+        }
+        auto lease=detail::NativeTargetReadBudget::acquire(budget_,snapshot.channels.size()+4,metadata);
+        if(!lease.value()){const auto&e=*lease.unavailable_detail();return Observation<bool>::unavailable(e.state,e.error);}
+        auto manifest=std::make_shared<WindowsTargetReadManifest>();manifest->policy=snapshot.policy;
+        manifest->budget=std::move(lease).take_value();manifest->readers.reserve(snapshot.channels.size());
+        const DWORD read=FILE_READ_DATA|FILE_READ_ATTRIBUTES|FILE_READ_EA|READ_CONTROL|SYNCHRONIZE|
+            (snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1?ACCESS_SYSTEM_SECURITY:0);
+        auto opened=target_->metadata_security_handle(read|FILE_WRITE_ATTRIBUTES);
+        if(!opened.value()){const auto&e=*opened.unavailable_detail();return Observation<bool>::unavailable(e.state,e.error);}
+        auto bootstrap=std::move(opened).take_value();const FILETIME suppressed{MAXDWORD,MAXDWORD};
+        if(!SetFileTime(bootstrap.get(),nullptr,&suppressed,&suppressed))return failure<bool>(GetLastError(),"target_read.base_suppress_times");
+        HANDLE raw=nullptr;
+        if(!DuplicateHandle(GetCurrentProcess(),bootstrap.get(),GetCurrentProcess(),&raw,read,FALSE,0))
+            return failure<bool>(GetLastError(),"target_read.base_reduce_rights");
+        OwnedHandle readonly(raw);auto prepared=std::make_shared<WindowsOpenedEntry>(std::move(readonly),target_->scope_,false,!directory_);
+        bootstrap.reset();if(close_error_)return Observation<bool>::unavailable(close_error_->state,
+            {close_error_->domain,close_error_->code,close_error_->operation});
+        // A separate, freshly opened enumeration description is prepared
+        // AFTER population. Never duplicate a pre-population cursor/OFD or
+        // reopen after restrictive security. A single active returned cursor
+        // owns its position; a later cursor restarts this prepared description.
+        if(directory_){
+            auto fresh=target_->metadata_security_handle(FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|SYNCHRONIZE|FILE_WRITE_ATTRIBUTES);
+            if(!fresh.value()){const auto&e=*fresh.unavailable_detail();return Observation<bool>::unavailable(e.state,e.error);}
+            auto enum_bootstrap=std::move(fresh).take_value();
+            if(!SetFileTime(enum_bootstrap.get(),nullptr,&suppressed,&suppressed))return failure<bool>(GetLastError(),"target_read.enumeration_suppress_times");
+            HANDLE raw_enum=nullptr;
+            if(!DuplicateHandle(GetCurrentProcess(),enum_bootstrap.get(),GetCurrentProcess(),&raw_enum,
+                FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|SYNCHRONIZE,FALSE,0))return failure<bool>(GetLastError(),"target_read.enumeration_reduce_rights");
+            OwnedHandle reduced_enum(raw_enum);enum_bootstrap.reset();
+            if(close_error_)return Observation<bool>::unavailable(close_error_->state,{close_error_->domain,close_error_->code,close_error_->operation});
+            enumeration_=std::move(reduced_enum);
+        }
+        manifest_=std::move(manifest);source_=std::move(prepared);target_=nullptr;
+        return Observation<bool>::available(true);
+    }
+    WindowsOpenedEntry* target_;
+    std::shared_ptr<const NativeMetadataProof> proof_;
+    MetadataCaptureLimits limits_;
+    std::shared_ptr<MetadataCaptureBudget> budget_;
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch_;
+    std::shared_ptr<const WindowsDirectoryCursor> container_;
+    std::shared_ptr<WindowsTargetReadManifest> manifest_;
+    std::shared_ptr<WindowsOpenedEntry> source_;
+    OwnedHandle enumeration_;
+    std::weak_ptr<const void> active_enumerator_;
+    std::size_t index_=0;
+    bool directory_=false,ready_=false,finished_=false,failed_=false;
+    mutable std::optional<MetadataCaptureCleanupError> close_error_;
+    ObservationState failure_state_=ObservationState::Unknown;
+    ErrorDomain failure_domain_=ErrorDomain::None;
+    std::int64_t failure_code_=0;
+    std::array<char,128> failure_operation_{};
 };
 
 Observation<bool> WindowsOpenedEntry::rename_noreplace(const DirectoryCursor& source_parent,
@@ -3518,6 +3771,22 @@ template<class T>Observation<std::unique_ptr<T>> stream_factory_error(const char
     return Observation<std::unique_ptr<T>>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),operation});
 }
+}
+Observation<NativeTargetReadSeed::Pointer> begin_native_target_read_seed(OpenedEntry& target,
+    std::shared_ptr<const NativeMetadataProof> proof,MetadataCaptureLimits limits,std::shared_ptr<MetadataCaptureBudget> budget,
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch) {
+    using R=Observation<NativeTargetReadSeed::Pointer>;auto* native=dynamic_cast<WindowsOpenedEntry*>(&target);
+    if(!native||!proof||!limits.valid()||!budget||!latch)return R::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"target_read.native_target_inputs"});
+    return R::available(std::make_unique<WindowsTargetReadSeed>(native,std::move(proof),limits,std::move(budget),std::move(latch)));
+}
+Observation<NativeTargetReadSeed::Pointer> begin_native_directory_read_seed(std::shared_ptr<const DirectoryCursor> directory,
+    std::shared_ptr<const NativeMetadataProof> proof,MetadataCaptureLimits limits,std::shared_ptr<MetadataCaptureBudget> budget,
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch) {
+    using R=Observation<NativeTargetReadSeed::Pointer>;auto native=std::dynamic_pointer_cast<const WindowsDirectoryCursor>(directory);
+    if(!native||!proof||!limits.valid()||!budget||!latch)return R::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"target_read.native_directory_inputs"});
+    return R::available(std::make_unique<WindowsTargetReadSeed>(nullptr,std::move(proof),limits,std::move(budget),std::move(latch),std::move(native)));
 }
 Observation<bool> qualify_native_metadata_target(OpenedEntry& target,const NativeMetadataProof& proof) {
     auto* native=dynamic_cast<WindowsOpenedEntry*>(&target);

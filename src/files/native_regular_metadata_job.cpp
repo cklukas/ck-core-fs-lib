@@ -38,7 +38,7 @@ Observation<bool> failure_result(const detail::PreparedJournalConsumerFailure& e
     catch(const std::bad_alloc&){return Observation<bool>::unavailable(e.state,{e.domain,e.code,{}});}
 }
 enum class Phase { SourceBefore,Preflight,OpenStream,ReadStream,WriteStream,CloseStream,OpenReader,
-    AttributeCatalog,RemoveAttributes,OrdinaryAttributes,Ownership,InitialBasic,Security,PrivilegedAttributes,
+    PrepareTargetObservation,AttributeCatalog,RemoveAttributes,OrdinaryAttributes,Ownership,InitialBasic,Security,PrivilegedAttributes,
     FinalTimes,ValuesBefore,VerifyStreams,ValuesAfter,SourceAfter,Flush,FinalValues,Complete };
 class StreamLatch final:public MetadataCaptureFailureLatch {
 public:
@@ -140,7 +140,7 @@ struct NativeRegularMetadataJob::Impl final:MetadataCaptureFailureLatch {
             if(result.value()&&*result.value()){auto now=target.inspect_basic();if(!now.value())return propagate<Step>(now);target_before=*now.value();phase=Phase::OpenStream;}
             break;
         case Phase::OpenStream:
-            if(index==s.channels.size()){index=0;phase=Phase::AttributeCatalog;break;}
+            if(index==s.channels.size()){index=0;phase=Phase::PrepareTargetObservation;break;}
             result=source_channel(s.channels[index]);if(!result.value()||!*result.value())break;
             {progress.metadata_effects=true;
              auto opened=detail::open_native_metadata_stream_writer(target,request.source,s.channels[index].identifier,std::move(latch));
@@ -169,6 +169,19 @@ struct NativeRegularMetadataJob::Impl final:MetadataCaptureFailureLatch {
             if(has_close_failure)return propagate<Step>(failure_result(close_failure));phase=Phase::OpenReader;break;
         case Phase::OpenReader:{auto reader=detail::open_native_metadata_stream_reader(target,request.source,s.channels[index].identifier,std::move(latch));
             if(!reader.value())return propagate<Step>(reader);readers.push_back(std::move(reader).take_value());++index;phase=Phase::OpenStream;break;}
+        case Phase::PrepareTargetObservation:
+            if(request.prepare_target_observation){
+                auto prepared=request.prepare_target_observation(target,stop);
+                auto drained=clean();if(!drained.value())return propagate<Step>(drained);
+                if(!prepared.value())return prepared;
+                if(*prepared.value()==Step::Pending)return pending();
+                if(*prepared.value()==Step::Cancelled){
+                    if(!stop.stop_requested())return reject<Step>("regular_metadata_job.observer_cancel_without_stop",ObservationState::Failed,AdapterError::InvalidNativeResult);
+                    progress.cancelled=true;return Observation<Step>::available(Step::Cancelled);
+                }
+                if(*prepared.value()!=Step::Complete)return reject<Step>("regular_metadata_job.observer_step",ObservationState::Failed,AdapterError::InvalidNativeResult);
+            }
+            phase=Phase::AttributeCatalog;break;
         case Phase::AttributeCatalog:{auto catalog=target.inspect_attributes(s.policy.limits);if(!catalog.value())return propagate<Step>(catalog);
             if(!target_before.identity.value()||!same(*target_before.identity.value(),catalog.value()->owner))return reject<Step>("regular_metadata_job.target_attribute_owner");
             attributes=std::move(catalog).take_value();index=0;phase=Phase::RemoveAttributes;break;}

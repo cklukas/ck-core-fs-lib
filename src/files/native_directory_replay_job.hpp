@@ -6,6 +6,7 @@
 #include "private_journal_scope.hpp"
 #include "native_directory_replay_verifier.hpp"
 #include "metadata_capture_job.hpp"
+#include "operation_metadata_job.hpp"
 #include <array>
 #include <functional>
 #include <string_view>
@@ -59,6 +60,10 @@ struct NativeDirectoryReplayRequest final {
     std::shared_ptr<const NativeMetadataProof> destination_review_proof;
     MetadataCaptureLimits metadata_limits{};
     std::shared_ptr<MetadataCaptureBudget> metadata_budget;
+    // Backend Tree hook only, after named streams exist, before restrictive
+    // metadata. No frontend callback or native-handle exposure. The enclosing
+    // Tree owns/drains the resulting independent target observer.
+    std::function<Observation<OperationMetadataStep>(OpenedEntry&,std::stop_token)> prepare_target_observation{};
 };
 // One native worker owns this cooperative job. Every advance performs one
 // phase; the enclosing Tree worker supplies threading and cancellation.

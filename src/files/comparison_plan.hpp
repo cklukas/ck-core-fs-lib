@@ -71,6 +71,11 @@ struct ComparisonMetadataDigest final {
     ComparisonObject before, after;
 };
 
+// Declarative execution contract facts, never native mutation authority.
+// Version1 requires an executor that performs fresh review-bound capture,
+// native creation/held-target binding and journaled postorder verification.
+// The generic planner and every legacy C adapter default to Unknown.
+enum class ComparisonDirectoryMetadataContract { Unknown, NativeOriginalPostorderV1 };
 struct ComparisonEntry final {
     // Exact, lossless adapter comparison key, '/' separated relative components.
     // No empty, '.', '..', NUL or backslash components, absolute/drive paths.
@@ -82,6 +87,7 @@ struct ComparisonEntry final {
     bool excluded = false;       // protects this path and its entire subtree
     bool name_collision = false;
     std::optional<ComparisonMetadataDigest> metadata_digest;
+    ComparisonDirectoryMetadataContract directory_metadata_contract=ComparisonDirectoryMetadataContract::Unknown;
 };
 
 struct ComparisonInventory final {
@@ -115,6 +121,7 @@ struct ComparisonOptions final {
     // remain unresolved until directory metadata has a preservation contract.
     // Byte-count completeness continues to describe main-data byte counts.
     bool compare_preserved_metadata = false;
+    ComparisonDirectoryMetadataContract directory_metadata_contract=ComparisonDirectoryMetadataContract::Unknown;
 };
 
 struct ComparisonLimits final {

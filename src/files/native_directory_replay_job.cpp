@@ -126,6 +126,7 @@ struct NativeDirectoryReplayJob::Bounded {
     std::optional<std::array<std::byte,32>> target_payload;
     DirectoryMetadataApplyJob::Pointer apply;
     DirectoryMetadataVerifyJob::Pointer verify;
+    bool target_observation_prepared=false;
 };
 NativeDirectoryReplayJob::NativeDirectoryReplayJob(NativeDirectoryReplayRequest request):request_(std::move(request)) {
     if(request_.source_proof){bounded_=std::make_unique<Bounded>(request_.journal_root);
@@ -363,6 +364,20 @@ Observation<bool> NativeDirectoryReplayJob::bounded_step(std::stop_token stop) {
             return reject("directory_replay.apply_close_failed",ObservationState::Unknown,AdapterError::InvalidNativeResult);}
         if(progress.phase==DirectoryApplyPhase::Cancelled)return reject("directory_replay.apply_cancelled",ObservationState::Unknown,AdapterError::InterruptedRead);
         if(progress.phase==DirectoryApplyPhase::AwaitingVerifier){
+            if(!state.target_observation_prepared){
+                if(request_.prepare_target_observation){
+                    auto prepared=request_.prepare_target_observation(creator_?creator_->metadata_writer():*writer_,stop);
+                    detail::PreparedJournalConsumerFailure close;
+                    if(detail::read_prepared_journal_consumer_failure(*request_.journal_root,close))return Observation<bool>::unavailable(
+                        close.state,{close.domain,close.code,close.operation.data()});
+                    if(!prepared.value())return propagate(prepared);
+                    if(*prepared.value()==OperationMetadataStep::Pending)return Observation<bool>::available(true);
+                    if(*prepared.value()==OperationMetadataStep::Cancelled&&stop.stop_requested())return reject(
+                        "directory_replay.observer_cancelled",ObservationState::Unknown,AdapterError::InterruptedRead);
+                    if(*prepared.value()!=OperationMetadataStep::Complete)return reject("directory_replay.observer_step",ObservationState::Failed,AdapterError::InvalidNativeResult);
+                }
+                state.target_observation_prepared=true;return Observation<bool>::available(true);
+            }
             if(!request_.reviewed_metadata.channels.empty()){
                 auto independent=create_directory_replay_verifier(destination_,cursor_,std::move(verifier_),request_.reviewed_metadata,request_.journal_root,stop);
                 if(!independent.value())return propagate(independent);stream_verifier_=std::move(independent).take_value();}

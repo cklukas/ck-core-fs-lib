@@ -444,6 +444,50 @@ if(BUILD_TESTING)
     if(NOT CK_CORE_FS_METADATA_TARGET_NATIVE_FS MATCHES "^(NTFS|ReFS)$")
       message(FATAL_ERROR "Native metadata stream target fixture must select NTFS or ReFS")
     endif()
+    # These are native Windows cases. Do not register their non-Windows
+    # fallback entry points as positive qualification.
+    foreach(suite native_copy_source_close_windows target_read_seed native_tree_execution tree_fixture_native_root native_tree_complete)
+      add_executable(ck_fs_${suite}_tests tests/${suite}_tests.cpp)
+      target_link_libraries(ck_fs_${suite}_tests PRIVATE ck_core_fs_native)
+      if(MSVC)
+        target_compile_options(ck_fs_${suite}_tests PRIVATE /UNDEBUG)
+        target_link_options(ck_fs_${suite}_tests PRIVATE /ENTRY:wmainCRTStartup)
+      else()
+        target_compile_options(ck_fs_${suite}_tests PRIVATE -UNDEBUG)
+      endif()
+    endforeach()
+    target_link_libraries(ck_fs_native_copy_source_close_windows_tests PRIVATE dbghelp)
+    add_test(NAME native_copy_source_close_windows COMMAND ck_fs_native_copy_source_close_windows_tests
+      --expect-filesystem "${CK_CORE_FS_METADATA_TARGET_NATIVE_FS}"
+      --fixture-root "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    add_test(NAME target_read_seed COMMAND ck_fs_target_read_seed_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    add_test(NAME native_tree_execution COMMAND ck_fs_native_tree_execution_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    add_test(NAME native_tree_execution_controls COMMAND ck_fs_native_tree_execution_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}" --controls)
+    add_test(NAME tree_fixture_native_root COMMAND ck_fs_tree_fixture_native_root_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    # Complete security replay explicitly exercises SeSecurityPrivilege. A
+    # machine lacking that native test capability must not count a skip as PASS.
+    option(CK_CORE_FS_TEST_PRIVILEGED_METADATA "Run native Complete security replay qualification" OFF)
+    if(CK_CORE_FS_TEST_PRIVILEGED_METADATA)
+      add_test(NAME target_read_seed_complete COMMAND ck_fs_target_read_seed_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}" --complete)
+      set_tests_properties(target_read_seed_complete PROPERTIES TIMEOUT 300
+        LABELS "windows;native;metadata;privileged"
+        ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+      add_test(NAME native_tree_complete COMMAND ck_fs_native_tree_complete_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+      set_tests_properties(native_tree_complete PROPERTIES TIMEOUT 1200
+        LABELS "windows;native;metadata;privileged"
+        ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    endif()
+    set_tests_properties(native_copy_source_close_windows target_read_seed tree_fixture_native_root PROPERTIES TIMEOUT 300
+      LABELS "windows;native;metadata"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    # New test budgets follow measured /Od whole-tree runs: 458s NTFS,
+    # 697s ReFS; controls 255s/332s. Existing test deadlines are unchanged.
+    set_tests_properties(native_tree_execution PROPERTIES TIMEOUT 1200
+      LABELS "windows;native;metadata"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    set_tests_properties(native_tree_execution_controls PROPERTIES TIMEOUT 600
+      LABELS "windows;native;metadata"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
     add_executable(ck_fs_native_metadata_stream_target_tests
       tests/native_metadata_stream_target_windows_tests.cpp)
     target_link_libraries(ck_fs_native_metadata_stream_target_tests PRIVATE ck_core_fs_native)
