@@ -195,6 +195,30 @@ linked against the unchanged normal `-O0` SDK. This is an optimized-fixture
 check, not qualification of an optimized product build. CTest now registers
 `native_sync_resolution_posix_close` on Linux.
 
+## Coherent macOS development race run
+
+The 418-file development snapshot (manifest
+`1ec62808999f485488403f0691e1a360a4d783bd9f0f38deafd45d04c6f58e5a`)
+was rebuilt with LLVM 23.1.4, matching TSan instrumentation on all 171 C/C++
+translation units, and the separately qualified corrected Darwin runtime
+`ba79ff2e55b670221abbcd28d5becef30eae9b56b9f77d9a6a9673f4e356eae2`.
+The clean 217-step build took 312.17 seconds; all 50 CTest entries ran in
+55.14 seconds. Loader output proves that exact runtime was used, with no race
+warnings or runtime CHECK failures.
+
+The suite result remains **43/50 PASS**, with seven failures: native regular
+metadata publication, regular metadata, lifecycle, C Tree copy, C Tree KeepBoth,
+reviewed Tree execution, and changed-receipt preview. The latter observed
+`journal_scope.ancestor_changed` during its precondition; an isolated run of
+the same binary subsequently passed all 153 changed-receipt checks. The
+original failure is retained and its external cause is not established.
+The remaining publication/receipt failures still block release. No failing
+entry was skipped or converted into an expected pass.
+
+This snapshot includes the first terminal-drain fix but predates the subsequent
+journal-owned Root propagation correction and new Tree own-effect integration.
+It is neither a stock-runtime pass nor qualification of those later changes.
+
 ## Remaining gates
 
 - Integrate and qualify postorder directory metadata replay and bounded
