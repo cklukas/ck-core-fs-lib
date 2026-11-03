@@ -365,7 +365,7 @@ regular-file copying plus created and merged directories, ADS, progressive
 metadata, target readers and sealed completion. The same executable passed
 **4,213 NTFS / 4,389 ReFS adversarial checks**: changed source before staging,
 foreign target mutation, cancellation after directory creation, and actual
-journal-close failure with and without persistent allocation failure. None of
+journal-close failure with and without an injected diagnostic allocation failure. None of
 those failures may issue completion proof. These are native normal results;
 the frozen cohort precedes the later common Batch/Legacy cleanup fixes.
 
