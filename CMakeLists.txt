@@ -211,6 +211,18 @@ include(CTest)
 if(BUILD_TESTING)
   enable_testing()
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(CK_CORE_FS_SHARED_TSAN_RUNTIME "" CACHE FILEPATH "Exact shared TSan runtime selected by qualification")
+  if(CK_CORE_FS_SHARED_TSAN_RUNTIME)
+    if(NOT CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF" OR NOT EXISTS "${CK_CORE_FS_SHARED_TSAN_RUNTIME}")
+      message(FATAL_ERROR "Shared TSan runtime qualification requires an existing ELF runtime")
+    endif()
+    add_executable(ck_fs_tsan_allocator_runtime_tests tests/tsan_allocator_runtime_tests.cpp)
+    target_compile_features(ck_fs_tsan_allocator_runtime_tests PRIVATE cxx_std_20)
+    target_link_libraries(ck_fs_tsan_allocator_runtime_tests PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    add_test(NAME tsan_allocator_runtime COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tsan_allocator_runtime.py
+      $<TARGET_FILE:ck_fs_tsan_allocator_runtime_tests> ${CK_CORE_FS_SHARED_TSAN_RUNTIME})
+  endif()
   # Mixed C++/C qualification must contain ONE native implementation. Linking
   # the native static archives and the C shared library into the same process
   # duplicates RTTI/state and triggers a genuine ASan ODR violation. Reuse the

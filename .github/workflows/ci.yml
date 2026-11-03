@@ -104,6 +104,7 @@ jobs:
           export TMPDIR="$task/tmp" TEMP="$task/tmp" TMP="$task/tmp"
           cmake -DQUALIFICATION_OUTPUT="$task" \
             -DQUALIFICATION_SANITIZER=${{ matrix.sanitizer }} \
+            -DQUALIFICATION_SHARED_THREAD_RUNTIME=${{ matrix.sanitizer == 'thread' && 'ON' || 'OFF' }} \
             -P tools/qualification.cmake
 
   macos:

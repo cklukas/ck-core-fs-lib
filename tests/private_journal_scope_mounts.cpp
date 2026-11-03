@@ -214,9 +214,10 @@ int run(const NativeAbsolutePath& scratch) {
         require(take(state->create_hard_link(name("private-state"), protected_id, *tree_source,
             name("private-hardlink")), "tree private hardlink"), "tree private link false");
         auto private_plan = preview(2);
+        const auto private_progress=private_plan->progress();
         require(private_plan->state() == ReviewedTreeState::Failed && !private_plan->preview() &&
-            bool(private_plan->progress().failure), "private alias exposed a Tree mutation proposal");
-        const auto& error = *private_plan->progress().failure;
+            bool(private_progress.failure), "private alias exposed a Tree mutation proposal");
+        const auto& error = *private_progress.failure;
         require(error.state == ObservationState::Unsupported && error.error.domain == ErrorDomain::Adapter &&
             error.error.code == static_cast<std::int64_t>(AdapterError::PlanTopologyUnsafe),
             "Tree private alias refusal lost typed Unsupported Adapter18");
