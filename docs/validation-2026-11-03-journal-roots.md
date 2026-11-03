@@ -144,6 +144,15 @@ itself remains compiled as C. An independent, fully matching ASan/UBSan C/C++
 plugin test passes and verifies that the C++ runtime loads before `main`.
 The complete committed SDK CI rerun remains required.
 
+That rerun passed ASan/UBSan, Windows and both normal Linux configurations.
+The thread-instrumented run exposed a cancellation-state defect: an
+interruption arriving inside Root preparation could return `Failed` instead
+of `Cancelled`. The transition now checks the actual stop token and
+interruption domain before failed-item accounting. Native cleanup errors
+retain precedence, including errors on a borrowed Root. Forty-four native,
+deterministic checks and the actual C cancellation test passed on a fresh
+matching Root4 build; the full CI rerun with this correction remains required.
+
 No final dependency pin or release is established by this packaging increment.
 
 ## Actual XFS and Btrfs fixtures

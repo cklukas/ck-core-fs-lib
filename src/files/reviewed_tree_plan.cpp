@@ -7,6 +7,7 @@
 #include "directory_name_rules.hpp"
 #include "prepared_journal_root.hpp"
 #include "private_journal_scope.hpp"
+#include "platform/prepared_journal_root_bridge.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -16,6 +17,10 @@ namespace {
 UnavailableObservation error(AdapterError code, const char* op,
     ObservationState state = ObservationState::Failed) {
     return {state, {ErrorDomain::Adapter, static_cast<std::int64_t>(code), op}};
+}
+bool interrupted_for_stop(const UnavailableObservation& e,std::stop_token stop)noexcept {
+    return stop.stop_requested()&&e.error.domain==ErrorDomain::Adapter&&
+        e.error.code==static_cast<std::int64_t>(AdapterError::InterruptedRead);
 }
 template<class T> Observation<T> unavailable(const UnavailableObservation& e) {
     return Observation<T>::unavailable(e.state, e.error);
@@ -432,6 +437,9 @@ struct ReviewedTreePlanJob::Impl {
             if((!finished.value()||!*finished.value())&&!close_failure)close_failure=finished.value()?
                 error(AdapterError::InvalidNativeResult,"reviewed_tree.private_root_finish_false"):*finished.unavailable_detail();
         }
+        detail::PreparedJournalConsumerFailure first;
+        if(root&&detail::read_prepared_journal_consumer_failure(*root,first))
+            close_failure=UnavailableObservation{first.state,{first.domain,first.code,first.operation.data()}};
         if(close_failure) {
             for(auto& item:items)if(mutation(item.action)&&item.state==ReviewedTreeItemState::Complete) {
                 item.state=ReviewedTreeItemState::NeedsReconciliation;item.failure=*close_failure;item.recovery_required=true;
@@ -439,6 +447,25 @@ struct ReviewedTreePlanJob::Impl {
             }
             fail(std::move(*close_failure),true);
         }
+    }
+    void cancel_step(std::stop_token stop) {
+        const auto copy_state=copy?copy->advance(stop):OperationExecutionState::Cancelled;
+        const bool ambiguous=copy_state==OperationExecutionState::NeedsReconciliation||copy_state==OperationExecutionState::Complete||
+            (deleting&&deleting->phase>=3);
+        if(copy&&copy->result().failure) {
+            const auto& e=*copy->result().failure;
+            if(!interrupted_for_stop(e,stop)||ambiguous){fail(e,true);return;}
+        }
+        progress.state=ambiguous?ReviewedTreeState::NeedsReconciliation:mutated?ReviewedTreeState::Partial:ReviewedTreeState::Cancelled;
+        progress.partial=mutated;progress.recovery_required=progress.recovery_required||mutated||ambiguous;
+        if(current<items.size()){
+            items[index()].state=ambiguous?ReviewedTreeItemState::NeedsReconciliation:ReviewedTreeItemState::Cancelled;
+            items[index()].recovery_required=progress.recovery_required;
+        }
+    }
+    void failure_or_cancel(const UnavailableObservation& e,std::stop_token stop,bool reconcile=false) {
+        if(interrupted_for_stop(e,stop))cancel_step(stop);
+        else fail(e,reconcile);
     }
     void fail(UnavailableObservation e, bool reconcile = false) {
         failure = e; progress.failure = e;
@@ -517,7 +544,7 @@ struct ReviewedTreePlanJob::Impl {
             start_scan(0); return;
         }
         scanner->step(stop);
-        if (scanner->failure) { fail(*scanner->failure); return; }
+        if (scanner->failure) { failure_or_cancel(*scanner->failure,stop); return; }
         if (!scanner->complete) return;
         auto observed = std::move(scanner->tree);
         if (progress.state == ReviewedTreeState::Inventory) {
@@ -1435,27 +1462,11 @@ ReviewedTreeState ReviewedTreePlanJob::advance(std::stop_token stop) {
     auto& p = *impl_;
     const auto state = p.progress.state;
     if (state >= ReviewedTreeState::Complete || (state == ReviewedTreeState::AwaitingReview && !stop.stop_requested())) return state;
-    if (stop.stop_requested()) {
-        auto copy_state = p.copy ? p.copy->advance(stop) : OperationExecutionState::Cancelled;
-        if(p.copy&&p.copy->result().failure) {
-            p.fail(*p.copy->result().failure,true);
-            p.finish_owned_private_root();return p.progress.state;
-        }
-        const bool ambiguous = copy_state == OperationExecutionState::NeedsReconciliation || copy_state == OperationExecutionState::Complete ||
-            (p.deleting && p.deleting->phase >= 3);
-        p.progress.state = ambiguous ? ReviewedTreeState::NeedsReconciliation : p.mutated ? ReviewedTreeState::Partial : ReviewedTreeState::Cancelled;
-        p.progress.partial = p.mutated;
-        p.progress.recovery_required = p.progress.recovery_required || p.mutated || ambiguous;
-        if (p.current < p.items.size()) {
-            p.items[p.index()].state = ambiguous ? ReviewedTreeItemState::NeedsReconciliation : ReviewedTreeItemState::Cancelled;
-            p.items[p.index()].recovery_required = p.progress.recovery_required;
-        }
-        p.finish_owned_private_root();return p.progress.state;
-    }
+    if(stop.stop_requested()){p.cancel_step(stop);p.finish_owned_private_root();return p.progress.state;}
     auto initialized=p.initialize_private_root(stop);
-    if(!initialized.value()){p.fail(*initialized.unavailable_detail());p.finish_owned_private_root();return p.progress.state;}
+    if(!initialized.value()){p.failure_or_cancel(*initialized.unavailable_detail(),stop);p.finish_owned_private_root();return p.progress.state;}
     auto private_scope=p.private_scope_guard(stop);
-    if(!private_scope.value()){p.fail(*private_scope.unavailable_detail(),p.mutated||bool(p.copy)||bool(p.deleting));p.finish_owned_private_root();return p.progress.state;}
+    if(!private_scope.value()){p.failure_or_cancel(*private_scope.unavailable_detail(),stop,p.mutated||bool(p.copy)||bool(p.deleting));p.finish_owned_private_root();return p.progress.state;}
     if (!p.topology_done) p.topology_step();
     else if (state == ReviewedTreeState::Inventory || state == ReviewedTreeState::Revalidating) p.scan_step(stop);
     else p.execute_step(stop);
