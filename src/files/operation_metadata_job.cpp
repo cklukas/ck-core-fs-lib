@@ -12,8 +12,11 @@ UnavailableObservation error(AdapterError code, const char* operation, Observati
 }
 
 Observation<OperationMetadataJob::Pointer> OperationMetadataJob::create(OperationMetadataRequest request) {
-    if (!request.apply_traversal_metadata || !request.apply_security_metadata || !request.apply_final_times ||
-        !request.flush_destination)
+    const bool any_single = request.apply_traversal_metadata || request.apply_security_metadata ||
+        request.apply_final_times || request.flush_destination;
+    const bool all_single = request.apply_traversal_metadata && request.apply_security_metadata &&
+        request.apply_final_times && request.flush_destination;
+    if (request.advance_phase ? any_single : !all_single)
         return Observation<Pointer>::unavailable(ObservationState::Failed,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidAccess), "metadata_job.adapters"});
     return Observation<Pointer>::available(Pointer(new OperationMetadataJob(std::move(request))));
@@ -46,6 +49,7 @@ OperationMetadataState OperationMetadataJob::invoke(
 OperationMetadataState OperationMetadataJob::advance(std::stop_token stop) {
     if (state() == OperationMetadataState::Complete || state() == OperationMetadataState::Failed ||
         state() == OperationMetadataState::Cancelled) return state();
+    if (request_.advance_phase) return advance_cooperative(stop);
     switch (state()) {
     case OperationMetadataState::Ready:
         result_.state = OperationMetadataState::ApplyingTraversal;
@@ -70,6 +74,28 @@ OperationMetadataState OperationMetadataJob::advance(std::stop_token stop) {
     case OperationMetadataState::Failed:
     case OperationMetadataState::Cancelled: return state();
     }
+    return state();
+}
+
+OperationMetadataState OperationMetadataJob::advance_cooperative(std::stop_token stop) {
+    if (stop.stop_requested()) { cancel(); return state(); }
+    if (state() == OperationMetadataState::Ready) result_.state = OperationMetadataState::ApplyingTraversal;
+    try {
+        auto step = request_.advance_phase(state(), stop);
+        if (!step.value()) { fail(*step.unavailable_detail()); return state(); }
+        if (*step.value() != OperationMetadataStep::Pending && *step.value() != OperationMetadataStep::Complete) {
+            fail(error(AdapterError::InvalidNativeResult, "metadata_job.cooperative_result")); return state();
+        }
+        if (stop.stop_requested()) { cancel(); return state(); }
+        if (*step.value() == OperationMetadataStep::Pending) return state();
+        switch (state()) {
+        case OperationMetadataState::ApplyingTraversal: result_.state = OperationMetadataState::ApplyingSecurity; break;
+        case OperationMetadataState::ApplyingSecurity: result_.state = OperationMetadataState::ApplyingTimes; break;
+        case OperationMetadataState::ApplyingTimes: result_.state = OperationMetadataState::Flushing; break;
+        case OperationMetadataState::Flushing: result_.state = OperationMetadataState::Complete; break;
+        default: fail(error(AdapterError::InvalidNativeResult, "metadata_job.cooperative_phase")); break;
+        }
+    } catch (...) { fail(error(AdapterError::InvalidNativeResult, "metadata_job.cooperative_exception")); }
     return state();
 }
 

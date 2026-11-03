@@ -13,6 +13,7 @@ namespace ck::files {
 
 enum class OperationMetadataState { Ready, ApplyingTraversal, ApplyingSecurity, ApplyingTimes, Flushing,
                                     Complete, Failed, Cancelled };
+enum class OperationMetadataStep { Pending, Complete };
 
 struct OperationMetadataRequest final {
     // Every phase is required, including explicit no-op callbacks.
@@ -20,6 +21,11 @@ struct OperationMetadataRequest final {
     std::function<Observation<bool>(std::stop_token)> apply_security_metadata;
     std::function<Observation<bool>(std::stop_token)> apply_final_times;
     std::function<Observation<bool>(std::stop_token)> flush_destination;
+    // Alternative to the four single-call adapters. One worker invocation
+    // advances only the current phase; Pending preserves that phase without
+    // granting completion. Never combine this with a single-call adapter.
+    // The native producer owns its bounded reads and all retained handles.
+    std::function<Observation<OperationMetadataStep>(OperationMetadataState, std::stop_token)> advance_phase;
 };
 
 struct OperationMetadataResult final {
@@ -44,6 +50,7 @@ private:
     void cancel() noexcept;
     OperationMetadataState invoke(const std::function<Observation<bool>(std::stop_token)>& callback,
                                   const char* operation, std::stop_token stop);
+    OperationMetadataState advance_cooperative(std::stop_token);
     OperationMetadataRequest request_;
     OperationMetadataResult result_;
 };
