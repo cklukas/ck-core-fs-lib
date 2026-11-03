@@ -345,6 +345,11 @@ if(BUILD_TESTING)
   add_test(NAME regular_execution_source COMMAND ck_fs_regular_execution_source_tests)
   set_tests_properties(regular_execution_source PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  add_executable(ck_fs_regular_metadata_review_tests tests/regular_metadata_review_tests.cpp)
+  target_link_libraries(ck_fs_regular_metadata_review_tests PRIVATE ck_core_fs_native ${CMAKE_DL_LIBS})
+  add_test(NAME regular_metadata_review COMMAND ck_fs_regular_metadata_review_tests --patched)
+  set_tests_properties(regular_metadata_review PROPERTIES TIMEOUT 180
+    ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   add_executable(ck_fs_native_directory_replay_job_tests tests/native_directory_replay_job_tests.cpp)
   add_executable(ck_fs_directory_postorder_worker_tests tests/directory_postorder_worker_tests.cpp)
   target_link_libraries(ck_fs_directory_postorder_worker_tests PRIVATE ck_core_fs_native)

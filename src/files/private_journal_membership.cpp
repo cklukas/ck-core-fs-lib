@@ -13,12 +13,11 @@ template<class T> bool equal(const Observation<T>& a,const Observation<T>& b) no
 }
 Observation<bool> detail::PrivateMembershipFailure::result() const {
     if(!*this)return Observation<bool>::available(true);
-    try {return Observation<bool>::unavailable(state,{domain,code,operation.data()});}
-    catch(const std::bad_alloc&) {
-        // All native owners have already been consumed. A native close error
-        // is also retained in Root's fixed failure latch before any formatting.
-        return Observation<bool>::unavailable(state,{domain,code,{}});
-    }
+    // Even an empty std::string may allocate a debug iterator proxy inside a
+    // noexcept constructor on MSVC. Do not manufacture another diagnostic on
+    // allocation failure: all owners have drained and Root retains the first
+    // native close error in its fixed latch. Let bad_alloc reach the caller.
+    return Observation<bool>::unavailable(state,{domain,code,operation.data()});
 }
 bool detail::private_membership_entry_qualified(const BasicMetadata& m) noexcept {
     return m.identity.value()&&compare_identity(*m.identity.value(),*m.identity.value())==IdentityComparison::Same&&

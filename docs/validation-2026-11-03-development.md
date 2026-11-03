@@ -87,6 +87,22 @@ directory worker v1; the subsequently integrated v3 values cache has separate
 native evidence (3,238 macOS checks and 11,173 each on NTFS/ReFS). Neither
 result establishes whole Tree composition or matching sanitizer qualification.
 
+The next coherent Linux ARM64/ext4 416-file snapshot has manifest
+`ae62828d65d71ed03392382597a57383152b50781332bd1161e3d9f87a7cc9f0`.
+Its fresh GCC 14 Debug build (`-O0 -g0`, one CPU) passed in 509.78s; all nine
+selected native tests passed in 23.09s. A recorded derivative replaced only
+the membership diagnostic implementation and added two regression fixtures;
+all original header bytes and remaining compile commands stayed unchanged.
+The expanded eleven-test run passed in 62.46s, including actual consumed
+source/HeldChild/directory close faults before baseline CAS and the six
+progressive metadata review regressions. This is normal component qualification,
+not a whole Tree, O2, sanitizer or physical power-loss result.
+
+The membership fix propagates allocation failure after native owners drain,
+rather than constructing another diagnostic with an empty string: MSVC debug
+iterator storage can allocate even for that fallback. The unchanged Windows
+native test passed 117 ordinary-path and 118 long-path checks after this fix.
+
 The later coherent Windows and macOS integration runs still fail Tree receipt
 validation after publication. Passing source and metadata components therefore
 do not establish receipt-bound execution completion. The Linux mount candidate
@@ -99,6 +115,8 @@ run is required before counting that correction as qualified.
 
 - Integrate and qualify postorder directory metadata replay and bounded
   regular-file metadata execution against the exact reviewed evidence.
+- Explicitly consume the base native copy source before terminal completion;
+  qualify its close faults while preserving Move's source-retirement ordering.
 - Qualify Windows named conflict resolution and all-stream admission.
 - Complete native Linux mount-ancestry qualification on ext4, XFS and Btrfs.
 - Retain the macOS strong-publication failures until a suitable native

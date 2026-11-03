@@ -86,7 +86,11 @@ struct NativeRegularMetadataJob::Impl final:MetadataCaptureFailureLatch {
         auto result=clean();if(!result.value()||!*result.value())return result;
         if(!request.source||request.source->io_finished())return reject<bool>("regular_metadata_job.closed_source",ObservationState::Changed,AdapterError::InvalidAccess);
         result=request.journal_root->revalidate();if(!result.value()||!*result.value())return result;
-        return request.verify_membership(stop);
+        result=request.verify_membership(stop);
+        if(!result.value()||!*result.value())return result;
+        // Callback-local native owners may report a consumed close failure
+        // while returning. Block further I/O/effects before leaving this gate.
+        return clean();
     }
     void record_close(const Observation<bool>& result)noexcept {
         if(const auto* e=result.unavailable_detail()) {
@@ -111,6 +115,7 @@ struct NativeRegularMetadataJob::Impl final:MetadataCaptureFailureLatch {
         auto result=request.revalidate_source(!source_started,stop);source_started=true;
         if(!result.value())return result;
         if(*result.value()==Step::Pending)return pending();
+        if(*result.value()==Step::Cancelled&&stop.stop_requested())return result;
         if(*result.value()!=Step::Complete)return reject<Step>("regular_metadata_job.source_step",ObservationState::Failed,AdapterError::InvalidNativeResult);
         source_started=false;phase=next;return pending();
     }

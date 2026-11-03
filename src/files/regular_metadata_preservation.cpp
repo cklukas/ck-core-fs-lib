@@ -205,6 +205,10 @@ Observation<bool> RegularMetadataPreservation::finish_progressive_io() {
         }
         // Drop duplicate callback/proof/Root references while the close
         // observer is still active. The replay values contain closed evidence.
+        // The preservation object can outlive terminal execution through the
+        // enclosing copy callbacks. Consume its original held source and drop
+        // closed native evidence here, while Root still observes every close.
+        source_.reset();replay_.reset();progressive_job_.reset();
         progressive_.reset();latch.read_root();
     }
     progressive_finished_=true;return result();
