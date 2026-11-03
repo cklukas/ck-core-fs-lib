@@ -3,6 +3,7 @@
 #pragma once
 #include "native_path.hpp"
 #include "sync_baseline.hpp"
+#include "prepared_journal_root.hpp"
 #include <functional>
 #include <memory>
 #include <optional>
@@ -12,7 +13,8 @@ namespace ck::files {
 
 // Internal C++ contract. The C facade owns the session and translates exceptions.
 // Calls on one session/backend must be serialized. Native roots/locks remain
-// held until destruction; callers revalidate before using borrowed root handles.
+// held until terminal finish_io or destruction; the Root owner is retained until
+// destruction. Revalidate before using borrowed root handles.
 struct SyncSessionIdentity final {
     SyncDigest left_root{}, right_root{}, policy{}, pair{};
 };
@@ -24,9 +26,11 @@ struct SyncSessionSnapshot final {
     // Inspection only, never implicitly promoted after corruption/lost intent.
     std::optional<SyncBaseline> previous;
 };
-enum class SyncSessionIo { Write, FileFlush, Publish, ParentFlush, Remove, FileClose };
+enum class SyncSessionIo { Write, FileFlush, Publish, ParentFlush, Remove, FileClose, NativeHandleClose };
 // Test hook: return false to fail BEFORE the named operation. Write is called
 // for every native write, including retries. max_write_bytes forces short writes.
+// NativeHandleClose is failure-only and observed AFTER the actual close: it
+// cannot skip a close or manufacture success. A throwing close observer fails.
 struct SyncSessionFaults final {
     std::function<bool(SyncSessionIo)> before;
     std::size_t max_write_bytes = 1024 * 1024;
@@ -40,6 +44,9 @@ struct SyncSessionFaults final {
 class SyncSessionBackend {
 public:
     virtual ~SyncSessionBackend() = default;
+    virtual PreparedJournalRoot::Pointer storage_root() const noexcept { return {}; }
+    virtual Observation<bool> finish_io() { return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"sync_session.backend_finish"}); }
     virtual const SyncDigest& left_identity() const noexcept = 0;
     virtual const SyncDigest& right_identity() const noexcept = 0;
     virtual Observation<bool> revalidate() = 0;
@@ -66,14 +73,26 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     const NativeAbsolutePath& coordinator, const NativeAbsolutePath& left,
     const NativeAbsolutePath& right, SyncSessionFaults faults = {});
 
+// Initial legacy address acquisition only. Consumers must subsequently share the
+// returned owner; navigation_address is never reopening authority.
+Observation<PreparedJournalRoot::Pointer> acquire_native_sync_storage_root(const NativeAbsolutePath&);
+Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backend(
+    PreparedJournalRoot::Pointer, const NativeAbsolutePath& left,
+    const NativeAbsolutePath& right, SyncSessionFaults faults = {});
+
 class SyncSession final {
 public:
     static Observation<std::unique_ptr<SyncSession>> open(std::unique_ptr<SyncSessionBackend>,
         const SyncDigest& policy, SyncBaselineLimits limits = {});
     const SyncSessionIdentity& identity() const noexcept { return identity_; }
+    PreparedJournalRoot::Pointer storage_root() const noexcept { return finished_?PreparedJournalRoot::Pointer{}:backend_->storage_root(); }
     const SyncSessionSnapshot& snapshot() const noexcept { return snapshot_; }
-    std::intptr_t root_handle(bool right) const noexcept { return backend_->root_handle(right); }
-    Observation<bool> revalidate() { return backend_->revalidate(); }
+    std::intptr_t root_handle(bool right) const noexcept { return finished_?-1:backend_->root_handle(right); }
+    Observation<bool> revalidate();
+    // Worker-only terminal close of consumer handles/locks. Idempotent failure;
+    // owner is retained until destruction, and is NEVER finished here. Adopted
+    // root lifecycle owner must subsequently finish/drain the original root.
+    Observation<bool> finish_io();
     // Refresh also completes a valid durable intent, under the held root locks.
     // A failed/uncertain commit requires refresh before further commits.
     Observation<bool> refresh();
@@ -95,5 +114,6 @@ private:
     std::string prefix_;
     SyncDigest loaded_digest_{};
     bool uncertain_ = false;
+    bool finished_ = false;
 };
 } // namespace ck::files

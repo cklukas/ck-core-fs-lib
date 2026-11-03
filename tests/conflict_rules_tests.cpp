@@ -346,6 +346,56 @@ void explicit_two_way_sides() {
         CHECK(evaluate_conflict_rule(rule, facts).used_fallback);
     }
 }
+void preserved_metadata_conflicts() {
+    Fixture fixture;
+    fixture.source = {fixture.entry("a", 1, ObjectKind::RegularFile)};
+    fixture.target = {fixture.entry("a", 2, ObjectKind::RegularFile)};
+    fixture.options.compare_preserved_metadata = true;
+    auto attach = [](ComparisonEntry& entry, unsigned value) {
+        ComparisonMetadataDigest digest;
+        digest.state = ComparisonDigestState::CompleteStable;
+        digest.algorithm = ComparisonDigestAlgorithm::Sha256;
+        digest.schema[0] = std::byte{1};
+        digest.policy_binding[0] = std::byte{2};
+        digest.bytes[0] = std::byte(value);
+        digest.ownership = ComparisonMetadataOwnership::Original;
+        digest.before = digest.after = entry.object;
+        entry.metadata_digest = digest;
+    };
+    attach(fixture.source.front(), 3);
+    attach(fixture.target.front(), 4);
+    auto made = ComparisonPlan::create(fixture.options, fixture.inventory(true), fixture.inventory(false));
+    CHECK(made.value());
+    fixture.plan = *made.value();
+    auto facts = fixture.facts("a");
+    CHECK(facts.relation == ComparisonRelation::MetadataDifferent);
+    for (auto choice : {C::UseSource, C::KeepTarget, C::KeepBothIncoming}) {
+        auto rule = fixture.rule(facts, choice);
+        const auto result = evaluate_conflict_rule(rule, facts);
+        CHECK(result.state == S::Apply && result.choice == choice);
+        CHECK(result.requires_native_name_allocation == (choice == C::KeepBothIncoming));
+    }
+    auto rule = fixture.rule(facts, C::Newest);
+    facts.time_order = ConflictTimeOrder::Equal;
+    facts.equal_time = true;
+    auto result = evaluate_conflict_rule(rule, facts);
+    CHECK(result.state == S::NeedsReview && result.used_fallback && result.choice == C::Ask);
+    rule.tie = C::KeepTarget;
+    result = evaluate_conflict_rule(rule, facts);
+    CHECK(result.state == S::Apply && result.used_fallback && result.choice == C::KeepTarget);
+    rule.choice = C::UseSource;
+    rule.retain_replaced = true;
+    CHECK(evaluate_conflict_rule(rule, facts).reason == R::RetentionUnavailable);
+    facts.retention_available = true;
+    CHECK(evaluate_conflict_rule(rule, facts).retain_replaced);
+    facts.relation = ComparisonRelation::Unknown;
+    CHECK(evaluate_conflict_rule(rule, facts).reason == R::UnqualifiedObjects);
+    facts.kind = K::RequiredMetadata;
+    rule.kind = K::RequiredMetadata;
+    CHECK(evaluate_conflict_rule(rule, facts).reason == R::SeparatePolicyRequired);
+    facts.evidence_current = false;
+    CHECK(evaluate_conflict_rule(rule, facts).state == S::Stale);
+}
 } // namespace
 
 int main() {
@@ -355,5 +405,6 @@ int main() {
     size_rules_and_protections();
     classes_and_common_choices();
     explicit_two_way_sides();
+    preserved_metadata_conflicts();
     std::printf("conflict_rules_tests: %u checks passed\n", checks);
 }

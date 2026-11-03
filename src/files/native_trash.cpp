@@ -28,6 +28,18 @@ bool append_id(std::vector<std::byte>& out,const NativeDurableIdentity& id) {
     put(out,id.generation.has_value(),1); put(out,id.generation.value_or(0),8); return true;
 }
 }
+Observation<bool> NativeTrashTransaction::revalidate_private_scope(std::stop_token) const {
+    return unsupported<bool>("trash.live_private_scope_unavailable");
+}
+Observation<bool> NativeTrashTransaction::finish_io() {return Observation<bool>::available(true);}
+Observation<std::unique_ptr<NativeTrashTransaction>> NativeTrashBackend::prepare_trash_scoped(
+    HeldChild::Pointer,std::shared_ptr<PreparedJournalRoot>,std::stop_token) const {
+    return unsupported<std::unique_ptr<NativeTrashTransaction>>("trash.private_scope_unavailable");
+}
+Observation<std::unique_ptr<NativeTrashTransaction>> NativeTrashBackend::prepare_restore_scoped(
+    const NativeTrashReceipt&,std::shared_ptr<const DirectoryCursor>,std::shared_ptr<PreparedJournalRoot>,std::stop_token) const {
+    return unsupported<std::unique_ptr<NativeTrashTransaction>>("restore.private_scope_unavailable");
+}
 Observation<std::vector<std::byte>> windows_trash_metadata(std::u16string_view path,uint64_t size,uint64_t time) {
     using R=Observation<std::vector<std::byte>>;
     if(path.empty() || path.size()>32767 || path.find(u'\0')!=path.npos)

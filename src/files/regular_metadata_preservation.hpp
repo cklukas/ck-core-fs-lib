@@ -4,6 +4,7 @@
 
 #include "held_child.hpp"
 #include "operation_metadata_job.hpp"
+#include "native_regular_metadata_job.hpp"
 
 namespace ck::files {
 
@@ -29,6 +30,11 @@ public:
         RegularMetadataScope scope = RegularMetadataScope::CompleteMetadataV1, std::stop_token stop = {});
     static Observation<Pointer> create_with_policy(HeldChild::Pointer source, bool allow_unhandled_metadata_loss,
         MetadataReplayPolicy policy, std::stop_token stop = {});
+    // Strict native worker binding. Fresh proof/review membership belongs to
+    // the enclosing reviewed executor; target must be null until prepare().
+    // This never substitutes a weaker preservation policy or caller digest.
+    static Observation<Pointer> create_progressive(HeldChild::Pointer,NativeRegularMetadataRequest);
+    Observation<bool> finish_progressive_io();
     RegularMetadataScopeReport scope_report() const noexcept {
         return {1, scope_, !allow_loss_ && scope_ == RegularMetadataScope::CompleteMetadataV1 ?
             ObservationState::Available : ObservationState::Unknown, policy_.ownership,
@@ -48,6 +54,11 @@ private:
     std::optional<BasicMetadata> applied_;
     std::optional<MetadataReplaySnapshot> replay_;
     MetadataReplayPolicy policy_;
+    std::optional<NativeRegularMetadataRequest> progressive_;
+    NativeRegularMetadataJob::Pointer progressive_job_;
+    bool progressive_finished_=false;
+    std::optional<MetadataCaptureCleanupError> progressive_finish_error_;
+    std::array<char,128> progressive_finish_operation_{};
 };
 
 } // namespace ck::files

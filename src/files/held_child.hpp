@@ -35,6 +35,7 @@ public:
                                           std::stop_token stop = {}) const;
     // Worker-only native qualification on the exact retained object.
     Observation<bool> qualify_ordinary_regular_metadata() const;
+    Observation<std::unique_ptr<OpenedEntry>> open_directory_metadata_target(const MetadataReplayPolicy&) const;
     Observation<MetadataReplaySnapshot> capture_metadata(MetadataReplayPolicy policy, std::stop_token stop = {}) const;
     Observation<bool> verify_metadata_source(const MetadataReplaySnapshot&, std::stop_token stop = {}) const;
     Observation<bool> qualify_stable_content() const;
@@ -46,6 +47,8 @@ public:
     bool continues(const HeldChild& previous) const noexcept;
 private:
     friend class ObjectInventoryJob;
+    friend class MetadataCaptureJob;
+    friend class NativeMainContentJob;
     struct Family {};
     HeldChild(std::shared_ptr<const DirectoryCursor> parent, NativeName name,
         std::shared_ptr<const OpenedEntry> child, BasicMetadata metadata,

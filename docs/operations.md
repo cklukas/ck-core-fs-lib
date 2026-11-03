@@ -1,13 +1,14 @@
 # Operations and feature inventory
 
-## 0.4 implementation status
+## Unreleased 0.5 development implementation status
 
 | Surface | Implemented | Qualification boundary |
 | --- | --- | --- |
 | Comparison planning | Copy/Move/Update/Missing/Sync/Mirror/Compare proposals, size/time/digest modes, bounded immutable pages, filters and protected exclusions | Preview facts; no native mutation authority |
 | Conflict policies | Per-item/selection/subtree/class rules, precedence, newest/size/source/target/keep-both choices, explicit tie handling, zero-length/retention protection | Native tree review freezes rules and manual native names into a revocable receipt; provider refusal remains visible |
 | Durable sessions | Baseline codec/checksum, edit/delete classification, metadata conflicts, deletion guards, overlapping-root locks, native verification receipts, durable generation compare-and-swap and recovery | Session commit verifies both roots; a baseline receipt alone never executes a two-way data plan |
-| Owned journal roots | Worker-owned private directory preparation, native ancestry/barriers, memory-only polling, consumer drain and sticky native close errors | Guarded Tree integration; provider-specific qualification, no global Action lease guarantee |
+| Native two-way execution | One coordinator owns both root locks, frozen inventories, bulk conflict receipts, mixed-direction regular-file operations, protected retention evidence, convergence checks, ledger and baseline commit | Current native scope is ordinary regular files directly below each root; hierarchical convergence remains unavailable; qualification is revision/provider specific |
+| Owned journal roots | Asynchronous adopt/provision, private native directory and ancestor ownership, durability barriers, memory-only retain/poll, consumer-bound shared authority and explicit finish/drain | A displayed path never replaces the held root; delayed close errors must be observed before exit |
 | Reviewed trees | Native inventory, immutable pages and facts, assessment, receipt-bound execution, stale receipt rejection, pause/resume/cancel and explicit worker drain | Each provider must qualify publication, metadata and source retirement; unsupported primitives cannot become success |
 | Retained replacement | Journaled old-target retention and explicit retained names before incoming publication | Requires stable old-object content and an object-bound native rename; unknown coverage refuses replacement |
 | Batch rename | Exception-free C jobs, exact native names, duplicate/cycle/collision review, reverse dependency order, one-use approval and bounded verified retry | Windows qualified native handle rename; POSIX source-name mutation remains refused |
@@ -15,11 +16,12 @@
 | Preservation | Versioned policy assessment, ordinary-scope native checks, mode/time verification and special-bit stripping | Complete preservation remains unavailable; opaque attributes and unsupported security are refused |
 | Job lifecycle | Worker-side setup, cancellation, bounded/coalesced events, retained terminal byte progress, explicit reconciliation outcomes | Cross-platform CI and installed-consumer checks qualify each revision |
 | Recovery | Private journal inspection and immutable C summary/pages | Read-only; no automatic replay authority |
+| Verified retry/resume | Stable C jobs, fresh one-use review, whole-source digest, explicit read-only prefix candidate, new private staging/journal, independent final content verification, cancellation and worker drain | A new operation; no historical staging adoption or cleanup authority, and no bypass of native publication/metadata qualification |
 | Browser models | Optional C++ browser target | Separate from C ABI engine/platform dependencies |
 
-Full ACL/xattr/security replay, complete mixed-direction hierarchical execution,
-provider-owned durable private-root capabilities and verified
-prefix resume remain delivery gates. Implemented interfaces and a passing
+Full ACL/xattr/security replay and complete mixed-direction hierarchical
+execution remain delivery gates. The 0.5 root/retry/two-way integration is
+under qualification. Implemented interfaces and a passing
 planning suite do not establish a platform's mutation capabilities. Consult the
 [revision-specific evidence](validation-2026-11-02.md): the macOS strong
 publication gate remains open, so its positive copy qualification is failing.
@@ -59,13 +61,8 @@ publication gate remains open, so its positive copy qualification is failing.
 
 ## Qualification and further ABI slices
 
-The next slices complete mixed-direction hierarchical execution, native
-preservation, provider-owned durable journal-root capabilities and verified
-prefix resume. Existing tree/action/session APIs already carry typed review,
+The remaining slices complete mixed-direction hierarchical execution, native
+preservation and cross-platform qualification of root capabilities and verified
+prefix resume. Tree/action/session/root/retry APIs carry typed review,
 capability, partial/recovery and access outcomes. No interface declaration or
 capability-family bit authorizes weakening identity or path-safety rules.
-
-The 0.4 addition covers the owned journal-root factory and guarded Tree
-integration. New Actions-with-Root, two-way execution and verified retry
-interfaces remain in the separate 0.5 development increment. Existing
-publication and complete-preservation gates remain mandatory.

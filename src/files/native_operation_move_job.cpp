@@ -177,7 +177,7 @@ Observation<NativeOperationMoveJob::Pointer> NativeOperationMoveJob::create(
             request.destination_name,
             request.copy_limits,
             {},
-            FileOperation::Move};
+            FileOperation::Move, {}, {}, {}, {}, {}};
         const auto source = request.source;
         copy_request.prepare_metadata = [source, allow = request.allow_unhandled_metadata_loss](
                                             OpenedEntry &staging, std::stop_token) {

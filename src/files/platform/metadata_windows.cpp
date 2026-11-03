@@ -4,6 +4,10 @@
 #include "../native_trash.hpp"
 #include "native_journal_directory_bridge.hpp"
 #include "metadata_replay.hpp"
+#include "metadata_capture_job.hpp"
+#include "native_metadata_stream_target.hpp"
+#include "native_windows_native_fsd.hpp"
+#include "sha256.hpp"
 #include "windows_name.hpp"
 #include "windows_directory_record.hpp"
 #include "windows_stream_records.hpp"
@@ -45,12 +49,30 @@ detail::WindowsJournalCloseObserver detail::exchange_windows_journal_close_obser
 }
 namespace {
 
+
+// Explicit persistent SD classes. BACKUP_SECURITY_INFORMATION alone does
+// not enumerate the modern resource/trust/access-filter request contract.
+constexpr SECURITY_INFORMATION persistent_security_information=
+    OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION|
+    SACL_SECURITY_INFORMATION|LABEL_SECURITY_INFORMATION|ATTRIBUTE_SECURITY_INFORMATION|
+    SCOPE_SECURITY_INFORMATION|PROCESS_TRUST_LABEL_SECURITY_INFORMATION|ACCESS_FILTER_SECURITY_INFORMATION;
+constexpr SECURITY_INFORMATION persistent_sacl_information=persistent_security_information&
+    ~(OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION);
+
+void report_capture_close(DWORD code,const char* operation)noexcept {
+    const auto observer=journal_close_observer;
+    if(observer.record)observer.record(observer.context,code,operation);
+    detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Win32,code,operation});
+    SetLastError(code);
+}
 struct HandleCloser {
     void operator()(void* handle) const noexcept {
         if (handle != nullptr && handle != INVALID_HANDLE_VALUE && !CloseHandle(handle)) {
-            const auto code=GetLastError();
+            const DWORD e=GetLastError();
             const auto observer=journal_close_observer;
-            if(observer.record)observer.record(observer.context,code,"sync_session.native_cursor_close");
+            if(observer.record)observer.record(observer.context,e,"sync_session.native_cursor_close");
+            detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Win32,e,"metadata_capture.temporary_CloseHandle"});
+            SetLastError(e);
         }
     }
 };
@@ -158,11 +180,33 @@ bool set_file_rename_information(HANDLE source, PFILE_RENAME_INFO information, U
     }
     static_assert(sizeof(NtSetInformationFileFunction) == sizeof(address));
     const auto set_information = std::bit_cast<NtSetInformationFileFunction>(address);
-    IO_STATUS_BLOCK io{};
+    IO_STATUS_BLOCK io{};io.Status=0x00000103L;
     // FileRenameInformation is the documented native information class used
     // by NtSetInformationFile. Unlike the Win32 wrapper, the native call
     // preserves a verified relative RootDirectory handle on local volumes.
-    const auto status = set_information(source, &io, information, size, 10);
+    auto status = set_information(source, &io, information, size, 10);
+    if (status == 0x00000103L) {
+        // A RenameSource handle is asynchronous. Its outstanding oplock can
+        // also signal the file object; inspect this exact request's status,
+        // never treat a signaled file handle or STATUS_PENDING as success.
+        // Both the caller's rename buffer and this IOSB remain live until the
+        // native request is complete. SYNCHRONIZE is required at guard open.
+        do {
+            const DWORD waited=WaitForSingleObject(source,50);
+            if (waited==WAIT_FAILED) {
+                // The operation owns this handle for its whole duration. A
+                // failed wait cannot permit early destruction of native I/O
+                // storage. Continue draining the exact IOSB after cancellation.
+                using Cancel=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PIO_STATUS_BLOCK);
+                const auto cancel_address=GetProcAddress(module,"NtCancelIoFileEx");
+                if (cancel_address) {IO_STATUS_BLOCK cancelled{};std::bit_cast<Cancel>(cancel_address)(source,&io,&cancelled);}
+                Sleep(1);
+            }
+            MemoryBarrier();
+            status=*reinterpret_cast<volatile NTSTATUS*>(&io.Status);
+            if (status==0x00000103L && waited==WAIT_OBJECT_0) Sleep(1);
+        } while(status==0x00000103L);
+    }
     if (status >= 0) return true;
     SetLastError(RtlNtStatusToDosError(status));
     return false;
@@ -359,14 +403,273 @@ struct WindowsPublicationContext final {
     Observation<ObjectIdentity> parent_identity;
 };
 
+// Borrows one worker-owned asynchronous read+DELETE handle. The kernel keeps
+// writing this request's OVERLAPPED/output until a break or cancellation has
+// completed, so this owner must be destroyed before the borrowed handle.
+class WindowsContentLease final {
+public:
+    explicit WindowsContentLease(HANDLE file):file_(file),event_(CreateEventW(nullptr,TRUE,FALSE,nullptr)) {
+        request_.StructureVersion=REQUEST_OPLOCK_CURRENT_VERSION;
+        request_.StructureLength=sizeof(request_);
+        request_.RequestedOplockLevel=OPLOCK_LEVEL_CACHE_READ|OPLOCK_LEVEL_CACHE_HANDLE;
+        request_.Flags=REQUEST_OPLOCK_INPUT_FLAG_REQUEST;
+        overlapped_.hEvent=event_.get();
+    }
+    WindowsContentLease(const WindowsContentLease&)=delete;
+    WindowsContentLease& operator=(const WindowsContentLease&)=delete;
+    ~WindowsContentLease() {
+        if (pending_) {
+            // Cancel only our lease IRP, then wait for its completion before
+            // releasing any kernel-referenced member. ERROR_NOT_FOUND means
+            // it raced completion; GetOverlappedResult still drains that IRP.
+            CancelIoEx(file_,&overlapped_);
+            DWORD count=0;GetOverlappedResult(file_,&overlapped_,&count,TRUE);
+        }
+    }
+    Observation<bool> acquire() {
+        if (!event_ || event_.get()==INVALID_HANDLE_VALUE)
+            return failure<bool>(GetLastError(),"stable_content.CreateEventW");
+        const BOOL immediate=DeviceIoControl(file_,FSCTL_REQUEST_OPLOCK,&request_,sizeof(request_),
+            &reply_,sizeof(reply_),nullptr,&overlapped_);
+        const DWORD code=immediate?ERROR_SUCCESS:GetLastError();
+        if (immediate) return Observation<bool>::unavailable(ObservationState::Failed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"stable_content.oplock_not_pending"});
+        if (code!=ERROR_IO_PENDING) {
+            if (code==ERROR_OPLOCK_NOT_GRANTED || code==ERROR_CANNOT_GRANT_REQUESTED_OPLOCK)
+                return Observation<bool>::unavailable(ObservationState::Unsupported,
+                    {ErrorDomain::Win32,code,"stable_content.FSCTL_REQUEST_OPLOCK"});
+            return failure<bool>(code,"stable_content.FSCTL_REQUEST_OPLOCK");
+        }
+        pending_=true;
+        return check();
+    }
+    Observation<bool> check() const {
+        if (broken_) return changed();
+        DWORD count=0;
+        if (!GetOverlappedResult(file_,const_cast<OVERLAPPED*>(&overlapped_),&count,FALSE)) {
+            const auto code=GetLastError();
+            if (code==ERROR_IO_INCOMPLETE) return Observation<bool>::available(true);
+        }
+        // Any completion loses this exact admission token. Never silently
+        // re-request after a break, switch, cancellation or unsolicited error.
+        broken_=true;
+        return changed();
+    }
+    HANDLE event() const noexcept {return event_.get();}
+private:
+    static Observation<bool> changed() {
+        return Observation<bool>::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"stable_content.windows_rh_broken"});
+    }
+    HANDLE file_;
+    OwnedHandle event_;
+    REQUEST_OPLOCK_INPUT_BUFFER request_{};
+    REQUEST_OPLOCK_OUTPUT_BUFFER reply_{};
+    OVERLAPPED overlapped_{};
+    bool pending_=false;
+    mutable bool broken_=false;
+};
+
+// Query every persistent SACL class, but set only classes whose actual ACE
+// bytes differ. Requesting a write to an absent process-trust class can require
+// kernel-only authority even when both queried descriptors have none.
+Observation<std::array<NativeBytes,6>> persistent_sacl_classes(const NativeSecurityValue& security) {
+    using Result=Observation<std::array<NativeBytes,6>>;
+    const auto checked=detail::validate_windows_descriptor(security.bytes,
+        {InventoryLimits::hard_native_bytes,InventoryLimits::hard_records});
+    if(!checked.value()){const auto& e=*checked.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    SECURITY_DESCRIPTOR_CONTROL control=0;DWORD revision=0;
+    if(!GetSecurityDescriptorControl(const_cast<std::byte*>(security.bytes.data()),&control,&revision))
+        return failure<std::array<NativeBytes,6>>(GetLastError(),"metadata_replay.coverage_descriptor_control");
+    constexpr auto replayable_control=SE_OWNER_DEFAULTED|SE_GROUP_DEFAULTED|SE_DACL_PRESENT|SE_DACL_DEFAULTED|
+        SE_SACL_PRESENT|SE_SACL_DEFAULTED|SE_DACL_AUTO_INHERIT_REQ|SE_SACL_AUTO_INHERIT_REQ|
+        SE_DACL_AUTO_INHERITED|SE_SACL_AUTO_INHERITED|SE_DACL_PROTECTED|SE_SACL_PROTECTED|SE_SELF_RELATIVE;
+    if((control&~replayable_control)!=0)
+        return failure<std::array<NativeBytes,6>>(ERROR_NOT_SUPPORTED,"metadata_replay.coverage_unhandled_descriptor_control");
+    PACL dacl=nullptr;BOOL dacl_present=FALSE,dacl_defaulted=FALSE;
+    if(!GetSecurityDescriptorDacl(const_cast<std::byte*>(security.bytes.data()),&dacl_present,&dacl,&dacl_defaulted))
+        return failure<std::array<NativeBytes,6>>(GetLastError(),"metadata_replay.coverage_dacl");
+    if(dacl)for(DWORD i=0;i<dacl->AceCount;++i) {
+        void* raw=nullptr;if(!GetAce(dacl,i,&raw))return failure<std::array<NativeBytes,6>>(GetLastError(),"metadata_replay.coverage_dacl_ace");
+        switch(static_cast<const ACE_HEADER*>(raw)->AceType) {
+        case ACCESS_ALLOWED_ACE_TYPE:case ACCESS_DENIED_ACE_TYPE:case ACCESS_ALLOWED_COMPOUND_ACE_TYPE:
+        case ACCESS_ALLOWED_OBJECT_ACE_TYPE:case ACCESS_DENIED_OBJECT_ACE_TYPE:
+        case ACCESS_ALLOWED_CALLBACK_ACE_TYPE:case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+        case ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE:case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:break;
+        default:return failure<std::array<NativeBytes,6>>(ERROR_NOT_SUPPORTED,"metadata_replay.coverage_unknown_dacl_ace");
+        }
+    }
+    PACL acl=nullptr;BOOL present=FALSE,defaulted=FALSE;
+    if(!GetSecurityDescriptorSacl(const_cast<std::byte*>(security.bytes.data()),&present,&acl,&defaulted))
+        return failure<std::array<NativeBytes,6>>(GetLastError(),"metadata_replay.coverage_sacl");
+    std::array<NativeBytes,6> classes;
+    if(!acl)return Result::available(std::move(classes));
+    for(DWORD i=0;i<acl->AceCount;++i) {
+        void* raw=nullptr;if(!GetAce(acl,i,&raw))return failure<std::array<NativeBytes,6>>(GetLastError(),"metadata_replay.coverage_ace");
+        const auto* ace=static_cast<const ACE_HEADER*>(raw);std::size_t part=0;
+        switch(ace->AceType) {
+        case SYSTEM_AUDIT_ACE_TYPE:case SYSTEM_ALARM_ACE_TYPE:case SYSTEM_AUDIT_OBJECT_ACE_TYPE:case SYSTEM_ALARM_OBJECT_ACE_TYPE:
+        case SYSTEM_AUDIT_CALLBACK_ACE_TYPE:case SYSTEM_ALARM_CALLBACK_ACE_TYPE:
+        case SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE:case SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE:part=0;break;
+        case SYSTEM_MANDATORY_LABEL_ACE_TYPE:part=1;break;
+        case SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE:part=2;break;
+        case SYSTEM_SCOPED_POLICY_ID_ACE_TYPE:part=3;break;
+        case SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE:part=4;break;
+        case SYSTEM_ACCESS_FILTER_ACE_TYPE:part=5;break;
+        default:return failure<std::array<NativeBytes,6>>(ERROR_NOT_SUPPORTED,"metadata_replay.coverage_unknown_sacl_ace");
+        }
+        const auto* bytes=static_cast<const std::byte*>(raw);classes[part].insert(classes[part].end(),bytes,bytes+ace->AceSize);
+    }
+    return Result::available(std::move(classes));
+}
+Observation<bool> require_enabled_security_privilege() {
+    using Result=Observation<bool>;HANDLE raw=nullptr;
+    if(!OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,TRUE,&raw)) {
+        if(GetLastError()!=ERROR_NO_TOKEN||!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw))
+            return failure<bool>(GetLastError(),"metadata_replay.coverage_effective_token");
+    }
+    OwnedHandle token(raw);DWORD size=0;GetTokenInformation(token.get(),TokenPrivileges,nullptr,0,&size);
+    if(!size||GetLastError()!=ERROR_INSUFFICIENT_BUFFER)return failure<bool>(GetLastError(),"metadata_replay.coverage_privilege_size");
+    NativeBytes bytes(size);
+    if(!GetTokenInformation(token.get(),TokenPrivileges,bytes.data(),size,&size))return failure<bool>(GetLastError(),"metadata_replay.coverage_privileges");
+    LUID security{};if(!LookupPrivilegeValueW(nullptr,L"SeSecurityPrivilege",&security))return failure<bool>(GetLastError(),"metadata_replay.coverage_security_luid");
+    const auto* privileges=reinterpret_cast<const TOKEN_PRIVILEGES*>(bytes.data());
+    for(DWORD i=0;i<privileges->PrivilegeCount;++i) {
+        const auto& item=privileges->Privileges[i];
+        if(item.Luid.LowPart==security.LowPart&&item.Luid.HighPart==security.HighPart&&(item.Attributes&SE_PRIVILEGE_ENABLED))
+            return Result::available(true);
+    }
+    return failure<bool>(ERROR_PRIVILEGE_NOT_HELD,"metadata_replay.coverage_security_privilege_disabled");
+}
+
+class WindowsMetadataChannel final:public MetadataReplayChannelSource {
+public:
+    void retain_capture_lease(std::shared_ptr<const void> lease)const{capture_lease_=std::move(lease);}
+
+    WindowsMetadataChannel(OwnedHandle handle,AdapterScope scope,NativeFeatureIdentifier identifier,ObjectIdentity owner,bool writable)
+        :handle_(std::move(handle)),scope_(std::move(scope)),identifier_(std::move(identifier)),owner_(std::move(owner)),writable_(writable){}
+    Observation<MetadataReplayChannelState> inspect() const override {
+        using Result=Observation<MetadataReplayChannelState>;
+        if(finished_)return Result::unavailable(ObservationState::Failed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_channels.finished_inspection"});
+        const auto current=identity(handle_.get(),scope_);
+        if(!current.value()){const auto& e=*current.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(compare_identity(*current.value(),owner_)!=IdentityComparison::Same)return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.owner_changed"});
+        FILE_STANDARD_INFO standard{};
+        if(!GetFileInformationByHandleEx(handle_.get(),FileStandardInfo,&standard,sizeof(standard)))
+            return failure<MetadataReplayChannelState>(GetLastError(),"metadata_channels.FileStandardInfo");
+        if(standard.DeletePending)return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.delete_pending"});
+        LARGE_INTEGER size{};FILE_BASIC_INFO attributes{};
+        if(!GetFileSizeEx(handle_.get(),&size))return failure<MetadataReplayChannelState>(GetLastError(),"metadata_channels.GetFileSizeEx");
+        if(!GetFileInformationByHandleEx(handle_.get(),FileBasicInfo,&attributes,sizeof(attributes)))
+            return failure<MetadataReplayChannelState>(GetLastError(),"metadata_channels.FileBasicInfo");
+        constexpr DWORD supported=FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_HIDDEN|
+            FILE_ATTRIBUTE_SYSTEM|FILE_ATTRIBUTE_ARCHIVE|FILE_ATTRIBUTE_NORMAL|FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+        if(size.QuadPart<0 || (attributes.FileAttributes&~supported))return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_channels.storage_provider"});
+        return Result::available({identifier_,*current.value(),static_cast<std::uint64_t>(size.QuadPart)});
+    }
+    Observation<ContentRead> read_content(ContentReadLimits limits,std::uint64_t offset,std::stop_token stop={}) const override {
+        using Result=Observation<ContentRead>;
+        if(!limits.valid())return Result::unavailable(ObservationState::Failed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidLimit),"metadata_channels.read_limit"});
+        if(stop.stop_requested())return Result::unavailable(ObservationState::Unknown,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InterruptedRead),"metadata_channels.read_cancelled"});
+        const auto before=inspect();if(!before.value()){const auto& e=*before.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(offset>before.value()->logical_size)return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.read_offset"});
+        LARGE_INTEGER at{};at.QuadPart=static_cast<LONGLONG>(offset);
+        if(!SetFilePointerEx(handle_.get(),at,nullptr,FILE_BEGIN))return failure<ContentRead>(GetLastError(),"metadata_channels.read_seek");
+        const auto count=static_cast<DWORD>(std::min<std::uint64_t>(limits.max_bytes,before.value()->logical_size-offset));
+        std::vector<std::byte> bytes(count);DWORD copied=0;
+        if(count&&!ReadFile(handle_.get(),bytes.data(),count,&copied,nullptr))return failure<ContentRead>(GetLastError(),"metadata_channels.ReadFile");
+        bytes.resize(copied);const auto after=inspect();
+        if(!after.value()){const auto& e=*after.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(after.value()->logical_size!=before.value()->logical_size)return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.read_size_changed"});
+        return Result::available({std::move(bytes),offset+copied>=before.value()->logical_size});
+    }
+    Observation<bool> truncate() {
+        if(!writable_||finished_)return failure<bool>(ERROR_ACCESS_DENIED,"metadata_channels.truncate_access");
+        FILE_END_OF_FILE_INFO size{};
+        if(!SetFileInformationByHandle(handle_.get(),FileEndOfFileInfo,&size,sizeof(size)))
+            return failure<bool>(GetLastError(),"metadata_channels.FileEndOfFileInfo");
+        return Observation<bool>::available(true);
+    }
+    Observation<std::size_t> write(std::uint64_t offset,std::span<const std::byte> data) {
+        if(!writable_||finished_)return failure<std::size_t>(ERROR_ACCESS_DENIED,"metadata_channels.write_access");
+        if(offset>static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max())||data.size()>64*1024)
+            return Observation<std::size_t>::unavailable(ObservationState::Failed,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidLimit),"metadata_channels.write_limit"});
+        LARGE_INTEGER at{};at.QuadPart=static_cast<LONGLONG>(offset);
+        if(!SetFilePointerEx(handle_.get(),at,nullptr,FILE_BEGIN))return failure<std::size_t>(GetLastError(),"metadata_channels.write_seek");
+        DWORD written=0;
+        if(!WriteFile(handle_.get(),data.data(),static_cast<DWORD>(data.size()),&written,nullptr))
+            return failure<std::size_t>(GetLastError(),"metadata_channels.WriteFile");
+        return Observation<std::size_t>::available(written);
+    }
+    Observation<bool> flush() {
+        if(!writable_||finished_)return failure<bool>(ERROR_ACCESS_DENIED,"metadata_channels.flush_access");
+        if(!FlushFileBuffers(handle_.get()))return failure<bool>(GetLastError(),"metadata_channels.FlushFileBuffers");
+        return Observation<bool>::available(true);
+    }
+    Observation<bool> finish() {
+        using Result=Observation<bool>;
+        if(!writer_finish_started_) {
+            writer_finish_started_=true;
+            if(!writable_||finished_)writer_finish_error_=MetadataCaptureCleanupError{ObservationState::Failed,
+                ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_channels.finish_not_writer"};
+            else {
+                finished_=true;const HANDLE writer=handle_.release();
+                const DWORD flush_error=FlushFileBuffers(writer)?ERROR_SUCCESS:GetLastError();
+                const DWORD close_error=CloseHandle(writer)?ERROR_SUCCESS:GetLastError();
+                if(flush_error)writer_finish_error_=MetadataCaptureCleanupError{error_state(flush_error),ErrorDomain::Win32,
+                    flush_error,"metadata_channels.finish_FlushFileBuffers"};
+                else if(close_error)writer_finish_error_=MetadataCaptureCleanupError{error_state(close_error),ErrorDomain::Win32,
+                    close_error,"metadata_channels.finish_CloseHandle"};
+            }
+        }
+        if(writer_finish_error_) {
+            const auto& e=*writer_finish_error_;detail::record_metadata_capture_close(e);
+            return Result::unavailable(e.state,{e.domain,e.code,e.operation});
+        }
+        return Result::available(true);
+    }
+    void finish_capture_reads()noexcept {
+        if(capture_close_started_){if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);return;}
+        capture_close_started_=true;
+        if(writable_){capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_capture.writer_not_read_owner"};}
+        else {finished_=true;const HANDLE h=handle_.release();if(h&&h!=INVALID_HANDLE_VALUE&&!CloseHandle(h)){const auto e=GetLastError();capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,e,"metadata_capture.channel_CloseHandle"};report_capture_close(e,"metadata_capture.channel_CloseHandle");}}
+        if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);
+    }
+    const NativeFeatureIdentifier& identifier() const noexcept{return identifier_;}
+    std::optional<MetadataCaptureCleanupError> capture_close_error()const noexcept{return capture_close_error_;}
+    std::optional<MetadataCaptureCleanupError> writer_finish_error()const noexcept{return writer_finish_error_;}
+private:
+    bool writer_finish_started_=false;
+    std::optional<MetadataCaptureCleanupError> writer_finish_error_;
+    bool capture_close_started_=false;
+    std::optional<MetadataCaptureCleanupError> capture_close_error_;
+    mutable std::shared_ptr<const void> capture_lease_;
+
+    OwnedHandle handle_;
+    AdapterScope scope_;
+    NativeFeatureIdentifier identifier_;
+    ObjectIdentity owner_;
+    bool writable_=false;
+    bool finished_=false;
+};
+
 class WindowsOpenedEntry final : public OpenedEntry {
 public:
     WindowsOpenedEntry(OwnedHandle handle, AdapterScope scope, bool layout_access = false,
                        bool content_access = false, bool content_write_access = false,
-                       std::unique_ptr<WindowsPublicationContext> publication = {}, bool rename_access = false)
+                       std::unique_ptr<WindowsPublicationContext> publication = {}, bool rename_access = false, bool directory_metadata_target = false)
         : handle_(std::move(handle)), scope_(std::move(scope)), layout_access_(layout_access),
           content_access_(content_access), content_write_access_(content_write_access),
-          rename_access_(rename_access), publication_(std::move(publication)) {}
+          rename_access_(rename_access), publication_(std::move(publication)), directory_metadata_target_(directory_metadata_target) {}
     Observation<ContentRead> read_content(ContentReadLimits limits = {}, std::uint64_t offset = 0,
                                           std::stop_token stop = {}) const override {
         using Result = Observation<ContentRead>;
@@ -390,13 +693,19 @@ public:
             return Result::unavailable(ObservationState::Changed,
                                        {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "content.offset"});
         const auto count = static_cast<DWORD>(std::min<std::uint64_t>(limits.max_bytes, size - offset));
-        LARGE_INTEGER position{}; position.QuadPart = static_cast<LONGLONG>(offset);
-        if (!SetFilePointerEx(handle_.get(), position, nullptr, FILE_BEGIN))
-            return failure<ContentRead>(GetLastError(), "content.seek");
         std::vector<std::byte> bytes(count);
         DWORD copied = 0;
-        if (count && !ReadFile(handle_.get(), bytes.data(), count, &copied, nullptr))
-            return failure<ContentRead>(GetLastError(), "content.ReadFile");
+        if (rename_access_) {
+            auto read=read_guarded(bytes,offset,stop);
+            if (!read.value()) {const auto& e=*read.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            copied=*read.value();
+        } else {
+            LARGE_INTEGER position{}; position.QuadPart = static_cast<LONGLONG>(offset);
+            if (!SetFilePointerEx(handle_.get(), position, nullptr, FILE_BEGIN))
+                return failure<ContentRead>(GetLastError(), "content.seek");
+            if (count && !ReadFile(handle_.get(), bytes.data(), count, &copied, nullptr))
+                return failure<ContentRead>(GetLastError(), "content.ReadFile");
+        }
         bytes.resize(copied);
         if (stop.stop_requested())
             return Result::unavailable(ObservationState::Unknown,
@@ -465,6 +774,12 @@ public:
         content_access_=false;
         layout_access_=false;
         rename_access_=false;
+        std::optional<Observation<bool>> channel_error;bool channel_exception=false;
+        for(auto& channel:channel_writers_) {
+            try {auto result=channel->finish();if((!result.value()||!*result.value())&&!channel_error)channel_error=std::move(result);}
+            catch(...){channel_exception=true;}
+        }
+        channel_writers_.clear();
         // Close the independent metadata-mutating handle before flushing the
         // data writer. Consume both owners first so destructors cannot retry.
         const HANDLE security=security_handle_.release();
@@ -472,11 +787,49 @@ public:
         const DWORD security_error=!security || security==INVALID_HANDLE_VALUE || CloseHandle(security) ? ERROR_SUCCESS : GetLastError();
         const DWORD flush_error=FlushFileBuffers(writer) ? ERROR_SUCCESS : GetLastError();
         const DWORD close_error=CloseHandle(writer) ? ERROR_SUCCESS : GetLastError();
-        if (security_error) finish_result_=failure<bool>(security_error,"content.finish_security_close");
+        if(channel_error)finish_result_=std::move(*channel_error);
+        else if(channel_exception)finish_result_=Observation<bool>::unavailable(ObservationState::Failed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"content.finish_channel_exception"});
+        else if (security_error) finish_result_=failure<bool>(security_error,"content.finish_security_close");
         else if (flush_error) finish_result_=failure<bool>(flush_error,"content.finish_FlushFileBuffers");
         else if (close_error) finish_result_=failure<bool>(close_error,"content.finish_CloseHandle");
         else finish_result_=Result::available(true);
         return *finish_result_;
+    }
+    void finish_capture_reads()noexcept {
+        if(capture_close_started_){if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);return;}
+        capture_close_started_=true;
+        if(content_write_access_){capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_capture.writer_not_read_owner"};}
+        else {
+            finish_started_=true;content_access_=false;layout_access_=false;
+            const HANDLE security=security_handle_.release(),data=handle_.release();
+            for(const HANDLE h:{security,data})if(h&&h!=INVALID_HANDLE_VALUE&&!CloseHandle(h)){
+                const MetadataCaptureCleanupError e{ObservationState::Failed,ErrorDomain::Win32,GetLastError(),"metadata_capture.source_CloseHandle"};
+                if(!capture_close_error_)capture_close_error_=e;report_capture_close(static_cast<DWORD>(e.code),e.operation);
+            }
+        }
+        if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);
+    }
+    // Content-only observation: no security/EA rights or metadata qualification.
+    // OpenFileById is checked against this held object's identity before adoption.
+    Observation<std::shared_ptr<const OpenedEntry>> open_main_content_source()const {
+        using R=Observation<std::shared_ptr<const OpenedEntry>>;
+        if(content_write_access_||!content_access_)return failure<std::shared_ptr<const OpenedEntry>>(
+            ERROR_ACCESS_DENIED,"main_content.readonly_content_source_required");
+        auto h=metadata_security_handle(FILE_READ_DATA|FILE_READ_ATTRIBUTES);
+        if(!h.value()){const auto&e=*h.unavailable_detail();return R::unavailable(e.state,e.error);}
+        return R::available(std::make_shared<WindowsOpenedEntry>(std::move(h).take_value(),scope_,false,true));
+    }
+    Observation<std::shared_ptr<const OpenedEntry>> open_progressive_metadata_source(const MetadataReplayPolicy& policy)const {
+        using Result=Observation<std::shared_ptr<const OpenedEntry>>;
+        if(content_write_access_)return failure<std::shared_ptr<const OpenedEntry>>(ERROR_ACCESS_DENIED,"metadata_capture.readonly_source_required");
+        const auto qualified=qualify_metadata_replay(policy);if(!qualified.value()){const auto&e=*qualified.unavailable_detail();return Result::unavailable(e.state,e.error);}if(!*qualified.value())return failure<std::shared_ptr<const OpenedEntry>>(ERROR_NOT_SUPPORTED,"metadata_capture.provider_false");
+        const auto basic=inspect_basic();if(!basic.value()){const auto&e=*basic.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        const bool file=basic.value()->kind.value()&&*basic.value()->kind.value()==ObjectKind::RegularFile;
+        const DWORD rights=FILE_READ_ATTRIBUTES|FILE_READ_EA|READ_CONTROL|(file?FILE_READ_DATA:0)|
+            (policy.scope==RegularMetadataScope::CompleteMetadataV1?ACCESS_SYSTEM_SECURITY:0);
+        auto h=metadata_security_handle(rights);if(!h.value()){const auto&e=*h.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        return Result::available(std::make_shared<WindowsOpenedEntry>(std::move(h).take_value(),scope_,false,file));
     }
     Observation<std::unique_ptr<OpenedEntry>> open_metadata_replay_view(const MetadataReplayPolicy& policy) const override {
         using Result=Observation<std::unique_ptr<OpenedEntry>>;
@@ -490,26 +843,95 @@ public:
         // handle against its retained identity; no source basename is reopened.
         return Result::available(std::make_unique<WindowsOpenedEntry>(std::move(opened).take_value(),scope_));
     }
+    Observation<std::unique_ptr<OpenedEntry>> open_directory_metadata_target(const MetadataReplayPolicy& policy) const override {
+        using Result=Observation<std::unique_ptr<OpenedEntry>>;
+        if(!policy.valid())return failure<std::unique_ptr<OpenedEntry>>(ERROR_INVALID_PARAMETER,"metadata_replay.directory_policy");
+        const auto before=inspect_basic();
+        if(!before.value()){const auto& e=*before.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(!before.value()->kind.value()||*before.value()->kind.value()!=ObjectKind::Directory)
+            return Result::unavailable(ObservationState::Unsupported,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::NotApplicable),"metadata_replay.directory_kind"});
+        const DWORD rights=FILE_GENERIC_READ|FILE_GENERIC_WRITE|READ_CONTROL|WRITE_DAC|WRITE_OWNER|
+            (policy.scope==RegularMetadataScope::CompleteMetadataV1?ACCESS_SYSTEM_SECURITY:0);
+        auto opened=metadata_security_handle(rights);
+        if(!opened.value()){const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        auto writer=std::make_unique<WindowsOpenedEntry>(std::move(opened).take_value(),scope_,false,false,true,nullptr,false,true);
+        const auto qualified=writer->qualify_metadata_replay(policy);
+        if(!qualified.value()){const auto& e=*qualified.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(!*qualified.value())return failure<std::unique_ptr<OpenedEntry>>(ERROR_NOT_SUPPORTED,"metadata_replay.directory_qualification_false");
+        return Result::available(std::move(writer));
+    }
+    Observation<std::shared_ptr<const MetadataSecurityCoverageEvidence>> issue_metadata_security_coverage(
+        const MetadataReplaySnapshot&) const override;
+    Observation<bool> preflight_metadata_security_coverage(const MetadataReplaySnapshot&) override;
+    Observation<bool> verify_metadata_security_coverage(const MetadataReplaySnapshot&) const override;
     Observation<bool> qualify_stable_content() const override {
-        // A share-denying open cannot invalidate a writable section that was
-        // created before that open. No qualified asynchronous oplock token is
-        // held here, so old-target digest retention remains unsupported.
-        return Observation<bool>::unavailable(ObservationState::Unsupported,
-            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),
-             "stable_content.windows_existing_mappings_unqualified"});
+        using Result=Observation<bool>;
+        const auto unsupported=[](const char* op){return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),op});};
+        // This proof is restricted to the main data stream of RenameSource.
+        // MoveSource still has no metadata freeze or source-retirement proof.
+        if (!rename_access_ || !content_access_) return unsupported("stable_content.rename_read_guard_required");
+        if (content_lease_) return content_lease_->check();
+        const auto basic=inspect_basic();
+        if (!basic.value()) {const auto& e=*basic.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if (!basic.value()->kind.value() || *basic.value()->kind.value()!=ObjectKind::RegularFile ||
+            !basic.value()->link_count.value() || *basic.value()->link_count.value()!=1 ||
+            !basic.value()->identity.value() || basic.value()->identity.value()->scheme!=IdentityScheme::WindowsFileId128)
+            return unsupported("stable_content.regular_single_identity");
+        if (const auto provider=provider_guard(*basic.value())) return Result::unavailable(provider->state,provider->error);
+        auto provider_view=metadata_security_handle(0);
+        if(!provider_view.value()){const auto& e=*provider_view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        WCHAR filesystem[32]{};
+        if (!GetVolumeInformationByHandleW(provider_view.value()->get(),nullptr,0,nullptr,nullptr,nullptr,filesystem,32))
+            return failure<bool>(GetLastError(),"stable_content.volume");
+        if (std::wstring_view(filesystem)!=L"NTFS" && std::wstring_view(filesystem)!=L"ReFS")
+            return unsupported("stable_content.filesystem");
+        const auto native_driver=detail::prove_windows_native_fsd(provider_view.value()->get());
+        if(!native_driver.qualified)return Result::unavailable(native_driver.state,
+            {native_driver.domain,native_driver.code,native_driver.operation});
+        using QueryVolume=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,ULONG);
+        const auto address=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryVolumeInformationFile");
+        if (!address) return unsupported("stable_content.device_query");
+        struct Device {ULONG type,characteristics;} device{};IO_STATUS_BLOCK io{};
+        const auto status=std::bit_cast<QueryVolume>(address)(provider_view.value()->get(),&io,&device,sizeof(device),4);
+        if (status!=0) return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
+            {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"stable_content.device"});
+        if (io.Information!=sizeof(device) || (device.characteristics&0x10U)) return unsupported("stable_content.remote_provider");
+        auto lease=std::make_unique<WindowsContentLease>(handle_.get());
+        const auto granted=lease->acquire();
+        if (!granted.value() || !*granted.value()) return granted;
+        content_lease_=std::move(lease);
+        return content_lease_->check();
     }
     Observation<bool> qualify_metadata_replay(const MetadataReplayPolicy& policy) const override {
         using Result=Observation<bool>;
+        if (rename_access_) {
+            auto view=synchronous_query_view(0);
+            if(!view.value()){const auto& e=*view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            return (*view.value())->qualify_metadata_replay(policy);
+        }
         const auto refuse=[](const char* op){return Result::unavailable(ObservationState::Unsupported,
             {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),op});};
         if (!policy.valid()) return refuse("metadata_replay.policy");
         const auto basic=inspect_basic();
         if (!basic.value()) {const auto& e=*basic.unavailable_detail();return Result::unavailable(e.state,e.error);}
-        if (!basic.value()->kind.value() || *basic.value()->kind.value()!=ObjectKind::RegularFile ||
-            !basic.value()->link_count.value() || *basic.value()->link_count.value()!=1 || !basic.value()->windows_attributes.value())
+        const bool directory=basic.value()->kind.value()&&*basic.value()->kind.value()==ObjectKind::Directory;
+        if (!basic.value()->kind.value() || (!directory&&*basic.value()->kind.value()!=ObjectKind::RegularFile) ||
+            !basic.value()->link_count.value() || ((directory||!content_write_access_)?*basic.value()->link_count.value()<1:*basic.value()->link_count.value()!=1) || !basic.value()->windows_attributes.value())
             return refuse("metadata_replay.windows_kind_links");
         if (const auto guard=provider_guard(*basic.value())) return Result::unavailable(guard->state,guard->error);
-        constexpr DWORD supported=FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM|
+        // Full directory preservation has no case-flag replay field yet.
+        // Only the explicitly queried zero state is covered; a volume search
+        // flag never proves the namespace policy of this held directory.
+        if(directory&&policy.scope==RegularMetadataScope::CompleteMetadataV1) {
+            FILE_CASE_SENSITIVE_INFO case_info{};
+            if(!GetFileInformationByHandleEx(handle_.get(),FileCaseSensitiveInfo,&case_info,sizeof(case_info)))
+                return Result::unavailable(ObservationState::Unsupported,
+                    {ErrorDomain::Win32,GetLastError(),"metadata_replay.directory_case_query_unqualified"});
+            if(case_info.Flags!=0)return refuse("metadata_replay.directory_case_flags_unimplemented");
+        }
+        const DWORD supported=(directory?FILE_ATTRIBUTE_DIRECTORY:0)|FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM|
             FILE_ATTRIBUTE_ARCHIVE|FILE_ATTRIBUTE_NORMAL|FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
         if ((*basic.value()->windows_attributes.value() & ~supported)!=0)
             return refuse("metadata_replay.windows_storage_provider");
@@ -518,6 +940,9 @@ public:
             return failure<bool>(GetLastError(),"metadata_replay.GetVolumeInformationByHandleW");
         if ((std::wstring_view(filesystem)!=L"NTFS" && std::wstring_view(filesystem)!=L"ReFS") || (flags&FILE_PERSISTENT_ACLS)==0)
             return refuse("metadata_replay.windows_unaudited_filesystem");
+        const auto native_driver=detail::prove_windows_native_fsd(handle_.get());
+        if(!native_driver.qualified)return Result::unavailable(native_driver.state,
+            {native_driver.domain,native_driver.code,native_driver.operation});
         using QueryVolume=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,ULONG);
         const auto query_address=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryVolumeInformationFile");
         if (!query_address) return refuse("metadata_replay.windows_device_query");
@@ -531,15 +956,19 @@ public:
         if (!channels.value()) {const auto& e=*channels.unavailable_detail();return Result::unavailable(e.state,e.error);}
         if (channels.value()->coverage!=DataChannelCoverage::WindowsFileStreamInfo)
             return refuse("metadata_replay.windows_stream_coverage");
+        if(!channels.value()->owner.value()||!basic.value()->identity.value()||
+           compare_identity(*channels.value()->owner.value(),*basic.value()->identity.value())!=IdentityComparison::Same||
+           std::count_if(channels.value()->channels.begin(),channels.value()->channels.end(),[](const auto& item){return item.kind==DataChannelKind::MainData;})!=(directory?0:1))
+            return refuse("metadata_replay.windows_stream_owner_set");
         for (const auto& channel:channels.value()->channels)
-            if (channel.kind!=DataChannelKind::MainData) return refuse("metadata_replay.windows_named_stream_unimplemented");
+            if (channel.kind!=DataChannelKind::MainData&&channel.kind!=DataChannelKind::NamedData) return refuse("metadata_replay.windows_opaque_stream_unimplemented");
         if (policy.scope==RegularMetadataScope::CompleteMetadataV1 && !policy.allow_privilege_metadata)
             return refuse("metadata_replay.full_windows_security_requires_optin");
         return Result::available(true);
     }
     Observation<bool> apply_replay_ownership(const BasicMetadata&, const MetadataReplayPolicy& policy) override {
         using Result=Observation<bool>;
-        if (!policy.valid() || !content_write_access_ || !publication_)
+        if (!policy.valid() || !content_write_access_ || (!publication_&&!directory_metadata_target_))
             return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_ownership");
         if (policy.ownership==MetadataOwnership::Original) return Result::available(true); // descriptor phase sets original SIDs
         HANDLE raw=nullptr;
@@ -557,38 +986,37 @@ public:
         };
         const auto owner=query(TokenOwner),group=query(TokenPrimaryGroup);
         if (!owner.value() || !group.value()) {const auto& e=*(owner.value()?group:owner).unavailable_detail();return Result::unavailable(e.state,e.error);}
-        auto opened=metadata_security_handle(WRITE_OWNER|READ_CONTROL);
+        auto opened=ensure_metadata_security_handle(WRITE_OWNER|READ_CONTROL);
         if (!opened.value()) {const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
-        const auto code=SetSecurityInfo(opened.value()->get(),SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION,
+        const auto code=SetSecurityInfo(*opened.value(),SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION,
             reinterpret_cast<const TOKEN_OWNER*>(owner.value()->data())->Owner,
             reinterpret_cast<const TOKEN_PRIMARY_GROUP*>(group.value()->data())->PrimaryGroup,nullptr,nullptr);
         if (code!=ERROR_SUCCESS) return failure<bool>(code,"metadata_replay.caller_SetSecurityInfo");
-        security_handle_=std::move(opened).take_value();
         const auto captured=read_security(SecurityPart::WindowsAccess,policy.limits);
         if (!captured.value()) {const auto& e=*captured.unavailable_detail();return Result::unavailable(e.state,e.error);}
         caller_security_=*captured.value();
         return Result::available(true);
     }
     Observation<bool> apply_replay_attribute(const AttributeValue& value, const MetadataReplayPolicy& policy) override {
-        if (!policy.valid() || !publication_) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_attribute");
+        if (!policy.valid() || (!publication_&&!directory_metadata_target_)) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_attribute");
         // Windows zero-sized EAs encode deletion, not a present empty value.
         if (value.bytes.empty()) return Observation<bool>::unavailable(ObservationState::Unsupported,
             {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"metadata_replay.empty_windows_ea"});
         return apply_nonsecurity_attribute(value);
     }
     Observation<bool> remove_replay_attribute(const NativeFeatureIdentifier& id, const MetadataReplayPolicy& policy) override {
-        if (!policy.valid() || !publication_) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_remove_attribute");
+        if (!policy.valid() || (!publication_&&!directory_metadata_target_)) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_remove_attribute");
         const auto basic=inspect_basic();
         if (!basic.value()) {const auto& e=*basic.unavailable_detail();return Observation<bool>::unavailable(e.state,e.error);}
         return apply_nonsecurity_attribute({id,{},basic.value()->identity,Observation<std::uint32_t>::available(0)});
     }
     Observation<bool> apply_replay_basic(const BasicMetadata& value, const MetadataReplayPolicy& policy) override {
-        if (!policy.valid() || !publication_) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_basic");
+        if (!policy.valid() || (!publication_&&!directory_metadata_target_)) return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_basic");
         return apply_portable_basic_metadata(value);
     }
     Observation<bool> apply_replay_security(const NativeSecurityValue& source, const MetadataReplayPolicy& policy) override {
         using Result=Observation<bool>;
-        if (!policy.valid() || !content_write_access_ || !publication_ || source.encoding!=SecurityEncoding::WindowsRelativeDescriptor ||
+        if (!policy.valid() || !content_write_access_ || (!publication_&&!directory_metadata_target_) || source.encoding!=SecurityEncoding::WindowsRelativeDescriptor ||
             source.presence!=SecurityPresence::Present || !source.owner.value())
             return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.staging_security");
         const auto checked=detail::validate_windows_descriptor(source.bytes,policy.limits);
@@ -628,9 +1056,51 @@ public:
             !GetSecurityDescriptorOwner(descriptor,&owner,&defaulted) || !GetSecurityDescriptorGroup(descriptor,&group,&defaulted) ||
             !GetSecurityDescriptorDacl(descriptor,&present,&dacl,&defaulted) || !GetSecurityDescriptorSacl(descriptor,&present,&sacl,&defaulted))
             return failure<bool>(GetLastError(),"metadata_replay.descriptor_fields");
+        if(source.part==SecurityPart::WindowsFullDescriptor) {
+            // Do not materialize a present-null SACL when the complete queried
+            // SACL is already identical. All classes are still queried/verified.
+            const auto current=read_security(SecurityPart::WindowsFullDescriptor,policy.limits);
+            if(!current.value()){const auto& e=*current.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            PACL other=nullptr;BOOL other_present=FALSE,other_defaulted=FALSE;
+            BOOL source_present=FALSE,source_defaulted=FALSE;PACL source_acl=nullptr;
+            SECURITY_DESCRIPTOR_CONTROL other_control=0;DWORD other_revision=0;
+            auto* other_descriptor=const_cast<std::byte*>(current.value()->bytes.data());
+            if(!GetSecurityDescriptorSacl(descriptor,&source_present,&source_acl,&source_defaulted)||
+               !GetSecurityDescriptorSacl(other_descriptor,&other_present,&other,&other_defaulted)||
+               !GetSecurityDescriptorControl(other_descriptor,&other_control,&other_revision))
+                return failure<bool>(GetLastError(),"metadata_replay.full_sacl_query");
+            constexpr auto sacl_control=SE_SACL_PROTECTED|SE_SACL_AUTO_INHERITED|SE_SACL_AUTO_INHERIT_REQ;
+            const auto desired_classes=persistent_sacl_classes(source),actual_classes=persistent_sacl_classes(*current.value());
+            if(!desired_classes.value()||!actual_classes.value()){const auto& e=*(desired_classes.value()?actual_classes:desired_classes).unavailable_detail();return Result::unavailable(e.state,e.error);}
+            constexpr SECURITY_INFORMATION class_masks[]{SACL_SECURITY_INFORMATION,LABEL_SECURITY_INFORMATION,
+                ATTRIBUTE_SECURITY_INFORMATION,SCOPE_SECURITY_INFORMATION,PROCESS_TRUST_LABEL_SECURITY_INFORMATION,ACCESS_FILTER_SECURITY_INFORMATION};
+            mask&=~persistent_sacl_information;
+            for(std::size_t index=0;index<6;++index)
+                if((*desired_classes.value())[index]!=(*actual_classes.value())[index])mask|=class_masks[index];
+            if(source_present!=other_present||source_defaulted!=other_defaulted||(!source_acl!=!other)||
+               (source_acl&&other&&(source_acl->AclRevision!=other->AclRevision||source_acl->AclSize!=other->AclSize))||
+               (control&sacl_control)!=(other_control&sacl_control))mask|=SACL_SECURITY_INFORMATION;
+        }
         if (mask&DACL_SECURITY_INFORMATION) mask|=(control&SE_DACL_PROTECTED)?PROTECTED_DACL_SECURITY_INFORMATION:UNPROTECTED_DACL_SECURITY_INFORMATION;
         if (mask&SACL_SECURITY_INFORMATION) mask|=(control&SE_SACL_PROTECTED)?PROTECTED_SACL_SECURITY_INFORMATION:UNPROTECTED_SACL_SECURITY_INFORMATION;
-        auto opened=metadata_security_handle(rights);
+        // Native assignment consumes AUTO_INHERIT_REQ while preserving the
+        // corresponding stored AUTO_INHERITED bit. Supplying only the stored
+        // bit clears it (0x8404 -> 0x8004) even when every ACE byte matches.
+        // This changes only our request copy; verification retains the exact
+        // captured control word and avoids parent ACL recalculation.
+        SECURITY_DESCRIPTOR_CONTROL inheritance_requests=0;
+        if((mask&DACL_SECURITY_INFORMATION)&&(control&SE_DACL_AUTO_INHERITED))
+            inheritance_requests|=SE_DACL_AUTO_INHERIT_REQ;
+        if((mask&SACL_SECURITY_INFORMATION)&&(control&SE_SACL_AUTO_INHERITED))
+            inheritance_requests|=SE_SACL_AUTO_INHERIT_REQ;
+        NativeBytes requested;
+        if(inheritance_requests) {
+            requested=source.bytes;
+            if(!SetSecurityDescriptorControl(requested.data(),inheritance_requests,inheritance_requests))
+                return failure<bool>(GetLastError(),"metadata_replay.inheritance_request");
+            descriptor=requested.data();
+        }
+        auto opened=ensure_metadata_security_handle(rights);
         if (!opened.value()) {const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
         // SetSecurityInfo reapplies parent inheritance, which can add ACEs
         // to this already inventoried ACL. Replay the validated descriptor on
@@ -639,10 +1109,9 @@ public:
         const auto address=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtSetSecurityObject");
         if (!address) return Result::unavailable(ObservationState::Unsupported,
             {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"metadata_replay.NtSetSecurityObject.resolve"});
-        const auto status=std::bit_cast<SetSecurity>(address)(opened.value()->get(),mask,descriptor);
+        const auto status=std::bit_cast<SetSecurity>(address)(*opened.value(),mask,descriptor);
         if (status!=0) return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
             {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"metadata_replay.NtSetSecurityObject"});
-        security_handle_=std::move(opened).take_value();
         return verify_replay_security(source,policy);
     }
     Observation<bool> verify_replay_security(const NativeSecurityValue& source, const MetadataReplayPolicy& policy) const override {
@@ -693,6 +1162,140 @@ public:
     }
     Observation<bool> rename_noreplace(const DirectoryCursor& source_parent, const DirectoryCursor& destination,
                                      const NativeName& name) const override;
+    Observation<bool> qualify_progressive_target(const NativeMetadataProof& proof,const NativeFeatureIdentifier* identifier=nullptr)const {
+        using R=Observation<bool>;
+        const auto reject=[](const char* op){return R::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),op});};
+        if(auto e=proof.cleanup_error())return R::unavailable(e->state,{e->domain,e->code,e->operation});
+        if(proof.io_finished()||!content_write_access_||finish_started_||
+           (!publication_&&!directory_metadata_target_))return reject("metadata_stream.private_open_target_required");
+        const auto& snapshot=proof.snapshot();
+        if(!snapshot.policy.valid()||snapshot.channel_coverage!=DataChannelCoverage::WindowsFileStreamInfo||
+           !snapshot.basic.kind.value()||!snapshot.basic.identity.value()||
+           (identifier&&std::none_of(snapshot.channels.begin(),snapshot.channels.end(),[&](const auto& c){return c.identifier==*identifier;})))
+            return reject("metadata_stream.open_native_channel_proof_required");
+        auto qualified=qualify_metadata_replay(snapshot.policy);if(!qualified.value()||!*qualified.value())return qualified;
+        auto source=verify_native_metadata_replay_channels(snapshot);if(!source.value()||!*source.value())return source;
+        auto target=inspect_basic();if(!target.value()){const auto&e=*target.unavailable_detail();return R::unavailable(e.state,e.error);}
+        if(!target.value()->identity.value()||!target.value()->kind.value()||*target.value()->kind.value()!=*snapshot.basic.kind.value()||
+           (*snapshot.basic.kind.value()==ObjectKind::RegularFile&&(!target.value()->logical_size.value()||
+            !snapshot.basic.logical_size.value()||*target.value()->logical_size.value()!=*snapshot.basic.logical_size.value())))
+            return reject("metadata_stream.target_shape");
+        return R::available(true);
+    }
+    Observation<std::shared_ptr<WindowsMetadataChannel>> open_progressive_writer(
+        const NativeMetadataProof& proof,const NativeFeatureIdentifier& identifier) {
+        using R=Observation<std::shared_ptr<WindowsMetadataChannel>>;
+        auto checked=qualify_progressive_target(proof,&identifier);
+        if(!checked.value()||!*checked.value())return R::unavailable(checked.value()?ObservationState::Failed:checked.state(),
+            checked.value()?NativeError{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_stream.target_false"}:checked.unavailable_detail()->error);
+        const auto& snapshot=proof.snapshot();auto catalog=inspect_data_channels(snapshot.policy.limits);
+        if(!catalog.value()){const auto&e=*catalog.unavailable_detail();return R::unavailable(e.state,e.error);}
+        if(catalog.value()->coverage!=snapshot.channel_coverage)return R::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_stream.target_catalog"});
+        for(const auto& c:catalog.value()->channels)if(c.kind!=DataChannelKind::MainData&&
+            (c.kind!=DataChannelKind::NamedData||
+             std::none_of(channel_writers_.begin(),channel_writers_.end(),[&](const auto& w){return w->identifier()==c.identifier;})||
+             std::none_of(snapshot.channels.begin(),snapshot.channels.end(),[&](const auto& s){return s.identifier==c.identifier;})))
+            return R::unavailable(ObservationState::Unsupported,{ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_stream.unowned_target_channel"});
+        auto opened=open_metadata_channel(identifier,true);
+        if(!opened.value()){const auto&e=*opened.unavailable_detail();return R::unavailable(e.state,e.error);}
+        std::shared_ptr<WindowsMetadataChannel> owner(std::move(opened).take_value());
+        channel_writers_.push_back(owner);return R::available(std::move(owner));
+    }
+    Observation<std::unique_ptr<WindowsMetadataChannel>> open_progressive_reader(
+        const NativeMetadataProof& proof,const NativeFeatureIdentifier& identifier) {
+        using R=Observation<std::unique_ptr<WindowsMetadataChannel>>;
+        auto checked=qualify_progressive_target(proof,&identifier);
+        if(!checked.value()||!*checked.value())return R::unavailable(checked.value()?ObservationState::Failed:checked.state(),
+            checked.value()?NativeError{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_stream.target_false"}:checked.unavailable_detail()->error);
+        // Bypass channel_writers_: this must be an independent file object,
+        // opened after that stream's writer closes and before final security.
+        return open_metadata_channel(identifier,false,true);
+    }
+    Observation<std::shared_ptr<const MetadataReplayChannelSource>> open_metadata_replay_channel_read(
+        const NativeFeatureIdentifier& identifier) const override {
+        using Result=Observation<std::shared_ptr<const MetadataReplayChannelSource>>;
+        // Verification reuses this already-owned stream writer, whose own
+        // automatic timestamps are suppressed. A separately reopened reader
+        // could change the file's access time after final timestamp replay.
+        for(const auto& owned:channel_writers_)if(owned->identifier()==identifier)return Result::available(owned);
+        auto opened=open_metadata_channel(identifier,false);
+        if(!opened.value()){const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        return Result::available(std::shared_ptr<const MetadataReplayChannelSource>(std::move(opened).take_value()));
+    }
+    Observation<bool> apply_replay_channels(const MetadataReplaySnapshot& snapshot,std::stop_token stop={}) override {
+        using Result=Observation<bool>;
+        if(!content_write_access_||(!publication_&&!directory_metadata_target_)||!snapshot.policy.valid()||snapshot.channel_coverage!=DataChannelCoverage::WindowsFileStreamInfo)
+            return failure<bool>(ERROR_ACCESS_DENIED,"metadata_channels.staging_access");
+        const auto proof=verify_native_metadata_replay_channels(snapshot);
+        if(!proof.value()||!*proof.value())return proof;
+        const auto catalog=inspect_data_channels(snapshot.policy.limits);
+        if(!catalog.value()){const auto& e=*catalog.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        for(const auto& channel:catalog.value()->channels)if(channel.kind!=DataChannelKind::MainData) {
+            if(channel.kind!=DataChannelKind::NamedData||std::none_of(channel_writers_.begin(),channel_writers_.end(),[&](const auto& own){return own->identifier()==channel.identifier;})||
+                std::none_of(snapshot.channels.begin(),snapshot.channels.end(),[&](const auto& expected){return expected.identifier==channel.identifier;}))
+                return Result::unavailable(ObservationState::Unsupported,
+                    {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_channels.unowned_staging_stream"});
+        }
+        for(std::size_t index=0;index<snapshot.channels.size();++index) {
+            const auto& expected=snapshot.channels[index];
+            if(!expected.source||!snapshot.basic.identity.value())return failure<bool>(ERROR_INVALID_DATA,"metadata_channels.source_missing");
+            for(std::size_t prior=0;prior<index;++prior)if(snapshot.channels[prior].identifier==expected.identifier)
+                return failure<bool>(ERROR_INVALID_DATA,"metadata_channels.duplicate_snapshot");
+            const auto source=expected.source->inspect();
+            if(!source.value()){const auto& e=*source.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            if(source.value()->identifier!=expected.identifier || source.value()->logical_size!=expected.logical_size ||
+                compare_identity(source.value()->owner,*snapshot.basic.identity.value())!=IdentityComparison::Same)
+                return Result::unavailable(ObservationState::Changed,
+                    {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.source_identity"});
+            auto existing=std::find_if(channel_writers_.begin(),channel_writers_.end(),[&](const auto& own){return own->identifier()==expected.identifier;});
+            WindowsMetadataChannel* writer=nullptr;
+            if(existing==channel_writers_.end()) {
+                auto opened=open_metadata_channel(expected.identifier,true);
+                if(!opened.value()){const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
+                channel_writers_.push_back(std::move(opened).take_value());writer=channel_writers_.back().get();
+            } else writer=existing->get();
+            auto truncated=writer->truncate();if(!truncated.value()||!*truncated.value())return truncated;
+            Sha256 digest;std::uint64_t offset=0;
+            while(offset<expected.logical_size) {
+                if(stop.stop_requested())return Result::unavailable(ObservationState::Unknown,
+                    {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InterruptedRead),"metadata_channels.copy_cancelled"});
+                const auto data=expected.source->read_content({64*1024},offset,stop);
+                if(!data.value()){const auto& e=*data.unavailable_detail();return Result::unavailable(e.state,e.error);}
+                if(data.value()->bytes.empty()||data.value()->bytes.size()>expected.logical_size-offset ||
+                    (data.value()->complete&&data.value()->bytes.size()!=expected.logical_size-offset))
+                    return Result::unavailable(ObservationState::Changed,
+                        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.copy_shape"});
+                digest.update(data.value()->bytes);
+                std::size_t done=0;
+                while(done<data.value()->bytes.size()) {
+                    const auto wrote=writer->write(offset+done,std::span(data.value()->bytes).subspan(done));
+                    if(!wrote.value()){const auto& e=*wrote.unavailable_detail();return Result::unavailable(e.state,e.error);}
+                    if(!*wrote.value()||*wrote.value()>data.value()->bytes.size()-done)return failure<bool>(ERROR_WRITE_FAULT,"metadata_channels.write_progress");
+                    done+=*wrote.value();
+                }
+                offset+=data.value()->bytes.size();
+            }
+            if(digest.digest()!=expected.digest)return Result::unavailable(ObservationState::Changed,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.source_bytes_changed"});
+            const auto stable=expected.source->inspect();
+            if(!stable.value()){const auto& e=*stable.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            if(stable.value()->logical_size!=expected.logical_size || stable.value()->identifier!=expected.identifier ||
+                compare_identity(stable.value()->owner,*snapshot.basic.identity.value())!=IdentityComparison::Same)
+                return Result::unavailable(ObservationState::Changed,
+                    {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.source_changed"});
+            const auto flushed=writer->flush();if(!flushed.value()||!*flushed.value())return flushed;
+            const auto target=writer->inspect();
+            if(!target.value()){const auto& e=*target.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            const auto checked=digest_metadata_replay_channel(*writer,expected.identifier,target.value()->owner,expected.logical_size,stop);
+            if(!checked.value()){const auto& e=*checked.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            if(*checked.value()!=expected.digest)return Result::unavailable(ObservationState::Changed,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.target_bytes_changed"});
+        }
+        return Result::available(true);
+    }
     Observation<bool> apply_portable_basic_metadata(const BasicMetadata& source) override {
         using Result = Observation<bool>;
         if (!content_write_access_)
@@ -703,10 +1306,10 @@ public:
             const auto& error = *target.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
-        if (!target.value()->kind.value() || *target.value()->kind.value() != ObjectKind::RegularFile)
+        if (!target.value()->kind.value() || (*target.value()->kind.value() != ObjectKind::RegularFile&&!(directory_metadata_target_&&*target.value()->kind.value()==ObjectKind::Directory)))
             return Result::unavailable(ObservationState::Unsupported,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::NotApplicable), "metadata.portable_basic.target_kind"});
-        if (!source.kind.value() || *source.kind.value() != ObjectKind::RegularFile)
+        if (!source.kind.value() || (*source.kind.value() != ObjectKind::RegularFile&&!(directory_metadata_target_&&*source.kind.value()==ObjectKind::Directory)))
             return Result::unavailable(ObservationState::Unsupported,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::NotApplicable), "metadata.portable_basic.source_kind"});
         if (!source.windows_attributes.value()) {
@@ -734,7 +1337,8 @@ public:
         native.LastAccessTime.QuadPart = *accessed.value();
         native.LastWriteTime.QuadPart = *modified.value();
         native.ChangeTime.QuadPart = *changed.value();
-        native.FileAttributes = *source.windows_attributes.value();
+        native.FileAttributes = *source.windows_attributes.value()&~FILE_ATTRIBUTE_DIRECTORY;
+        if(!native.FileAttributes)native.FileAttributes=FILE_ATTRIBUTE_NORMAL;
         if (!SetFileInformationByHandle(handle_.get(), FileBasicInfo, &native, sizeof(native)))
             return failure<bool>(GetLastError(), "metadata.portable_basic.FileBasicInfo");
         return Result::available(true);
@@ -772,7 +1376,7 @@ public:
             return Result::unavailable(error.state, error.error);
         }
         if (!before.value()->identity.value() || !before.value()->kind.value() ||
-            *before.value()->kind.value() != ObjectKind::RegularFile)
+            (*before.value()->kind.value() != ObjectKind::RegularFile&&!(directory_metadata_target_&&*before.value()->kind.value()==ObjectKind::Directory)))
             return Result::unavailable(ObservationState::Unsupported,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::NotApplicable), "attributes.nonsecurity.target_kind"});
         if (const auto guarded = provider_guard(*before.value()))
@@ -820,6 +1424,11 @@ public:
     }
     Observation<FileIntegrityInfo> inspect_integrity(InventoryLimits limits = {}) const override {
         using Result = Observation<FileIntegrityInfo>;
+        if (rename_access_) {
+            auto view=synchronous_query_view(0);
+            if(!view.value()){const auto& e=*view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            return (*view.value())->inspect_integrity(limits);
+        }
         if (!limits.valid()) return Result::unavailable(ObservationState::Failed,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidLimit), "integrity.limits"});
         if (limits.max_native_bytes < WindowsIntegrityData::wire_bytes) return Result::unavailable(ObservationState::Unknown,
@@ -856,6 +1465,11 @@ public:
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InterruptedRead), "layout.cancelled"});
         if (!layout_access_) return Result::unavailable(ObservationState::Denied,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidAccess), "layout.access_not_requested"});
+        if (rename_access_) {
+            auto view=synchronous_query_view(FILE_READ_DATA,true);
+            if(!view.value()){const auto& e=*view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            return (*view.value())->inspect_data_layout(limits,stop);
+        }
         const auto before = inspect_basic();
         if (!before.value()) { const auto& e = *before.unavailable_detail(); return Result::unavailable(e.state, e.error); }
         const auto guard = detail::data_layout_access_guard(*before.value(), StorageModel::WindowsHandleAttributes);
@@ -893,6 +1507,11 @@ public:
     Observation<std::unique_ptr<OpenedEntry>> open_parent_directory() const override;
     Observation<LinkMetadata> read_link_metadata(InventoryLimits limits = {}) const override {
         using Result = Observation<LinkMetadata>;
+        if (rename_access_) {
+            auto view=synchronous_query_view(0);
+            if(!view.value()){const auto& e=*view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            return (*view.value())->read_link_metadata(limits);
+        }
         if (!limits.valid()) return Result::unavailable(ObservationState::Failed,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidLimit), "link.limits"});
         const auto metadata = inspect_basic();
@@ -1003,6 +1622,11 @@ public:
     }
     Observation<AttributeCatalog> inspect_attributes(InventoryLimits limits = {}) const override {
         using Result = Observation<AttributeCatalog>;
+        if (rename_access_) {
+            auto view=synchronous_query_view(FILE_READ_EA);
+            if(!view.value()){const auto& e=*view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            return (*view.value())->inspect_attributes(limits);
+        }
         if (!limits.valid()) return Result::unavailable(ObservationState::Failed,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidLimit), "attributes.limits"});
         const auto metadata = inspect_basic();
@@ -1035,6 +1659,11 @@ public:
     }
     Observation<AttributeValue> read_attribute(const NativeFeatureIdentifier& id, InventoryLimits limits = {}) const override {
         using Result = Observation<AttributeValue>;
+        if (rename_access_) {
+            auto view=synchronous_query_view(FILE_READ_EA);
+            if(!view.value()){const auto& e=*view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            return (*view.value())->read_attribute(id,limits);
+        }
         if (!limits.valid()) return Result::unavailable(ObservationState::Failed,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidLimit), "attributes.limits"});
         const auto* name = id.windows_ea_bytes();
@@ -1067,7 +1696,7 @@ public:
         switch (part) {
         case SecurityPart::WindowsAccess: mask = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION; break;
         case SecurityPart::WindowsIntegrity: mask = LABEL_SECURITY_INFORMATION; break;
-        case SecurityPart::WindowsFullDescriptor: mask = BACKUP_SECURITY_INFORMATION; break;
+        case SecurityPart::WindowsFullDescriptor: mask = persistent_security_information; break;
         default: return Result::unavailable(ObservationState::Unsupported,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::NotApplicable), "security.model"});
         }
@@ -1092,6 +1721,92 @@ public:
     }
 private:
     friend class WindowsDirectoryCursor;
+    friend class ::ck::files::NativeCreatedDirectory;
+    Observation<std::unique_ptr<WindowsMetadataChannel>> open_metadata_channel(const NativeFeatureIdentifier& identifier,bool create,
+        bool suppress_read_times=false) const {
+        using Result=Observation<std::unique_ptr<WindowsMetadataChannel>>;
+        const auto* units=identifier.windows_units();
+        if(!units||units->size()<=7||units->front()!=u':'||!units->ends_with(u":$DATA")||
+            units->substr(1,units->size()-7).find_first_of(u":/\\\0",0,4)!=std::u16string::npos ||
+            units->size()>std::numeric_limits<USHORT>::max()/sizeof(WCHAR))
+            return Result::unavailable(ObservationState::Failed,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidIdentifier),"metadata_channels.native_identifier"});
+        if(create&&(!content_write_access_||(!publication_&&!directory_metadata_target_)))return failure<std::unique_ptr<WindowsMetadataChannel>>(ERROR_ACCESS_DENIED,"metadata_channels.create_access");
+        const auto owner=identity(handle_.get(),scope_);
+        if(!owner.value()){const auto& e=*owner.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(owner.value()->scheme!=IdentityScheme::WindowsFileId128)return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"metadata_channels.owner_scheme"});
+        const auto basic=inspect_basic();
+        if(!basic.value()){const auto& e=*basic.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(!basic.value()->kind.value()||(*basic.value()->kind.value()!=ObjectKind::RegularFile&&*basic.value()->kind.value()!=ObjectKind::Directory))
+            return failure<std::unique_ptr<WindowsMetadataChannel>>(ERROR_NOT_SUPPORTED,"metadata_channels.base_kind");
+        const bool directory=*basic.value()->kind.value()==ObjectKind::Directory;
+        std::wstring spelling(units->begin(),units->end());UNICODE_STRING name{};
+        name.Length=static_cast<USHORT>(spelling.size()*sizeof(WCHAR));name.MaximumLength=name.Length;name.Buffer=spelling.data();
+        OBJECT_ATTRIBUTES attributes{};attributes.Length=sizeof(attributes);attributes.RootDirectory=handle_.get();attributes.ObjectName=&name;
+        IO_STATUS_BLOCK io{};HANDLE raw=nullptr;
+        const auto status=NtCreateFile(&raw,create?FILE_GENERIC_READ|FILE_GENERIC_WRITE:
+            FILE_READ_DATA|FILE_READ_ATTRIBUTES|SYNCHRONIZE|(suppress_read_times?FILE_WRITE_ATTRIBUTES:0),
+            &attributes,&io,nullptr,FILE_ATTRIBUTE_NORMAL,FILE_SHARE_READ|FILE_SHARE_DELETE,
+            create?FILE_CREATE:FILE_OPEN,(directory?0:FILE_NON_DIRECTORY_FILE)|FILE_OPEN_REPARSE_POINT|FILE_OPEN_NO_RECALL|FILE_SYNCHRONOUS_IO_NONALERT,nullptr,0);
+        OwnedHandle opened(raw);
+        if(status!=0)return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
+            {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"metadata_channels.NtCreateFile.relative"});
+        if(!opened||opened.get()==INVALID_HANDLE_VALUE||io.Information!=(create?FILE_CREATED:FILE_OPENED))
+            return failure<std::unique_ptr<WindowsMetadataChannel>>(ERROR_INVALID_DATA,"metadata_channels.open_result");
+        if(create||suppress_read_times) {
+            // Stream writes and close otherwise defer updates to the base
+            // file's times. Suppress updates from this specific file object;
+            // final base-object timestamp replay still sets the actual values.
+            const FILETIME suppressed{MAXDWORD,MAXDWORD};
+            if(!SetFileTime(opened.get(),nullptr,&suppressed,&suppressed))
+                return failure<std::unique_ptr<WindowsMetadataChannel>>(GetLastError(),"metadata_channels.suppress_automatic_times");
+        }
+        auto channel=std::make_unique<WindowsMetadataChannel>(std::move(opened),scope_,identifier,*owner.value(),create);
+        const auto checked=channel->inspect();
+        if(!checked.value()){const auto& e=*checked.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        return Result::available(std::move(channel));
+    }
+    Observation<std::unique_ptr<WindowsOpenedEntry>> synchronous_query_view(DWORD rights,bool layout=false) const {
+        using Result=Observation<std::unique_ptr<WindowsOpenedEntry>>;
+        auto handle=metadata_security_handle(rights);
+        if(!handle.value()){const auto& e=*handle.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        return Result::available(std::make_unique<WindowsOpenedEntry>(std::move(handle).take_value(),scope_,layout));
+    }
+    Observation<DWORD> read_guarded(std::span<std::byte> bytes,std::uint64_t offset,std::stop_token stop) const {
+        using Result=Observation<DWORD>;
+        if (content_lease_) {const auto stable=content_lease_->check();if(!stable.value()){const auto& e=*stable.unavailable_detail();return Result::unavailable(e.state,e.error);}}
+        if (bytes.empty()) return Result::available(0);
+        OwnedHandle event(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+        if (!event || event.get()==INVALID_HANDLE_VALUE) return failure<DWORD>(GetLastError(),"content.guard_read_event");
+        OVERLAPPED io{};io.hEvent=event.get();io.Offset=static_cast<DWORD>(offset);io.OffsetHigh=static_cast<DWORD>(offset>>32U);
+        DWORD copied=0;
+        if (!ReadFile(handle_.get(),bytes.data(),static_cast<DWORD>(bytes.size()),&copied,&io)) {
+            const DWORD code=GetLastError();
+            if (code!=ERROR_IO_PENDING) return failure<DWORD>(code,"content.guard_ReadFile");
+            bool cancelled=false,broken=false;DWORD wait_error=0;
+            for (;;) {
+                HANDLE events[]{event.get(),content_lease_?content_lease_->event():nullptr};
+                const DWORD result=WaitForMultipleObjects(content_lease_?2:1,events,FALSE,50);
+                if (result==WAIT_OBJECT_0) break;
+                cancelled=stop.stop_requested();broken=result==WAIT_OBJECT_0+1;
+                if (result==WAIT_FAILED) wait_error=GetLastError();
+                if (cancelled || broken || wait_error) {
+                    CancelIoEx(handle_.get(),&io);
+                    // Cancellation is a request, not completion. Drain this
+                    // read before its buffer, event or OVERLAPPED can unwind.
+                    GetOverlappedResult(handle_.get(),&io,&copied,TRUE);
+                    if (cancelled) return Result::unavailable(ObservationState::Unknown,
+                        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InterruptedRead),"content.guard_read_cancelled"});
+                    if (broken) {const auto e=content_lease_->check();return Result::unavailable(e.state(),e.unavailable_detail()->error);}
+                    return failure<DWORD>(wait_error,"content.guard_read_wait");
+                }
+            }
+            if (!GetOverlappedResult(handle_.get(),&io,&copied,FALSE)) return failure<DWORD>(GetLastError(),"content.guard_read_completion");
+        }
+        if (content_lease_) {const auto stable=content_lease_->check();if(!stable.value()){const auto& e=*stable.unavailable_detail();return Result::unavailable(e.state,e.error);}}
+        return Result::available(copied);
+    }
     static std::optional<UnavailableObservation> provider_guard(const BasicMetadata& metadata) {
         const auto review = provider_review_required(metadata, StorageModel::WindowsHandleAttributes);
         if (!review.value()) return *review.unavailable_detail();
@@ -1136,7 +1851,7 @@ private:
         } else return Result::unavailable(ObservationState::Unsupported,
             {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"metadata_replay.windows_id_scheme"});
         OwnedHandle opened(OpenFileById(handle_.get(),&id,rights|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-            nullptr,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+            nullptr,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL|FILE_FLAG_BACKUP_SEMANTICS));
         if (!opened || opened.get()==INVALID_HANDLE_VALUE) return failure<OwnedHandle>(GetLastError(),"metadata_replay.OpenFileById.security");
         const auto checked=identity(opened.get(),scope_);
         if (!checked.value() || compare_identity(*held.value(),*checked.value())!=IdentityComparison::Same)
@@ -1144,6 +1859,17 @@ private:
                 {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_replay.security_handle_identity"});
         return Result::available(std::move(opened));
     }
+    Observation<HANDLE> ensure_metadata_security_handle(DWORD rights) {
+        using Result=Observation<HANDLE>;
+        if(security_handle_&&(security_access_&rights)==rights) return Result::available(security_handle_.get());
+        auto opened=metadata_security_handle(rights|security_access_);
+        if(!opened.value()){const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        security_handle_=std::move(opened).take_value();security_access_|=rights;
+        return Result::available(security_handle_.get());
+    }
+    bool capture_close_started_=false;
+    std::optional<MetadataCaptureCleanupError> capture_close_error_;
+    DWORD security_access_=0;
     OwnedHandle security_handle_;
     bool finish_started_ = false;
     std::optional<Observation<bool>> finish_result_;
@@ -1155,7 +1881,240 @@ private:
     bool content_write_access_ = false;
     bool rename_access_ = false;
     std::unique_ptr<WindowsPublicationContext> publication_;
+    bool directory_metadata_target_=false;
+    mutable std::unique_ptr<WindowsContentLease> content_lease_;
+    std::vector<std::shared_ptr<WindowsMetadataChannel>> channel_writers_;
 };
+
+// This type is deliberately private to the native adapter. A caller-created
+// snapshot or evidence implementation cannot authorize complete native replay.
+class WindowsChannelManifestProof final:public MetadataReplayChannelEvidence {
+public:
+    WindowsChannelManifestProof(std::unique_ptr<OpenedEntry> source,MetadataReplaySnapshot observed,std::shared_ptr<const void> lease={})
+        :source_(std::move(source)),observed_(std::move(observed)),capture_lease_(std::move(lease)) {
+        observed_.channel_evidence.reset();observed_.security_coverage.reset();
+    }
+    Observation<bool> recheck(const MetadataReplaySnapshot& requested)const {
+        using Result=Observation<bool>;
+        const auto changed=[](const char* op){return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),op});};
+        const auto& expected=observed_;
+        if(!requested.policy.valid()||requested.policy.version!=expected.policy.version||requested.policy.scope!=expected.policy.scope||
+           requested.policy.ownership!=expected.policy.ownership||requested.policy.allow_privilege_metadata!=expected.policy.allow_privilege_metadata||
+           requested.policy.limits.max_native_bytes!=expected.policy.limits.max_native_bytes||
+           requested.policy.limits.max_records!=expected.policy.limits.max_records||
+           requested.channel_coverage!=DataChannelCoverage::WindowsFileStreamInfo||
+           requested.channel_coverage!=expected.channel_coverage||requested.channels.size()!=expected.channels.size()||
+           requested.channels.size()>requested.policy.limits.max_records||
+           !requested.basic.identity.value()||!expected.basic.identity.value()||
+           compare_identity(*requested.basic.identity.value(),*expected.basic.identity.value())!=IdentityComparison::Same||
+           !requested.basic.kind.value()||!expected.basic.kind.value()||*requested.basic.kind.value()!=*expected.basic.kind.value())
+            return changed("metadata_channels.proof_manifest");
+        const auto qualified=source_->qualify_metadata_replay(expected.policy);
+        if(!qualified.value()||!*qualified.value())return qualified;
+        const auto basic=source_->inspect_basic();
+        if(!basic.value()){const auto& e=*basic.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(!basic.value()->identity.value()||!basic.value()->kind.value()||
+           compare_identity(*basic.value()->identity.value(),*expected.basic.identity.value())!=IdentityComparison::Same||
+           *basic.value()->kind.value()!=*expected.basic.kind.value())return changed("metadata_channels.proof_owner");
+        const auto catalog=source_->inspect_data_channels(expected.policy.limits);
+        if(!catalog.value()){const auto& e=*catalog.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        const auto main_count=*expected.basic.kind.value()==ObjectKind::Directory?0U:1U;
+        if(catalog.value()->coverage!=expected.channel_coverage||!catalog.value()->owner.value()||
+           compare_identity(*catalog.value()->owner.value(),*expected.basic.identity.value())!=IdentityComparison::Same||
+           catalog.value()->channels.size()!=expected.channels.size()+main_count)
+            return changed("metadata_channels.proof_catalog");
+        for(std::size_t i=0;i<expected.channels.size();++i) {
+            const auto& channel=expected.channels[i];
+            for(std::size_t j=0;j<i;++j)if(expected.channels[j].identifier==channel.identifier)
+                return changed("metadata_channels.proof_duplicate");
+            const auto found=std::find_if(requested.channels.begin(),requested.channels.end(),[&](const auto& x){return x.identifier==channel.identifier;});
+            if(found==requested.channels.end()||found->logical_size!=channel.logical_size||found->digest!=channel.digest||
+               found->source.get()!=channel.source.get()||!dynamic_cast<const WindowsMetadataChannel*>(channel.source.get()))
+                return changed("metadata_channels.proof_channel_binding");
+            const auto current=std::find_if(catalog.value()->channels.begin(),catalog.value()->channels.end(),
+                [&](const auto& x){return x.kind==DataChannelKind::NamedData&&x.identifier==channel.identifier;});
+            if(current==catalog.value()->channels.end()||!current->logical_size.value()||*current->logical_size.value()!=channel.logical_size)
+                return changed("metadata_channels.proof_channel_catalog");
+            const auto state=channel.source->inspect();
+            if(!state.value()){const auto& e=*state.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            if(state.value()->identifier!=channel.identifier||state.value()->logical_size!=channel.logical_size||
+               compare_identity(state.value()->owner,*expected.basic.identity.value())!=IdentityComparison::Same)
+                return changed("metadata_channels.proof_channel_owner");
+        }
+        return Result::available(true);
+    }
+    void finish_capture_reads()const noexcept {
+        auto* native=dynamic_cast<WindowsOpenedEntry*>(source_.get());
+        if(native)native->finish_capture_reads();
+        else detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_capture.native_proof_source_missing"});
+    }
+private:
+    std::unique_ptr<OpenedEntry> source_;
+    MetadataReplaySnapshot observed_;
+    std::shared_ptr<const void> capture_lease_;
+};
+
+class WindowsPersistentSecurityProof final : public MetadataSecurityCoverageEvidence {
+public:
+    WindowsPersistentSecurityProof(std::unique_ptr<WindowsOpenedEntry> source,MetadataReplaySnapshot observed,std::shared_ptr<const void> lease={})
+        :source_(std::move(source)),observed_(std::move(observed)),capture_lease_(std::move(lease)) {observed_.security_coverage.reset();}
+    MetadataSecurityCoverage family() const noexcept override {return MetadataSecurityCoverage::WindowsPersistentSecurityV1;}
+    Observation<bool> recheck(const MetadataReplaySnapshot& requested) const override {
+        using Result=Observation<bool>;
+        const auto channels=verify_native_metadata_replay_channels(requested);
+        if(!channels.value()||!*channels.value())return channels;
+        const auto changed=[](const char* op){return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),op});};
+        const auto unsupported=[](const char* op){return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),op});};
+        const auto same_owner=[](const Observation<ObjectIdentity>& a,const Observation<ObjectIdentity>& b) {
+            return a.value()&&b.value()&&compare_identity(*a.value(),*b.value())==IdentityComparison::Same;
+        };
+        const auto& expected=observed_;
+        if(requested.policy.version!=expected.policy.version||requested.policy.scope!=expected.policy.scope||
+           requested.policy.ownership!=expected.policy.ownership||requested.policy.allow_privilege_metadata!=expected.policy.allow_privilege_metadata||
+           requested.policy.limits.max_native_bytes!=expected.policy.limits.max_native_bytes||requested.policy.limits.max_records!=expected.policy.limits.max_records||
+           !same_owner(requested.basic.identity,expected.basic.identity)||requested.attribute_coverage!=expected.attribute_coverage||
+           requested.attributes.size()!=expected.attributes.size()||requested.security.size()!=1||expected.security.size()!=1)
+            return changed("metadata_replay.coverage_manifest");
+        const auto& security=requested.security.front();const auto& original=expected.security.front();
+        if(security.part!=SecurityPart::WindowsFullDescriptor||security.encoding!=SecurityEncoding::WindowsRelativeDescriptor||security.encoding!=original.encoding||
+           security.presence!=SecurityPresence::Present||security.presence!=original.presence||security.native_query_mask!=persistent_security_information||
+           security.bytes!=original.bytes||!same_owner(security.owner,expected.basic.identity))
+            return changed("metadata_replay.coverage_security_manifest");
+        for(const auto& attribute:expected.attributes) {
+            const auto found=std::find_if(requested.attributes.begin(),requested.attributes.end(),
+                [&](const auto& item){return item.identifier==attribute.identifier;});
+            if(found==requested.attributes.end()||found->bytes!=attribute.bytes||!found->native_flags.value()||
+               !attribute.native_flags.value()||*found->native_flags.value()!=*attribute.native_flags.value()||
+               !same_owner(found->owner,expected.basic.identity)) return changed("metadata_replay.coverage_ea_manifest");
+            if(!attribute.native_flags.value()||*attribute.native_flags.value()!=0)
+                return unsupported("metadata_replay.coverage_ea_interpretation_flags");
+            const auto* name=attribute.identifier.windows_ea_bytes();
+            if(!name)return unsupported("metadata_replay.coverage_ea_namespace");
+            std::string upper=*name;
+            for(auto& byte:upper)if(byte>='a'&&byte<='z')byte=static_cast<char>(byte-'a'+'A');
+            // NtQueryEaFile includes kernel EAs. These can require kernel-mode
+            // writes, so refuse before effects rather than silently dropping
+            // persistent state or treating a derived trust cache as replayable.
+            if(upper.starts_with("$KERNEL."))return unsupported("metadata_replay.coverage_kernel_ea_not_replayable");
+        }
+        if(requested.channel_coverage!=DataChannelCoverage::WindowsFileStreamInfo||
+           expected.channel_coverage!=requested.channel_coverage||requested.channels.size()!=expected.channels.size())
+            return changed("metadata_replay.coverage_channel_manifest");
+        const auto catalog_channels=source_->inspect_data_channels(expected.policy.limits);
+        if(!catalog_channels.value()){const auto& e=*catalog_channels.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        const auto main_count=expected.basic.kind.value()&&*expected.basic.kind.value()==ObjectKind::Directory?0U:1U;
+        if(catalog_channels.value()->coverage!=DataChannelCoverage::WindowsFileStreamInfo||
+           !same_owner(catalog_channels.value()->owner,expected.basic.identity)||
+           catalog_channels.value()->channels.size()!=expected.channels.size()+main_count)
+            return changed("metadata_replay.coverage_source_channel_set");
+        for(const auto& channel:expected.channels) {
+            const auto requested_channel=std::find_if(requested.channels.begin(),requested.channels.end(),
+                [&](const auto& item){return item.identifier==channel.identifier;});
+            if(requested_channel==requested.channels.end()||requested_channel->logical_size!=channel.logical_size||
+               requested_channel->digest!=channel.digest||requested_channel->source.get()!=channel.source.get()||
+               !dynamic_cast<const WindowsMetadataChannel*>(channel.source.get()))
+                return changed("metadata_replay.coverage_channel_binding");
+            const auto current=std::find_if(catalog_channels.value()->channels.begin(),catalog_channels.value()->channels.end(),
+                [&](const auto& item){return item.kind==DataChannelKind::NamedData&&item.identifier==channel.identifier;});
+            if(current==catalog_channels.value()->channels.end()||!current->logical_size.value()||*current->logical_size.value()!=channel.logical_size)
+                return changed("metadata_replay.coverage_source_channel_size");
+            const auto state=channel.source->inspect();
+            if(!state.value()){const auto& e=*state.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            if(state.value()->identifier!=channel.identifier||state.value()->logical_size!=channel.logical_size||
+               compare_identity(state.value()->owner,*expected.basic.identity.value())!=IdentityComparison::Same)
+                return changed("metadata_replay.coverage_channel_owner_size");
+        }
+        const auto classes=persistent_sacl_classes(original);
+        if(!classes.value()){const auto& e=*classes.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        const auto qualified=source_->qualify_metadata_replay(expected.policy);
+        if(!qualified.value()||!*qualified.value())return qualified;
+        const auto basic=source_->inspect_basic();
+        if(!basic.value()){const auto& e=*basic.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(!same_owner(basic.value()->identity,expected.basic.identity)||!basic.value()->kind.value()||
+           !expected.basic.kind.value()||*basic.value()->kind.value()!=*expected.basic.kind.value())
+            return changed("metadata_replay.coverage_source_identity");
+        const auto actual=source_->read_security(SecurityPart::WindowsFullDescriptor,expected.policy.limits);
+        if(!actual.value()){const auto& e=*actual.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(actual.value()->native_query_mask!=persistent_security_information||actual.value()->bytes!=original.bytes||
+           !same_owner(actual.value()->owner,expected.basic.identity))return changed("metadata_replay.coverage_source_security_changed");
+        const auto catalog=source_->inspect_attributes(expected.policy.limits);
+        if(!catalog.value()){const auto& e=*catalog.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(catalog.value()->coverage!=AttributeCoverage::WindowsExtendedAttributes||
+           !same_owner(catalog.value()->owner,expected.basic.identity)||catalog.value()->attributes.size()!=expected.attributes.size())
+            return changed("metadata_replay.coverage_source_ea_set");
+        for(const auto& descriptor:catalog.value()->attributes) {
+            const auto found=std::find_if(expected.attributes.begin(),expected.attributes.end(),
+                [&](const auto& item){return item.identifier==descriptor.identifier;});
+            if(found==expected.attributes.end())return changed("metadata_replay.coverage_source_ea_name");
+            const auto value=source_->read_attribute(descriptor.identifier,expected.policy.limits);
+            if(!value.value()){const auto& e=*value.unavailable_detail();return Result::unavailable(e.state,e.error);}
+            if(value.value()->bytes!=found->bytes||!value.value()->native_flags.value()||!found->native_flags.value()||
+               *value.value()->native_flags.value()!=*found->native_flags.value()||!same_owner(value.value()->owner,expected.basic.identity))
+                return changed("metadata_replay.coverage_source_ea_changed");
+        }
+        return Result::available(true);
+    }
+    void finish_capture_reads()const noexcept {
+        auto* native=dynamic_cast<WindowsOpenedEntry*>(source_.get());
+        if(native)native->finish_capture_reads();
+        else detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_capture.native_proof_source_missing"});
+    }
+private:
+    std::unique_ptr<WindowsOpenedEntry> source_;
+    MetadataReplaySnapshot observed_;
+    std::shared_ptr<const void> capture_lease_;
+};
+Observation<std::shared_ptr<const MetadataSecurityCoverageEvidence>> WindowsOpenedEntry::issue_metadata_security_coverage(
+    const MetadataReplaySnapshot& snapshot) const {
+    using Result=Observation<std::shared_ptr<const MetadataSecurityCoverageEvidence>>;
+    if(snapshot.policy.scope!=RegularMetadataScope::CompleteMetadataV1||snapshot.attribute_coverage!=AttributeCoverage::WindowsExtendedAttributes)
+        return failure<std::shared_ptr<const MetadataSecurityCoverageEvidence>>(ERROR_INVALID_PARAMETER,"metadata_replay.coverage_policy");
+    const auto channel_proof=verify_native_metadata_replay_channels(snapshot);
+    if(!channel_proof.value()){const auto& e=*channel_proof.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    auto opened=synchronous_query_view(FILE_READ_EA|READ_CONTROL|ACCESS_SYSTEM_SECURITY);
+    if(!opened.value()){const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    auto evidence=std::make_shared<WindowsPersistentSecurityProof>(std::move(opened).take_value(),snapshot);
+    const auto checked=evidence->recheck(snapshot);
+    if(!checked.value()){const auto& e=*checked.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    if(!*checked.value())return failure<std::shared_ptr<const MetadataSecurityCoverageEvidence>>(ERROR_INVALID_DATA,"metadata_replay.coverage_false");
+    return Result::available(std::move(evidence));
+}
+Observation<bool> WindowsOpenedEntry::verify_metadata_security_coverage(const MetadataReplaySnapshot& snapshot) const {
+    const auto* proof=dynamic_cast<const WindowsPersistentSecurityProof*>(snapshot.security_coverage.get());
+    if(!proof)return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_replay.native_security_evidence_required"});
+    const auto qualified=qualify_metadata_replay(snapshot.policy);
+    if(!qualified.value()||!*qualified.value())return qualified;
+    return proof->recheck(snapshot);
+}
+Observation<bool> WindowsOpenedEntry::preflight_metadata_security_coverage(const MetadataReplaySnapshot& snapshot) {
+    using Result=Observation<bool>;
+    if(!content_write_access_||(!publication_&&!directory_metadata_target_))return failure<bool>(ERROR_ACCESS_DENIED,"metadata_replay.coverage_target_access");
+    const auto checked=verify_metadata_security_coverage(snapshot);
+    if(!checked.value()||!*checked.value())return checked;
+    const auto privilege=require_enabled_security_privilege();
+    if(!privilege.value())return privilege;
+    auto opened=ensure_metadata_security_handle(READ_CONTROL|WRITE_OWNER|WRITE_DAC|ACCESS_SYSTEM_SECURITY);
+    if(!opened.value()){const auto& e=*opened.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    // Actual all-class target query also rejects unknown masks/providers before
+    // ownership, ACL, attribute or timestamp mutation.
+    const auto security=read_security(SecurityPart::WindowsFullDescriptor,snapshot.policy.limits);
+    if(!security.value()){const auto& e=*security.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    const auto classes=persistent_sacl_classes(*security.value());
+    if(!classes.value()){const auto& e=*classes.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    const auto attributes=inspect_attributes(snapshot.policy.limits);
+    if(!attributes.value()){const auto& e=*attributes.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    for(const auto& item:attributes.value()->attributes) {
+        const auto* name=item.identifier.windows_ea_bytes();
+        if(!name)return failure<bool>(ERROR_NOT_SUPPORTED,"metadata_replay.target_ea_namespace");
+        std::string upper=*name;for(auto& byte:upper)if(byte>='a'&&byte<='z')byte=static_cast<char>(byte-'a'+'A');
+        if(upper.starts_with("$KERNEL."))return failure<bool>(ERROR_NOT_SUPPORTED,"metadata_replay.target_kernel_ea_not_replayable");
+    }
+    return Result::available(true);
+}
 
 Observation<detail::WindowsParentIds> windows_parent_ids(HANDLE handle, IdentityScheme scheme) {
     using Result = Observation<detail::WindowsParentIds>;
@@ -1229,7 +2188,14 @@ Observation<std::unique_ptr<OpenedEntry>> open_windows_parent(HANDLE child, cons
     if (const auto mismatch = qualify(ids.value()->child, *after.value()->identity.value())) return Result::unavailable(mismatch->state, mismatch->error);
     return Result::available(std::move(opened));
 }
-Observation<std::unique_ptr<OpenedEntry>> WindowsOpenedEntry::open_parent_directory() const { return open_windows_parent(handle_.get(), scope_); }
+Observation<std::unique_ptr<OpenedEntry>> WindowsOpenedEntry::open_parent_directory() const {
+    if (rename_access_) {
+        auto view=synchronous_query_view(0);
+        if(!view.value()){const auto& e=*view.unavailable_detail();return Observation<std::unique_ptr<OpenedEntry>>::unavailable(e.state,e.error);}
+        return (*view.value())->open_parent_directory();
+    }
+    return open_windows_parent(handle_.get(), scope_);
+}
 
 // Public FILE_FS_FULL_SIZE_INFORMATION wire layout. The desktop SDK does not
 // declare this WDK structure; no private members or syscall numbers are used.
@@ -1262,6 +2228,15 @@ Observation<VolumeSpaceCounters> volume_space(HANDLE handle) {
 class WindowsDirectoryCursor final : public DirectoryCursor {
     friend class WindowsOpenedEntry;
 public:
+    Observation<std::shared_ptr<const OpenedEntry>> open_progressive_directory_source(const MetadataReplayPolicy& policy)const {
+        using R=Observation<std::shared_ptr<const OpenedEntry>>;HANDLE h=nullptr;
+        if(!DuplicateHandle(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&h,0,FALSE,DUPLICATE_SAME_ACCESS))
+            return failure<std::shared_ptr<const OpenedEntry>>(GetLastError(),"metadata_capture.directory_query_dup");
+        WindowsOpenedEntry held(OwnedHandle(h),scope_);
+        return held.open_progressive_metadata_source(policy);
+    }
+
+
     WindowsDirectoryCursor(OwnedHandle handle, Observation<ObjectIdentity> native_identity, AdapterScope scope)
         : DirectoryCursor(std::move(native_identity)), handle_(std::move(handle)), scope_(std::move(scope)) {}
     Observation<AdapterScope> source_scope() const override { return Observation<AdapterScope>::available(scope_); }
@@ -1775,6 +2750,9 @@ public:
         if (!GetVolumeInformationByHandleW(handle_.get(),nullptr,0,nullptr,nullptr,&flags,filesystem,32))
             return failure<bool>(GetLastError(),"rename.identity_bound.volume");
         if (std::wstring_view(filesystem)!=L"NTFS" && std::wstring_view(filesystem)!=L"ReFS") return refuse("rename.identity_bound.filesystem");
+        const auto native_driver=detail::prove_windows_native_fsd(handle_.get());
+        if(!native_driver.qualified)return Result::unavailable(native_driver.state,
+            {native_driver.domain,native_driver.code,native_driver.operation});
         using QueryVolume=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,ULONG);
         const auto address=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryVolumeInformationFile");
         if (!address) return refuse("rename.identity_bound.device_query");
@@ -2182,6 +3160,8 @@ public:
         return open_component(name,access,ChildLookupMode::NativeDefault);
     }
 private:
+    friend auto ::ck::files::qualify_native_directory_creation(const DirectoryCursor&,const MetadataReplayPolicy&) -> Observation<bool>;
+    friend auto ::ck::files::create_native_directory(std::shared_ptr<const DirectoryCursor>,NativeName,const MetadataReplayPolicy&) -> Observation<std::unique_ptr<NativeCreatedDirectory>>;
     Observation<std::unique_ptr<OpenedEntry>> open_component(const NativeName& name, EntryAccess access, ChildLookupMode mode) const {
         if (!valid_entry_access(access)) return Observation<std::unique_ptr<OpenedEntry>>::unavailable(ObservationState::Failed,
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidAccess), "open_child.access"});
@@ -2306,7 +3286,7 @@ private:
             exclusive ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         const NTSTATUS status = NtCreateFile(&raw, rights, &attributes, &io, nullptr, 0,
             sharing, FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
+            FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | (rename_guard?0:FILE_SYNCHRONOUS_IO_NONALERT), nullptr, 0);
         OwnedHandle opened(raw);
         if (status < 0 || status == 0x00000103L)
             return Result::unavailable(status < 0 ? error_state(RtlNtStatusToDosError(status)) : ObservationState::Failed,
@@ -2380,12 +3360,14 @@ Observation<bool> WindowsOpenedEntry::rename_noreplace(const DirectoryCursor& so
     if (!provider.value()) {const auto& e=*provider.unavailable_detail();return Result::unavailable(e.state,e.error);}
     if (*provider.value()) return Result::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"rename_noreplace.held_provider"});
+    if (content_lease_) {const auto stable=content_lease_->check();if(!stable.value()||!*stable.value()) return stable;}
     auto source_flush=from->open_namespace_write_handle();
     if (!source_flush.value()) {const auto& e=*source_flush.unavailable_detail();return Result::unavailable(e.state,e.error);}
     auto renamed=to->publish_noreplace(handle_.get(),name);
     if (!renamed.value() || !*renamed.value()) return renamed;
     if (!FlushFileBuffers(source_flush.value()->get())) return Result::unavailable(ObservationState::Unknown,
         {ErrorDomain::Win32,GetLastError(),"rename_noreplace.held_source_directory_flush"});
+    if (content_lease_) {const auto stable=content_lease_->check();if(!stable.value()) return Result::unavailable(ObservationState::Unknown,stable.unavailable_detail()->error);}
     return Result::available(true);
 }
 
@@ -2439,6 +3421,396 @@ Observation<bool> WindowsOpenedEntry::publish_noreplace(const DirectoryCursor& d
 }
 
 } // namespace
+
+namespace detail {
+Observation<std::shared_ptr<const OpenedEntry>> open_native_main_content_source(
+    std::shared_ptr<const OpenedEntry> source){
+    using R=Observation<std::shared_ptr<const OpenedEntry>>;
+    const auto* native=dynamic_cast<const WindowsOpenedEntry*>(source.get());
+    if(!native)return R::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"main_content.native_source_required"});
+    return native->open_main_content_source();
+}
+Observation<std::shared_ptr<const OpenedEntry>> open_native_metadata_capture_source(
+    std::shared_ptr<const OpenedEntry> source,const MetadataReplayPolicy& policy){
+    using R=Observation<std::shared_ptr<const OpenedEntry>>;
+    const auto* native=dynamic_cast<const WindowsOpenedEntry*>(source.get());
+    if(!native||!policy.valid())return R::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_capture.native_source_required"});
+    return native->open_progressive_metadata_source(policy);
+}
+Observation<std::shared_ptr<const OpenedEntry>> open_native_directory_capture_source(
+    std::shared_ptr<const DirectoryCursor> source,const MetadataReplayPolicy& policy){
+    using R=Observation<std::shared_ptr<const OpenedEntry>>;
+    const auto* native=dynamic_cast<const WindowsDirectoryCursor*>(source.get());
+    if(!native||!policy.valid())return R::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_capture.native_directory_required"});
+    return native->open_progressive_directory_source(policy);
+}
+namespace {
+Observation<bool> stream_close_result(const std::optional<MetadataCaptureCleanupError>& error) {
+    if(!error)return Observation<bool>::available(true);
+    return Observation<bool>::unavailable(error->state,{error->domain,error->code,error->operation});
+}
+class ProgressiveStreamWriter final:public NativeMetadataStreamWriter {
+public:
+    ProgressiveStreamWriter(std::shared_ptr<WindowsMetadataChannel> channel,
+        std::shared_ptr<const NativeMetadataProof> proof,std::shared_ptr<const MetadataCaptureFailureLatch> latch)
+        :channel_(std::move(channel)),proof_(std::move(proof)),latch_(std::move(latch)){}
+    ~ProgressiveStreamWriter()override{if(!finished_)try{(void)finish_io();}catch(...){}}
+    Observation<MetadataReplayChannelState> inspect()const override{return channel_->inspect();}
+    Observation<std::size_t> write(std::uint64_t offset,std::span<const std::byte> bytes)override {
+        if(finished_||!proof_||proof_->io_finished())return Observation<std::size_t>::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_stream.finished_write"});
+        return channel_->write(offset,bytes);
+    }
+    Observation<bool> finish_io()override {
+        if(!finished_) {
+            finished_=true;
+            { MetadataCaptureCleanupScope scope(latch_.get());
+              try{(void)channel_->finish();}catch(...){
+                  error_=channel_->writer_finish_error();
+                  if(!error_)error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Adapter,
+                      static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_stream.writer_finish_exception"};
+              }
+              if(!error_)error_=channel_->writer_finish_error();
+              if(error_)record_metadata_capture_close(*error_);
+              proof_.reset();
+            }
+            latch_.reset();
+        }
+        return stream_close_result(error_);
+    }
+private:
+    std::shared_ptr<WindowsMetadataChannel> channel_;
+    std::shared_ptr<const NativeMetadataProof> proof_;
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch_;
+    std::optional<MetadataCaptureCleanupError> error_;
+    bool finished_=false;
+};
+class ProgressiveStreamReader final:public NativeMetadataStreamReader {
+public:
+    ProgressiveStreamReader(std::unique_ptr<WindowsMetadataChannel> channel,
+        std::shared_ptr<const NativeMetadataProof> proof,std::shared_ptr<const MetadataCaptureFailureLatch> latch)
+        :channel_(std::move(channel)),proof_(std::move(proof)),latch_(std::move(latch)){}
+    ~ProgressiveStreamReader()override{if(!finished_)try{(void)finish_io();}catch(...){}}
+    Observation<MetadataReplayChannelState> inspect()const override{return channel_->inspect();}
+    Observation<ContentRead> read_content(ContentReadLimits limits,std::uint64_t offset,std::stop_token stop)const override {
+        return channel_->read_content(limits,offset,stop);
+    }
+    Observation<bool> finish_io()override {
+        if(!finished_) {
+            finished_=true;
+            { MetadataCaptureCleanupScope scope(latch_.get());channel_->finish_capture_reads();
+              error_=channel_->capture_close_error();proof_.reset(); }
+            latch_.reset();
+        }
+        return stream_close_result(error_);
+    }
+private:
+    std::unique_ptr<WindowsMetadataChannel> channel_;
+    std::shared_ptr<const NativeMetadataProof> proof_;
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch_;
+    std::optional<MetadataCaptureCleanupError> error_;
+    bool finished_=false;
+};
+template<class T>Observation<std::unique_ptr<T>> stream_factory_error(const char* operation) {
+    return Observation<std::unique_ptr<T>>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),operation});
+}
+}
+Observation<bool> qualify_native_metadata_target(OpenedEntry& target,const NativeMetadataProof& proof) {
+    auto* native=dynamic_cast<WindowsOpenedEntry*>(&target);
+    if(!native)return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_stream.native_target_required"});
+    return native->qualify_progressive_target(proof);
+}
+Observation<std::unique_ptr<NativeMetadataStreamWriter>> open_native_metadata_stream_writer(OpenedEntry& target,
+    std::shared_ptr<const NativeMetadataProof> proof,const NativeFeatureIdentifier& identifier,
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch) {
+    using R=Observation<std::unique_ptr<NativeMetadataStreamWriter>>;
+    auto* native=dynamic_cast<WindowsOpenedEntry*>(&target);
+    if(!native||!proof||!latch)return stream_factory_error<NativeMetadataStreamWriter>("metadata_stream.native_writer_inputs");
+    MetadataCaptureCleanupScope scope(latch.get());
+    auto opened=native->open_progressive_writer(*proof,identifier);
+    if(!opened.value()){const auto&e=*opened.unavailable_detail();return R::unavailable(e.state,e.error);}
+    auto channel=std::move(opened).take_value();
+    try{return R::available(std::make_unique<ProgressiveStreamWriter>(channel,proof,latch));}
+    catch(...){try{(void)channel->finish();}catch(...){if(auto e=channel->writer_finish_error())record_metadata_capture_close(*e);}throw;}
+}
+Observation<std::unique_ptr<NativeMetadataStreamReader>> open_native_metadata_stream_reader(OpenedEntry& target,
+    std::shared_ptr<const NativeMetadataProof> proof,const NativeFeatureIdentifier& identifier,
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch) {
+    using R=Observation<std::unique_ptr<NativeMetadataStreamReader>>;
+    auto* native=dynamic_cast<WindowsOpenedEntry*>(&target);
+    if(!native||!proof||!latch)return stream_factory_error<NativeMetadataStreamReader>("metadata_stream.native_reader_inputs");
+    MetadataCaptureCleanupScope scope(latch.get());
+    auto opened=native->open_progressive_reader(*proof,identifier);
+    if(!opened.value()){const auto&e=*opened.unavailable_detail();return R::unavailable(e.state,e.error);}
+    auto channel=std::move(opened).take_value();
+    try{return R::available(std::make_unique<ProgressiveStreamReader>(std::move(channel),proof,latch));}
+    catch(...){if(channel)channel->finish_capture_reads();throw;}
+}
+void finish_native_metadata_capture(const OpenedEntry* source,const MetadataReplaySnapshot& snapshot)noexcept {
+    for(const auto& c:snapshot.channels){
+        auto* native=const_cast<WindowsMetadataChannel*>(dynamic_cast<const WindowsMetadataChannel*>(c.source.get()));
+        if(native)native->finish_capture_reads();
+        else record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_capture.native_channel_close_required"});
+    }
+    if(snapshot.security_coverage){
+        const auto* proof=dynamic_cast<const WindowsPersistentSecurityProof*>(snapshot.security_coverage.get());
+        if(proof)proof->finish_capture_reads();else record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_capture.native_security_close_required"});
+    }
+    if(snapshot.channel_evidence){
+        const auto* proof=dynamic_cast<const WindowsChannelManifestProof*>(snapshot.channel_evidence.get());
+        if(proof)proof->finish_capture_reads();else record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_capture.native_manifest_close_required"});
+    }
+    if(source){auto* native=const_cast<WindowsOpenedEntry*>(dynamic_cast<const WindowsOpenedEntry*>(source));
+        if(native)native->finish_capture_reads();else record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_capture.native_source_close_required"});}
+}
+Observation<bool> seal_native_metadata_capture(MetadataCaptureJob& job){
+    using R=Observation<bool>;
+    const auto refuse=[](const char* op){return R::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),op});};
+    if(!job.ready_to_seal())return refuse("metadata_capture.unfinished_producer");
+    auto& snapshot=job.sealing_snapshot();const auto* native=dynamic_cast<const WindowsOpenedEntry*>(job.sealing_source().get());
+    if(!native||snapshot.channel_coverage!=DataChannelCoverage::WindowsFileStreamInfo)return refuse("metadata_capture.native_seal_source");
+    const auto qualified=native->qualify_metadata_replay(snapshot.policy);if(!qualified.value()||!*qualified.value())return qualified;
+    for(const auto& channel:snapshot.channels){
+        const auto* reader=dynamic_cast<const WindowsMetadataChannel*>(channel.source.get());
+        if(!reader)return refuse("metadata_capture.native_reader_required");
+        reader->retain_capture_lease(job.sealing_lease());
+    }
+    auto query=native->open_metadata_replay_view(snapshot.policy);
+    if(!query.value()){const auto&e=*query.unavailable_detail();return R::unavailable(e.state,e.error);}
+    if(!*query.value()||!dynamic_cast<const WindowsOpenedEntry*>(query.value()->get()))return refuse("metadata_capture.native_manifest_view");
+    snapshot.channel_evidence=std::make_shared<WindowsChannelManifestProof>(std::move(query).take_value(),snapshot,job.sealing_lease());
+    if(snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1){
+        if(snapshot.security.size()!=1)return refuse("metadata_capture.native_full_descriptor");
+        const auto classes=persistent_sacl_classes(snapshot.security.front());
+        if(!classes.value()){const auto&e=*classes.unavailable_detail();return R::unavailable(e.state,e.error);}
+        auto view=native->open_metadata_replay_view(snapshot.policy);
+        if(!view.value()){const auto&e=*view.unavailable_detail();return R::unavailable(e.state,e.error);}
+        if(!*view.value()||!dynamic_cast<WindowsOpenedEntry*>(view.value()->get()))return refuse("metadata_capture.native_full_view");
+        auto owned=std::move(view).take_value();
+        std::unique_ptr<WindowsOpenedEntry> exact(static_cast<WindowsOpenedEntry*>(owned.release()));
+        snapshot.security_coverage=std::make_shared<WindowsPersistentSecurityProof>(std::move(exact),snapshot,job.sealing_lease());
+    }
+    // The only hashes being signed are the final job's private, twice-read
+    // accumulators. No bulk issuer or public-snapshot hash is accepted here.
+    return R::available(true);
+}
+} // namespace detail
+
+Observation<std::shared_ptr<const MetadataReplayChannelEvidence>> issue_native_metadata_replay_channels(
+    const OpenedEntry& source,const MetadataReplaySnapshot& snapshot,std::stop_token stop) {
+    using Result=Observation<std::shared_ptr<const MetadataReplayChannelEvidence>>;
+    if(!dynamic_cast<const WindowsOpenedEntry*>(&source)||!snapshot.policy.valid()||
+       snapshot.channel_coverage!=DataChannelCoverage::WindowsFileStreamInfo||
+       snapshot.channels.size()>snapshot.policy.limits.max_records)
+        return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_channels.native_issuer_bounds"});
+    auto view=source.open_metadata_replay_view(snapshot.policy);
+    if(!view.value()){const auto& e=*view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    if(!*view.value()||!dynamic_cast<const WindowsOpenedEntry*>(view.value()->get()))
+        return failure<std::shared_ptr<const MetadataReplayChannelEvidence>>(ERROR_INVALID_DATA,"metadata_channels.native_issuer_view");
+    auto proof=std::make_shared<WindowsChannelManifestProof>(std::move(view).take_value(),snapshot);
+    const auto checked=proof->recheck(snapshot);
+    if(!checked.value()){const auto& e=*checked.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    if(!*checked.value())return failure<std::shared_ptr<const MetadataReplayChannelEvidence>>(ERROR_INVALID_DATA,"metadata_channels.native_issuer_false");
+    // The public issuer never signs caller-supplied hashes. Hash only genuine
+    // adapter readers, with cancellation, after catalog/identity/limit checks.
+    for(const auto& channel:snapshot.channels) {
+        const auto digest=digest_metadata_replay_channel(*channel.source,channel.identifier,
+            *snapshot.basic.identity.value(),channel.logical_size,stop);
+        if(!digest.value()){const auto& e=*digest.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(*digest.value()!=channel.digest)return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.native_issuer_digest"});
+    }
+    if(stop.stop_requested())return Result::unavailable(ObservationState::Unknown,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InterruptedRead),"metadata_channels.native_issuer_cancelled"});
+    const auto final=proof->recheck(snapshot);
+    if(!final.value()){const auto& e=*final.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    return Result::available(std::move(proof));
+}
+Observation<bool> verify_native_metadata_replay_channels(const MetadataReplaySnapshot& snapshot) {
+    const auto* proof=dynamic_cast<const WindowsChannelManifestProof*>(snapshot.channel_evidence.get());
+    if(!proof)return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_channels.native_evidence_required"});
+    return proof->recheck(snapshot);
+}
+
+namespace {
+Observation<NativeBytes> private_creation_descriptor() {
+    using Result=Observation<NativeBytes>;HANDLE raw=nullptr;
+    if(!OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,TRUE,&raw)) {
+        if(GetLastError()!=ERROR_NO_TOKEN||!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw))
+            return failure<NativeBytes>(GetLastError(),"directory_creation.effective_token");
+    }
+    OwnedHandle token(raw);DWORD size=0;GetTokenInformation(token.get(),TokenUser,nullptr,0,&size);
+    if(!size||GetLastError()!=ERROR_INSUFFICIENT_BUFFER)return failure<NativeBytes>(GetLastError(),"directory_creation.token_size");
+    NativeBytes user(size);
+    if(!GetTokenInformation(token.get(),TokenUser,user.data(),size,&size))return failure<NativeBytes>(GetLastError(),"directory_creation.token_user");
+    LPWSTR text=nullptr;
+    if(!ConvertSidToStringSidW(reinterpret_cast<const TOKEN_USER*>(user.data())->User.Sid,&text))
+        return failure<NativeBytes>(GetLastError(),"directory_creation.sid");
+    const std::wstring sid(text);LocalFree(text);
+    const auto sddl=L"O:"+sid+L"D:P(A;;FA;;;"+sid+L")(A;;FA;;;SY)";
+    PSECURITY_DESCRIPTOR descriptor=nullptr;ULONG bytes=0;
+    if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(),SDDL_REVISION_1,&descriptor,&bytes))
+        return failure<NativeBytes>(GetLastError(),"directory_creation.private_descriptor");
+    const auto* first=static_cast<const std::byte*>(descriptor);NativeBytes result(first,first+bytes);LocalFree(descriptor);
+    return Result::available(std::move(result));
+}
+Observation<OwnedHandle> readonly_created_directory(HANDLE created,const ObjectIdentity& expected,
+    const AdapterScope& scope,DWORD rights) {
+    using Result=Observation<OwnedHandle>;
+    if(expected.scheme!=IdentityScheme::WindowsFileId128)return failure<OwnedHandle>(ERROR_NOT_SUPPORTED,"directory_creation.identity_scheme");
+    FILE_ID_DESCRIPTOR id{};id.dwSize=sizeof(id);id.Type=ExtendedFileIdType;
+    std::memcpy(id.ExtendedFileId.Identifier,expected.object.bytes.data(),16);
+    OwnedHandle opened(OpenFileById(created,&id,rights|FILE_READ_ATTRIBUTES|SYNCHRONIZE,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,
+        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+    if(!opened||opened.get()==INVALID_HANDLE_VALUE)return failure<OwnedHandle>(GetLastError(),"directory_creation.OpenFileById.readonly");
+    const auto current=handle_metadata(opened.get(),scope);
+    if(!current.value()){const auto& e=*current.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    if(!current.value()->identity.value()||compare_identity(*current.value()->identity.value(),expected)!=IdentityComparison::Same||
+       !current.value()->kind.value()||*current.value()->kind.value()!=ObjectKind::Directory)
+        return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"directory_creation.readonly_identity"});
+    return Result::available(std::move(opened));
+}
+Observation<bool> verify_private_creation_descriptor(WindowsOpenedEntry& writer,const NativeBytes& expected) {
+    using Result=Observation<bool>;
+    const auto actual=writer.read_security(SecurityPart::WindowsAccess);
+    if(!actual.value()){const auto& e=*actual.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    auto* a=const_cast<std::byte*>(expected.data());auto* b=const_cast<std::byte*>(actual.value()->bytes.data());
+    PSID ao=nullptr,bo=nullptr;BOOL ad=FALSE,bd=FALSE;PACL aa=nullptr,ba=nullptr;BOOL ap=FALSE,bp=FALSE;
+    SECURITY_DESCRIPTOR_CONTROL control=0;DWORD revision=0;
+    if(!GetSecurityDescriptorOwner(a,&ao,&ad)||!GetSecurityDescriptorOwner(b,&bo,&bd)||!ao||!bo||!EqualSid(ao,bo)||
+       !GetSecurityDescriptorDacl(a,&ap,&aa,&ad)||!GetSecurityDescriptorDacl(b,&bp,&ba,&bd)||!ap||!bp||!aa||!ba||
+       aa->AclSize!=ba->AclSize||std::memcmp(aa,ba,aa->AclSize)!=0||
+       !GetSecurityDescriptorControl(b,&control,&revision)||(control&SE_DACL_PROTECTED)==0)
+        return Result::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"directory_creation.private_descriptor_changed"});
+    return Result::available(true);
+}
+}
+Observation<bool> qualify_native_directory_creation(const DirectoryCursor& parent,const MetadataReplayPolicy& policy) {
+    using Result=Observation<bool>;
+    const auto unsupported=[](const char* op){return Result::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),op});};
+    if(!policy.valid())return failure<bool>(ERROR_INVALID_PARAMETER,"directory_creation.policy");
+    const auto* cursor=dynamic_cast<const WindowsDirectoryCursor*>(&parent);
+    if(!cursor)return unsupported("directory_creation.native_cursor_required");
+    const auto current=handle_metadata(cursor->handle_.get(),cursor->scope_);
+    if(!current.value()){const auto& e=*current.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    constexpr DWORD supported=FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM|
+        FILE_ATTRIBUTE_ARCHIVE|FILE_ATTRIBUTE_NORMAL|FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+    if(!current.value()->kind.value()||*current.value()->kind.value()!=ObjectKind::Directory||
+       !current.value()->identity.value()||current.value()->identity.value()->scheme!=IdentityScheme::WindowsFileId128||
+       !parent.identity().value()||compare_identity(*current.value()->identity.value(),*parent.identity().value())!=IdentityComparison::Same||
+       !current.value()->windows_attributes.value()||(*current.value()->windows_attributes.value()&~supported))
+        return unsupported("directory_creation.parent_provider_identity");
+    DWORD flags=0;WCHAR filesystem[32]{};
+    if(!GetVolumeInformationByHandleW(cursor->handle_.get(),nullptr,0,nullptr,nullptr,&flags,filesystem,32))
+        return failure<bool>(GetLastError(),"directory_creation.volume");
+    if((std::wstring_view(filesystem)!=L"NTFS"&&std::wstring_view(filesystem)!=L"ReFS")||!(flags&FILE_PERSISTENT_ACLS))
+        return unsupported("directory_creation.filesystem");
+    using QueryVolume=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,ULONG);
+    const auto address=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryVolumeInformationFile");
+    if(!address)return unsupported("directory_creation.device_query");
+    struct Device{ULONG type,characteristics;} device{};IO_STATUS_BLOCK io{};
+    const auto status=std::bit_cast<QueryVolume>(address)(cursor->handle_.get(),&io,&device,sizeof(device),4);
+    if(status!=0)return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
+        {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"directory_creation.device"});
+    if(io.Information!=sizeof(device)||(device.characteristics&0x10U))return unsupported("directory_creation.remote_provider");
+    if(policy.scope==RegularMetadataScope::CompleteMetadataV1) {
+        // New directories can inherit the parent's case-sensitive state.
+        // Refuse unknown/nonzero state before FILE_CREATE, not afterwards.
+        FILE_CASE_SENSITIVE_INFO case_info{};
+        if(!GetFileInformationByHandleEx(cursor->handle_.get(),FileCaseSensitiveInfo,&case_info,sizeof(case_info)))
+            return Result::unavailable(ObservationState::Unsupported,
+                {ErrorDomain::Win32,GetLastError(),"directory_creation.parent_case_query_unqualified"});
+        if(case_info.Flags!=0)return unsupported("directory_creation.parent_case_flags_unimplemented");
+        if(!policy.allow_privilege_metadata)return unsupported("directory_creation.full_security_optin_required");
+        const auto privilege=require_enabled_security_privilege();if(!privilege.value())return privilege;
+    }
+    // Acquire actual namespace rights, but never infer creation identity from
+    // this momentary check. The factory repeats qualification before FILE_CREATE.
+    auto access=cursor->open_namespace_write_handle();
+    if(!access.value()){const auto& e=*access.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    const HANDLE handle=std::move(access).take_value().release();
+    if(!CloseHandle(handle))return failure<bool>(GetLastError(),"directory_creation.qualify_parent_close");
+    return Result::available(true);
+}
+Observation<std::unique_ptr<NativeCreatedDirectory>> create_native_directory(
+    std::shared_ptr<const DirectoryCursor> parent,NativeName name,const MetadataReplayPolicy& policy) {
+    using Result=Observation<std::unique_ptr<NativeCreatedDirectory>>;
+    if(!parent)return failure<std::unique_ptr<NativeCreatedDirectory>>(ERROR_INVALID_PARAMETER,"directory_creation.parent");
+    const auto* units=name.windows_units();
+    if(!units||!name.is_valid()||units->find(u':')!=std::u16string::npos||units->size()>std::numeric_limits<USHORT>::max()/sizeof(WCHAR))
+        return failure<std::unique_ptr<NativeCreatedDirectory>>(ERROR_INVALID_PARAMETER,"directory_creation.name");
+    const auto qualified=qualify_native_directory_creation(*parent,policy);
+    if(!qualified.value()){const auto& e=*qualified.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    if(!*qualified.value())return failure<std::unique_ptr<NativeCreatedDirectory>>(ERROR_NOT_SUPPORTED,"directory_creation.qualification_false");
+    const auto* cursor=dynamic_cast<const WindowsDirectoryCursor*>(parent.get());
+    auto parent_access=cursor->open_namespace_write_handle();
+    if(!parent_access.value()){const auto& e=*parent_access.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    auto descriptor=private_creation_descriptor();
+    if(!descriptor.value()){const auto& e=*descriptor.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    std::wstring spelling(units->begin(),units->end());UNICODE_STRING native_name{};
+    native_name.Length=static_cast<USHORT>(spelling.size()*sizeof(WCHAR));native_name.MaximumLength=native_name.Length;native_name.Buffer=spelling.data();
+    OBJECT_ATTRIBUTES attributes{};attributes.Length=sizeof(attributes);attributes.RootDirectory=cursor->handle_.get();
+    attributes.ObjectName=&native_name;attributes.SecurityDescriptor=const_cast<std::byte*>(descriptor.value()->data());
+    IO_STATUS_BLOCK io{};HANDLE raw=nullptr;
+    const DWORD rights=FILE_GENERIC_READ|FILE_GENERIC_WRITE|READ_CONTROL|WRITE_DAC|WRITE_OWNER|DELETE|
+        (policy.scope==RegularMetadataScope::CompleteMetadataV1?ACCESS_SYSTEM_SECURITY:0);
+    const auto status=NtCreateFile(&raw,rights,&attributes,&io,nullptr,FILE_ATTRIBUTE_NORMAL,FILE_SHARE_READ|FILE_SHARE_WRITE,
+        FILE_CREATE,FILE_DIRECTORY_FILE|FILE_OPEN_REPARSE_POINT|FILE_SYNCHRONOUS_IO_NONALERT|FILE_WRITE_THROUGH,nullptr,0);
+    OwnedHandle created(raw);
+    if(status!=0)return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
+        {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"directory_creation.NtCreateFile"});
+    if(!created||created.get()==INVALID_HANDLE_VALUE||io.Information!=FILE_CREATED)
+        return failure<std::unique_ptr<NativeCreatedDirectory>>(ERROR_INVALID_DATA,"directory_creation.not_created");
+    const auto observed=handle_metadata(created.get(),cursor->scope_);
+    if(!observed.value()){const auto& e=*observed.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    if(!observed.value()->kind.value()||*observed.value()->kind.value()!=ObjectKind::Directory||!observed.value()->identity.value())
+        return failure<std::unique_ptr<NativeCreatedDirectory>>(ERROR_INVALID_DATA,"directory_creation.created_kind_identity");
+    auto cursor_view=readonly_created_directory(created.get(),*observed.value()->identity.value(),cursor->scope_,FILE_LIST_DIRECTORY);
+    if(!cursor_view.value()){const auto& e=*cursor_view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    auto verify_view=readonly_created_directory(created.get(),*observed.value()->identity.value(),cursor->scope_,FILE_READ_EA|READ_CONTROL|
+        (policy.scope==RegularMetadataScope::CompleteMetadataV1?ACCESS_SYSTEM_SECURITY:0));
+    if(!verify_view.value()){const auto& e=*verify_view.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    auto writer=std::make_unique<WindowsOpenedEntry>(std::move(created),cursor->scope_,false,false,true,nullptr,false,true);
+    const auto private_checked=verify_private_creation_descriptor(*writer,*descriptor.value());
+    if(!private_checked.value()){const auto& e=*private_checked.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    const auto metadata_qualified=writer->qualify_metadata_replay(policy);
+    if(!metadata_qualified.value()){const auto& e=*metadata_qualified.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    if(!*metadata_qualified.value())return failure<std::unique_ptr<NativeCreatedDirectory>>(ERROR_NOT_SUPPORTED,"directory_creation.metadata_qualification_false");
+    const auto directory_identity=identity(cursor_view.value()->get(),cursor->scope_);
+    if(!directory_identity.value()){const auto& e=*directory_identity.unavailable_detail();return Result::unavailable(e.state,e.error);}
+    auto result_cursor=std::make_shared<WindowsDirectoryCursor>(std::move(cursor_view).take_value(),directory_identity,cursor->scope_);
+    auto verifier=std::make_unique<WindowsOpenedEntry>(std::move(verify_view).take_value(),cursor->scope_);
+    // Consume the temporary namespace writer and report its close error too.
+    const HANDLE parent_writer=std::move(parent_access).take_value().release();
+    const DWORD flush_error=FlushFileBuffers(parent_writer)?ERROR_SUCCESS:GetLastError();
+    const DWORD close_error=CloseHandle(parent_writer)?ERROR_SUCCESS:GetLastError();
+    if(flush_error)return failure<std::unique_ptr<NativeCreatedDirectory>>(flush_error,"directory_creation.parent_flush_after_create");
+    if(close_error)return failure<std::unique_ptr<NativeCreatedDirectory>>(close_error,"directory_creation.parent_close_after_create");
+    return Result::available(std::unique_ptr<NativeCreatedDirectory>(new NativeCreatedDirectory(std::move(parent),std::move(name),
+        std::move(result_cursor),std::move(writer),std::move(verifier),*observed.value(),policy)));
+}
+Observation<bool> NativeCreatedDirectory::finish_io() {
+    if(finish_result_)return *finish_result_;
+    const auto* writer=dynamic_cast<const WindowsOpenedEntry*>(writer_.get());
+    auto* verifier=dynamic_cast<WindowsOpenedEntry*>(verifier_.get());
+    if(!writer||!verifier)return failure<bool>(ERROR_INVALID_HANDLE,"directory_creation.native_writer_required");
+    // Preserve actual caller SID evidence before fully closing the writer.
+    verifier->caller_security_=writer->caller_security_;
+    finish_result_=writer_->finish_content_writes();return *finish_result_;
+}
+
 
 Observation<BasicMetadata> NativeFileSystem::inspect_basic(const std::filesystem::path& path) const {
     const auto address = NativeAbsolutePath::from_host(path);

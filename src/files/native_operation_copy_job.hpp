@@ -62,6 +62,11 @@ struct NativeOperationCopyRequest final {
     // creation/publication/journal authority remains here. Never a UI callback.
     std::function<Observation<StreamCopyJob::Pointer>(OpenedEntry&,OpenedEntry&,StreamCopyLimits)>
         prepare_stream;
+    // Optional native metadata-owner drain, attempted on every terminal path
+    // after the base writer and before journal close. It must consume all
+    // independent stream readers/source proofs and cache native first errors.
+    // A callback failure prevents public success even after publication.
+    std::function<Observation<bool>()> finish_metadata;
 };
 
 // Worker-only native binding of OperationCopyJob and OperationCommitJob. Move

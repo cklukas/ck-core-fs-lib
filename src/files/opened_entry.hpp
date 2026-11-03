@@ -25,6 +25,8 @@ class DirectoryCursor;
 class NativeName;
 struct MetadataReplayPolicy;
 struct MetadataReplaySnapshot;
+class MetadataSecurityCoverageEvidence;
+class MetadataReplayChannelSource;
 
 // Requested OS access only; never authority for mutation, loss or hydration.
 // Layout is an explicit regular-file query opt-in and can require data-read
@@ -162,6 +164,10 @@ public:
     // query handle, avoiding shared mutable access state. Available(nullptr)
     // explicitly uses the existing object (POSIX); denial never weakens capture.
     virtual Observation<std::unique_ptr<OpenedEntry>> open_metadata_replay_view(const MetadataReplayPolicy&) const;
+    // Worker-only independent metadata writer for this held directory. No
+    // basename reopen, data writes, or publication authority is conferred.
+    // Apply after descendants; finish_content_writes closes only this view.
+    virtual Observation<std::unique_ptr<OpenedEntry>> open_directory_metadata_target(const MetadataReplayPolicy&) const;
     virtual Observation<bool> apply_replay_ownership(const BasicMetadata&, const MetadataReplayPolicy&);
     virtual Observation<bool> apply_replay_attribute(const AttributeValue&, const MetadataReplayPolicy&);
     virtual Observation<bool> remove_replay_attribute(const NativeFeatureIdentifier&, const MetadataReplayPolicy&);
@@ -178,6 +184,13 @@ public:
     // prove that the original parent/name still refers to this held inode.
     virtual Observation<bool> rename_noreplace(const DirectoryCursor& source_parent,
         const DirectoryCursor& destination, const NativeName& name) const;
+    virtual Observation<std::shared_ptr<const MetadataSecurityCoverageEvidence>> issue_metadata_security_coverage(
+        const MetadataReplaySnapshot&) const;
+    virtual Observation<bool> preflight_metadata_security_coverage(const MetadataReplaySnapshot&);
+    virtual Observation<bool> verify_metadata_security_coverage(const MetadataReplaySnapshot&) const;
+    virtual Observation<std::shared_ptr<const MetadataReplayChannelSource>> open_metadata_replay_channel_read(
+        const NativeFeatureIdentifier&) const;
+    virtual Observation<bool> apply_replay_channels(const MetadataReplaySnapshot&,std::stop_token = {});
 protected:
     OpenedEntry() = default;
 };

@@ -83,6 +83,9 @@ bool HeldChild::continues(const HeldChild& previous) const noexcept {
 Observation<bool> HeldChild::qualify_ordinary_regular_metadata() const {
     return child_->qualify_ordinary_regular_metadata();
 }
+Observation<std::unique_ptr<OpenedEntry>> HeldChild::open_directory_metadata_target(const MetadataReplayPolicy& policy) const {
+    return child_->open_directory_metadata_target(policy);
+}
 Observation<MetadataReplaySnapshot> HeldChild::capture_metadata(MetadataReplayPolicy policy, std::stop_token stop) const {
     return capture_metadata_replay(*child_, policy, stop);
 }

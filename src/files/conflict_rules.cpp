@@ -67,7 +67,7 @@ bool valid_rule(const ConflictRule& rule) {
 
 bool valid_facts(const ConflictFacts& facts) noexcept {
     return valid_enum(facts.kind, K::CapacityFailure) &&
-        valid_enum(facts.relation, ComparisonRelation::Protected) &&
+        valid_enum(facts.relation, ComparisonRelation::MetadataDifferent) &&
         valid_enum(facts.direction, ConflictDirection::RightToLeft) &&
         valid_enum(facts.time_order, ConflictTimeOrder::Ambiguous) && valid_path(facts.relative_path) &&
         facts.equal_time == (facts.time_order == ConflictTimeOrder::Equal) &&

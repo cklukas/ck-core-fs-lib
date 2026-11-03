@@ -3,6 +3,7 @@
 #include "../sync_session.hpp"
 #include "../sha256.hpp"
 #include "posix_private_storage.hpp"
+#include "prepared_journal_root_bridge.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -26,10 +27,17 @@ namespace ck::files {
 namespace {
 struct Fd {
     int fd=-1;
-    explicit Fd(int v=-1):fd(v) {}
-    ~Fd() { if(fd>=0) ::close(fd); }
-    Fd(Fd&& v) noexcept:fd(v.fd) { v.fd=-1; }
-    Fd& operator=(Fd&& v) noexcept { if(this!=&v) { if(fd>=0) ::close(fd); fd=v.fd; v.fd=-1; } return *this; }
+    PreparedJournalRoot::Pointer owner;
+    explicit Fd(int v=-1,PreparedJournalRoot::Pointer keep={}):fd(v),owner(std::move(keep)) {}
+    int close_native() noexcept {
+        const int current=std::exchange(fd,-1);int code=0;
+        if(current>=0 && ::close(current))code=errno;
+        if(code&&owner)detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Failed,ErrorDomain::Posix,code,"sync_session.directory_close");
+        owner.reset();return code;
+    }
+    ~Fd() { (void)close_native(); }
+    Fd(Fd&& v) noexcept:fd(std::exchange(v.fd,-1)),owner(std::move(v.owner)) {}
+    Fd& operator=(Fd&& v) noexcept { if(this!=&v) { (void)close_native();fd=std::exchange(v.fd,-1);owner=std::move(v.owner); } return *this; }
     Fd(const Fd&)=delete; Fd& operator=(const Fd&)=delete;
 };
 template<class T> Observation<T> failure(int e,const char* op) {
@@ -143,6 +151,40 @@ Observation<bool> validate(const Chain& c) {
     }
     return Observation<bool>::available(true);
 }
+// Ascend from the provider-owned duplicate; no navigation address participates.
+Observation<Chain> held_storage_chain(PreparedJournalRoot::Pointer owner) {
+    auto duplicate=detail::duplicate_prepared_journal_directory(*owner);
+    if(!duplicate.value())return propagate<Chain>(duplicate);
+    Fd current(*duplicate.value(),owner);Chain out;
+    for(;;) {
+        if(out.size()>=256)return reject<Chain>("sync_session.storage_ancestor_limit",ObservationState::Unsupported);
+        struct stat st{};if(fstat(current.fd,&st))return failure<Chain>(errno,"sync_session.storage_stat");
+        auto id=identity(current.fd);if(!id.value())return propagate<Chain>(id);
+        if(std::any_of(out.begin(),out.end(),[&](const auto& node){return node.id==*id.value();}))
+            return reject<Chain>("sync_session.storage_ancestor_cycle",ObservationState::Unsupported);
+        Fd parent(openat(current.fd,"..",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC),owner);
+        if(parent.fd<0)return failure<Chain>(errno,"sync_session.storage_parent");
+        struct stat ps{};if(fstat(parent.fd,&ps))return failure<Chain>(errno,"sync_session.storage_parent_stat");
+        out.push_back({std::move(current),{},*id.value(),st.st_dev,st.st_ino});
+        if(st.st_dev==ps.st_dev&&st.st_ino==ps.st_ino)break;
+        current=std::move(parent);
+    }
+    std::reverse(out.begin(),out.end());
+    auto valid=owner->revalidate();if(!valid.value())return propagate<Chain>(valid);
+    return Observation<Chain>::available(std::move(out));
+}
+Observation<bool> validate_storage(const Chain& chain,PreparedJournalRoot& owner) {
+    auto checked=owner.revalidate();if(!checked.value())return checked;
+    for(std::size_t i=0;i<chain.size();++i) {
+        auto id=identity(chain[i].fd.fd);if(!id.value())return propagate<bool>(id);
+        if(*id.value()!=chain[i].id)return reject<bool>("sync_session.storage_identity_changed");
+        struct stat parent{};if(fstatat(chain[i].fd.fd,"..",&parent,AT_SYMLINK_NOFOLLOW))
+            return failure<bool>(errno,"sync_session.storage_parent_check");
+        const auto& expected=chain[i?i-1:0];
+        if(parent.st_dev!=expected.dev||parent.st_ino!=expected.ino)return reject<bool>("sync_session.storage_ancestry_changed");
+    }
+    return owner.revalidate();
+}
 bool contains(const Chain& c,const SyncDigest& id) {
     return std::any_of(c.begin(),c.end(),[&](const auto& n){return n.id==id;});
 }
@@ -187,20 +229,69 @@ Observation<bool> qualify_mounts(const std::string& text,const Chain& c) {
 #endif
 class PosixBackend final:public SyncSessionBackend {
 public:
+    // Destroy native duplicates/locks before releasing the lifecycle owner.
+    PreparedJournalRoot::Pointer owner;
     Chain store,left,right;
+    PreparedJournalRoot::Pointer storage_root() const noexcept override { return owner; }
+    // Set only by this provider's legacy address factory. An externally
+    // adopted shared root is NEVER finalized by a session consumer.
+    bool owns_root_lifecycle=false,root_finished=false;
+    bool closed=false;
+    int close_error=0;
+    void close_native() noexcept {
+        if(closed)return;closed=true;
+        for(auto* chain:{&store,&left,&right})for(auto& node:*chain) {
+            if(node.fd.fd<0)continue;
+            const int error=node.fd.close_native();if(error&&!close_error)close_error=error;
+            try {if(faults.before&&!faults.before(SyncSessionIo::NativeHandleClose)&&!close_error)close_error=EIO;}
+            catch(...) {if(!close_error)close_error=EIO;}
+        }
+        if(close_error&&owner)detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Failed,ErrorDomain::Posix,close_error,"sync_session.directory_close");
+    }
+    ~PosixBackend() override {
+        close_native();
+        if(owns_root_lifecycle&&owner&&!root_finished)try{(void)finish_owned_root();}catch(...) {
+            detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"sync_session.root_finish_exception");
+        }
+    }
+    Observation<bool> finish_owned_root() {
+        if(!owns_root_lifecycle||root_finished)return Observation<bool>::available(true);
+        auto result=owner->finish_io();
+        if(result.value()) {
+            if(*result.value())root_finished=true;
+            else {
+                detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Unknown,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"sync_session.root_finish_false");
+                return Observation<bool>::unavailable(ObservationState::Unknown,{ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"sync_session.root_finish_false"});
+            }
+        }
+        return result;
+    }
+    Observation<bool> finish_io() override {
+        close_native();
+        auto root=finish_owned_root();if(!root.value())return root;
+        detail::PreparedJournalConsumerFailure first;
+        if(owner&&detail::read_prepared_journal_consumer_failure(*owner,first))
+            return Observation<bool>::unavailable(first.state,{first.domain,first.code,first.operation.data()});
+        return close_error?failure<bool>(close_error,"sync_session.directory_close"):Observation<bool>::available(true);
+    }
     SyncSessionFaults faults;
 #ifndef __APPLE__
     std::string mounts;
 #endif
     const SyncDigest& left_identity() const noexcept override { return left.back().id; }
     const SyncDigest& right_identity() const noexcept override { return right.back().id; }
-    std::intptr_t root_handle(bool r) const noexcept override { return (r?right:left).back().fd.fd; }
+    std::intptr_t root_handle(bool r) const noexcept override { return closed?-1:(r?right:left).back().fd.fd; }
     Observation<bool> revalidate() override {
+        if(closed)return reject<bool>("sync_session.finished");
 #ifndef __APPLE__
         auto m=mount_table(); if(!m.value()) return propagate<bool>(m);
         if(*m.value()!=mounts) return reject<bool>("sync_session.mount_topology_changed");
 #endif
-        for(const auto* c:{&store,&left,&right}) { auto r=validate(*c); if(!r.value()) return r; }
+        auto held=validate_storage(store,*owner);if(!held.value())return held;
+        for(const auto* c:{&left,&right}) { auto r=validate(*c); if(!r.value()) return r; }
         return detail::qualify_posix_private_storage(store.back().fd.fd,detail::PosixPrivateStorageKind::Directory);
     }
     Observation<bool> before(SyncSessionIo io) {
@@ -284,24 +375,37 @@ public:
     }
     Observation<bool> flush_directory() override {
         auto r=before(SyncSessionIo::ParentFlush); if(!r.value()) return r;
-        if(fsync(store.back().fd.fd)) return failure<bool>(errno,"sync_session.parent_flush");
-#ifdef __APPLE__
-        if(fcntl(store.back().fd.fd,F_FULLFSYNC)) return failure<bool>(errno,"sync_session.parent_fullflush");
-#endif
-        return Observation<bool>::available(true);
+        return owner->sync();
     }
 };
 }
 Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backend(
     const NativeAbsolutePath& coordinator,const NativeAbsolutePath& left,const NativeAbsolutePath& right,SyncSessionFaults faults) {
     using P=std::unique_ptr<SyncSessionBackend>;
+    auto initial=chain(coordinator);if(!initial.value())return propagate<P>(initial);
+    auto privacy=detail::qualify_posix_private_storage(initial.value()->back().fd.fd,detail::PosixPrivateStorageKind::Directory);
+    if(!privacy.value())return propagate<P>(privacy);
+    auto root=acquire_native_sync_storage_root(coordinator);if(!root.value())return propagate<P>(root);
+    auto checked=validate(*initial.value());if(!checked.value())return propagate<P>(checked);
+    auto acquired=held_storage_chain(*root.value());if(!acquired.value())return propagate<P>(acquired);
+    if(acquired.value()->back().id!=initial.value()->back().id)return reject<P>("sync_session.initial_storage_changed");
+    auto acquired_backend=open_native_sync_session_backend(std::move(root).take_value(),left,right,std::move(faults));
+    if(acquired_backend.value())static_cast<PosixBackend*>(acquired_backend.value()->get())->owns_root_lifecycle=true;
+    return acquired_backend;
+}
+Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backend(
+    PreparedJournalRoot::Pointer owner,const NativeAbsolutePath& left,const NativeAbsolutePath& right,SyncSessionFaults faults) {
+    using P=std::unique_ptr<SyncSessionBackend>;
     if(!faults.max_write_bytes || faults.max_write_bytes>1024*1024)
         return reject<P>("sync_session.write_limit",ObservationState::Failed);
-    auto s=chain(coordinator); if(!s.value()) return propagate<P>(s);
+    if(!owner)return reject<P>("sync_session.null_storage_owner",ObservationState::Failed);
+    auto s=held_storage_chain(owner); if(!s.value()) return propagate<P>(s);
     auto l=chain(left); if(!l.value()) return propagate<P>(l);
     auto r=chain(right); if(!r.value()) return propagate<P>(r);
-    auto b=std::make_unique<PosixBackend>(); b->store=std::move(s).take_value();
+    auto b=std::make_unique<PosixBackend>(); b->owner=std::move(owner); b->store=std::move(s).take_value();
     b->left=std::move(l).take_value(); b->right=std::move(r).take_value(); b->faults=std::move(faults);
+    if(b->store.front().id!=b->left.front().id||b->store.front().id!=b->right.front().id)
+        return reject<P>("sync_session.storage_namespace_unqualified",ObservationState::Unsupported);
     if(contains(b->left,b->right_identity()) || contains(b->right,b->left_identity()) ||
         contains(b->store,b->left_identity()) || contains(b->store,b->right_identity()))
         return reject<P>("sync_session.overlapping_pair_or_store",ObservationState::Failed);

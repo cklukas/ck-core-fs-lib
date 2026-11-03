@@ -1,9 +1,9 @@
 # C API
 
 The entry header is [`include/ck_file_engine.h`](../include/ck_file_engine.h).
-`ck_fs_tree.h`, `ck_fs_actions.h`, `ck_fs_session.h` and
-`ck_fs_journal_root.h` expose native reviewed execution, action jobs, durable
-sessions and owned journal roots. All headers are usable from C and C++ and contain no C++ types, exceptions, STL
+`ck_fs_tree.h`, `ck_fs_actions.h`, `ck_fs_session.h`, `ck_fs_journal_root.h`,
+and `ck_fs_retry.h` expose native reviewed execution, action jobs, durable
+sessions, owned journal roots and verified copy retry. All headers are usable from C and C++ and contain no C++ types, exceptions, STL
 containers, or frontend types.
 
 ## Ownership
@@ -29,11 +29,11 @@ runtime allocator.
 
 ## Jobs
 
-The 0.4 interface exposes ABI minor 4. Existing handles and snapshot layouts
-are unchanged. The shared runtime identity includes 0.4 (`libck-core-fs-lib.0.4`
-on Unix and `ck-core-fs-lib-0.4.dll` on Windows). An older runtime cannot
-satisfy the new exports. Use the installed CMake package and verify the actual
-runtime identity before use.
+The unreleased 0.5 development interface exposes ABI minor 5. Existing handles
+and snapshot layouts are unchanged. The shared-library identity includes 0.5
+(`libck-core-fs-lib.0.5` on Unix and `ck-core-fs-lib-0.5.dll` on Windows), so
+an older binary cannot satisfy dependencies on the new exports. Use the
+installed CMake package and verify the actual runtime version before use.
 
 Start functions return quickly. `CKFE_API_OK` means a non-null job handle was
 created; a rejected operation returns `CKFE_API_OPERATION_UNAVAILABLE` and a
@@ -125,7 +125,12 @@ destination.
 `ck_fs_session.h` provides worker-only durable baseline sessions and verified
 commit receipts. Open retains both root locks, including overlap protection;
 commit is generation-checked and crash recovery preserves uncertain evidence.
-These baseline primitives do not substitute for a composed two-way executor.
+The `ckfss_two_way_*` companion composes native inventory, frozen conflict
+rules, mixed-direction execution, convergence verification and baseline commit.
+Its current native scope is ordinary regular files directly below each root;
+nested trees and structural directory metadata remain unavailable. Bulk rules
+use backend facts and an opaque assessed receipt. A baseline receipt alone
+never authorizes data execution.
 
 ## Owned journal roots
 
@@ -142,7 +147,7 @@ OutOfMemory and Exception do not establish that guarantee. A failure after
 worker creation requests stop and joins before returning, but may already have
 created recovery evidence. A null output alone never authorizes cleanup.
 
-Pass the root to the additive tree entry point rather than
+Pass the root to the additive tree/action/session entry point rather than
 reopening its displayed address. The capability owns the native directory;
 pathname fields are navigation hints only where that API permits them. Retain
 and poll are memory-only. A consumer finishes its own journal duplicates and
@@ -170,18 +175,42 @@ native cursor. A stacked or network provider can translate identities and hide
 its backing ancestry. Linux scope certification is limited to direct ext4,
 XFS and Btrfs, and macOS to local APFS. Unsupported providers and per-entry
 mount boundaries are refused before review. A bind-mounted private journal
-file is therefore not treated as an ordinary file outside its Root. Windows
-certifies the actual kernel NTFS/ReFS driver in the held directory device
-path for both the journal Root and scan cursor; reported filesystem names
-alone are insufficient. Remote/unknown providers are refused.
+file is therefore not treated as an ordinary file outside its Root.
+
+Directory ancestry alone cannot exclude a regular file with multiple names.
+Such a file additionally requires a fresh bounded native identity inventory of
+the private Root, including nested directories. The inventory reads names and
+identities, not file contents. Native source and namespace bookends must remain
+valid; incomplete, inaccessible, changed, mounted or reparse inventories cannot
+produce an accepted plan. Ordinary hardlinks outside private state remain valid
+input. No timestamp-keyed membership cache survives the assessment.
 
 This isolation applies to the passed Root capability. It is not a global
 active-root registry. Cross-process protection for cooperating rename/Trash
 clients requires the separate native namespace-lease execution gate; external
 writers still require native revalidation and recovery handling.
 
-Action-with-Root, session and retry entry points are reserved for the
-separately qualified 0.5 increment. Existing 0.3 Actions are unchanged in 0.4.
+## Verified retry and prefix resume
+
+`ck_fs_retry.h` starts a new reviewed operation from held source/destination
+owners, bounded original journal evidence and an explicitly selected read-only
+candidate. No filename or deletion authority is imported from recovery text.
+The attempt uses a fresh operation ID, fresh journal and new private staging
+object. Its one-use review binds the whole source SHA-256, strict metadata,
+candidate prefix and original journal bytes.
+
+The worker verifies the prefix against the frozen source, copies it into new
+staging, then reads the remaining source. Both the assembled digest and an
+independent staging reread must match the frozen whole-source digest before
+metadata and no-replace publication. A candidate EOF cannot end the full copy.
+The original candidate, source and journal are preserved.
+
+`ckfer_start_with_journal_roots_v1` retains two READY capabilities. Initialize
+both pathname fields to empty and supply the required exact journal names.
+Drain retry jobs before finishing their shared roots. Snapshots retain native
+error scalars and journal finalization errors; release never joins. These
+contracts do not turn an unsupported publisher or metadata provider into a
+successful resume.
 
 ## Comparison and policy headers
 
@@ -199,9 +228,45 @@ native inventory and receipt path; it does not promote caller-fact previews.
 ## Native encoding
 
 On POSIX, `_utf8` path/name inputs are byte-preserving component strings: the
-library does not validate or re-encode them, so non-UTF-8 native filenames are
-not rejected. On Windows, `_utf8` inputs are decoded as UTF-8 and invalid
+library does not validate or re-encode them. The native filesystem may reject a
+byte sequence, as APFS does for invalid UTF-8; that native error is preserved.
+On Windows, `_utf8` inputs are decoded as UTF-8 and invalid
 sequences are reported as Unsupported/UnrepresentableName. Windows callers that need exact
 UTF-16 names can use the UTF-16 entry points. The native adapter performs the
 final filesystem operation through its wide/native boundary; the C API's UTF-8
 conversion is not a permission to use narrow Win32 I/O.
+
+## Unreleased 0.5 cached Tree diagnostics
+
+`ck_fs_diagnostics.h` requires ABI minor 5 or later. Initialize a
+`ckfet_failure_details_v1` and call `ckfet_get_failure_details_v1` to copy one
+cached publication: failure state/domain/code, bounded operation tag, sequence,
+plan generation and current row. Correlate separate snapshot/detail reads only
+when their sequence numbers match. After worker drain, cached details remain
+readable without retaining the native Root or reopening any object.
+
+The getter performs no allocation, filesystem I/O or callback. Invalid version,
+size, reserved fields or null arguments leave the output unchanged. A tag holds
+at most 95 bytes plus a NUL; `operation_bytes` and `operation_truncated` distinguish
+a bounded prefix from a complete tag. Failure state is meaningful even when its
+native domain/code is absent. Tags are diagnostics, never recovery or mutation
+authority. This extension is separate from the frozen 0.4 Root/Tree headers.
+
+## Unreleased 0.5 native synchronization semantics
+
+Verified receipts, the two-way coordinator and named Keep Both resolution share
+semantic policy schema V2. For qualified Windows DATA streams, it binds exact
+native stream names, logical lengths and SHA-256 digests as well as preserved
+attributes and security. Equal unnamed bytes cannot establish convergence when
+named streams differ. Content budgets include all named DATA before capture
+hashes those streams. Source membership is rechecked after the final digest;
+inventory is revalidated before baseline commit.
+
+A previous semantic policy remains a policy mismatch requiring review. Opening
+a new API does not discard or silently reset its durable history. Named Keep
+Both reviews bind both proposed exact names on both roots, protect both original
+objects and keep their original conflict pending. Both reviewed versions must
+be independently published and verified on both sides before the new version
+paths enter the baseline. The current named-resolution provider admits regular
+main-data files; its named-stream accounting and directory execution remain
+separate qualification gates.

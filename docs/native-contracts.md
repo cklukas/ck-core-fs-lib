@@ -1,6 +1,6 @@
 # Native execution contracts
 
-The 0.4 API separates caller-fact previews from native execution. A
+The native API separates caller-fact previews from native execution. A
 `ckfsp_plan` remains a preview only. It cannot be converted into mutation
 authority. Native workers retain roots, enumerate exact components, hash
 content, freeze their observations, and obtain their own reviewed receipts.
@@ -111,12 +111,28 @@ metadata convergence, links, and other unsupported kinds require their own
 native contracts. Do not infer complete two-way tree execution from the durable
 store or regular-path receipt APIs.
 
+The unreleased 0.5 `ckfss_two_way_*` companion owns one mixed-direction executor rather
+than composing two opposing copy jobs. It freezes both inventories, metadata
+policy, baseline generation and conflict decisions into native review receipts.
+The first scope covers ordinary regular files directly below each root. It
+performs actual qualified copies and retained replacements/deletions, then
+fresh convergence verification before baseline commit. Unsupported structural
+changes remain explicit blocked rows.
+
+An operation ledger records the execution and convergence intent. Required
+journal flushes and fallible closes precede baseline compare-and-swap; sealing
+and restart recovery follow it. Partial, skipped, cancelled or uncertain data
+execution cannot silently advance the baseline. Retained artifacts remain
+visible protected evidence, identified by exact native components and fresh
+observations. A data filename prefix never hides user files, and recovered
+identities never become live cleanup authority.
+
 ## Owned journal-root lifecycle
 
 The 0.4 root factory adopts or provisions a private native directory, retains
 its native ancestry and performs required durability barriers on its worker.
 Only a Ready capability may be shared with operations. The root's displayed
-address is a navigation hint; tree operation journals and their consumers
+address is a navigation hint; operation journals and baseline/ledger consumers
 use the same held native owner. A per-journal duplicate is closed independently.
 
 Finishing a root stops new consumer acquisition and waits for existing shared
@@ -125,6 +141,15 @@ final root outcome for delayed flush/close errors before exit. Cached terminal
 tree pages can outlive the tree worker without retaining native root authority.
 Provisioning cancellation preserves created evidence rather than attempting
 name-based cleanup. See the [C lifecycle contract](c-api.md#owned-journal-roots).
+
+Scan guards certify genuine native providers and held ancestry in both
+directions. A multiply linked regular file also requires a fresh bounded native
+private-state identity walk. An ordinary external hardlink remains usable; a
+name selecting private state cannot enter the mutation plan. Incomplete walks,
+unknown identities, mount/reparse boundaries and changed namespace bookends
+are refusals. The proof is neither a cached inode set nor a namespace lease.
+Its native duplicates are consumed once; close errors reach the Root's fixed
+failure latch before error-message allocation.
 
 ## Action jobs and qualification
 
@@ -183,6 +208,8 @@ Complete metadata capture, application and verification currently refuse
 unproved logical-security coverage. A successful ordinary copy is not Complete
 preservation. Complete provider qualification requires every requested logical
 class, including labels/capabilities, to be known and preserved. Windows
-alternate streams, complete security coverage, directory replay, native
-two-way composition and verified prefix resume remain active implementation
-work. None is qualified merely by its interface or a model test.
+alternate streams, complete security coverage and directory replay remain
+active implementation work. Native two-way composition and verified prefix
+resume have development interfaces and focused native evidence; remaining
+integration qualification is separate. None is qualified merely by its
+interface or a model test.

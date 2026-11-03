@@ -2,6 +2,7 @@
 #include "ck_fs_actions.h"
 #include "native_handles.hpp"
 #include "action_jobs.hpp"
+#include "journal_root_handles.hpp"
 #include <atomic>
 #include <cstring>
 #include <new>
@@ -49,7 +50,20 @@ NativeAbsolutePath address(const ckfea_native_text& t) {
         NativeAbsolutePath::from_windows(units(t));
     require(n.value()!=nullptr); return std::move(n).take_value();
 }
-ActionRequest convert(const ckfea_request& in) {
+std::optional<NativeAbsolutePath> journal_address(const ckfea_native_text& text,const PreparedJournalRoot::Pointer& root) {
+    if(empty(text)&&root)return std::nullopt;
+    return address(text);
+}
+void bind_root(ActionRequest& out,PreparedJournalRoot::Pointer root) {
+    if(!root)return;
+    if(out.journal_directory)require(out.journal_directory->encoding()==root->encoding());
+    if(out.journal_name)require(out.journal_name->encoding()==root->encoding());
+    out.prepared_journal_root=root;
+    out.open_journal=[root=std::move(root)](const NativeAbsolutePath&,const NativeName& name,bool create){
+        return open_prepared_operation_journal_file(*root,name,create);
+    };
+}
+ActionRequest convert(const ckfea_request& in,PreparedJournalRoot::Pointer root={}) {
     require(header(&in) && in.operation>=CKFEA_RENAME && in.operation<=CKFEA_VERIFY_RECOVERY &&
         !(in.capabilities&~uint32_t(CKFEA_ALLOW_NATIVE_TRASH|CKFEA_ALLOW_NATIVE_RESTORE)) && in.retry_limit<=2);
     for (auto r:in.reserved) require(!r);
@@ -84,8 +98,8 @@ ActionRequest convert(const ckfea_request& in) {
         if(in.operation==CKFEA_RENAME) require(!in.capabilities);
         else require(!in.retry_limit && !(in.capabilities&CKFEA_ALLOW_NATIVE_RESTORE));
         if (!empty(in.journal_directory) || !empty(in.journal_name)) {
-            out.journal_directory=address(in.journal_directory); out.journal_name=name(in.journal_name);
-            require(out.journal_directory->encoding()==out.journal_name->encoding());
+            out.journal_directory=journal_address(in.journal_directory,root); out.journal_name=name(in.journal_name);
+            require(!out.journal_directory||out.journal_directory->encoding()==out.journal_name->encoding());
         }
     } else {
         require(!in.retry_limit && empty(in.journal_directory) && empty(in.journal_name));
@@ -103,16 +117,16 @@ ActionRequest convert(const ckfea_request& in) {
         } else require(!a.flags && empty(a.destination_name));
         out.items.push_back(std::move(item));
     }
-    return out;
+    bind_root(out,std::move(root));return out;
 }
-ActionRequest convert_restore(const ckfea_restore_request& in) {
+ActionRequest convert_restore(const ckfea_restore_request& in,PreparedJournalRoot::Pointer root={}) {
     require(header(&in) && !(in.capabilities&~uint32_t(CKFEA_ALLOW_NATIVE_RESTORE)) && in.items && in.item_count && in.item_count<=CKFEA_MAX_ITEMS);
     for(auto r:in.reserved) require(!r);
     text_header(in.journal_directory);text_header(in.journal_name);
     ActionRequest out;out.operation=CKFEA_RESTORE;out.capabilities=in.capabilities;
     if(!empty(in.journal_directory)||!empty(in.journal_name)) {
-        out.journal_directory=address(in.journal_directory);out.journal_name=name(in.journal_name);
-        require(out.journal_directory->encoding()==out.journal_name->encoding());
+        out.journal_directory=journal_address(in.journal_directory,root);out.journal_name=name(in.journal_name);
+        require(!out.journal_directory||out.journal_directory->encoding()==out.journal_name->encoding());
     }
     out.restore_items.reserve(in.item_count);
     for(uint32_t i=0;i<in.item_count;++i) {
@@ -120,7 +134,7 @@ ActionRequest convert_restore(const ckfea_restore_request& in) {
         require(header(&item)&&!item.reserved[0]&&!item.reserved[1]&&item.receipt&&item.receipt->value&&item.original_parent&&item.original_parent->cursor);
         out.restore_items.push_back({item.receipt->value,item.original_parent->cursor});
     }
-    return out;
+    bind_root(out,std::move(root));return out;
 }
 ckfea_status start(ActionRequest request,ckfea_job** out) {
     auto slot=std::make_shared<Slot>();auto count=live_jobs.load();
@@ -149,6 +163,15 @@ ckfea_status ckfea_job_create(const ckfea_request* in, ckfea_job** out) noexcept
         return start(convert(*in),out);
     });
 }
+ckfea_status ckfea_job_create_with_journal_root(const ckfea_request* in,const ckfjr_root* root,ckfea_job** out) noexcept {
+    if(out)*out=nullptr;
+    return boundary([&]()->ckfea_status {
+        require(in&&root&&out);
+        auto retained=retain_prepared_journal_root(root);
+        if(!retained.value())return CKFEA_NOT_READY;
+        return start(convert(*in,std::move(retained).take_value()),out);
+    });
+}
 void ckfea_restore_request_init(ckfea_restore_request* p) noexcept {
     if(p){reset(*p);ckfea_native_text_init(&p->journal_directory);ckfea_native_text_init(&p->journal_name);}
 }
@@ -156,6 +179,15 @@ void ckfea_restore_item_init(ckfea_restore_item* p) noexcept {if(p)reset(*p);}
 ckfea_status ckfea_restore_job_create(const ckfea_restore_request* in,ckfea_job** out) noexcept {
     if(out)*out=nullptr;
     return boundary([&]()->ckfea_status{require(in&&out);return start(convert_restore(*in),out);});
+}
+ckfea_status ckfea_restore_job_create_with_journal_root(const ckfea_restore_request* in,const ckfjr_root* root,ckfea_job** out) noexcept {
+    if(out)*out=nullptr;
+    return boundary([&]()->ckfea_status {
+        require(in&&root&&out);
+        auto retained=retain_prepared_journal_root(root);
+        if(!retained.value())return CKFEA_NOT_READY;
+        return start(convert_restore(*in,std::move(retained).take_value()),out);
+    });
 }
 ckfea_status ckfea_job_trash_receipt(const ckfea_job* job,uint32_t item,ckfea_trash_receipt** out) noexcept {
     if(out)*out=nullptr;

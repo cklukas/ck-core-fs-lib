@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "ck_fs_tree.h"
+#include "ck_fs_diagnostics.h"
 #include "native_handles.hpp"
 #include "reviewed_tree_plan.hpp"
 #include "prepared_journal_root.hpp"
@@ -14,7 +15,12 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
+
+static_assert(sizeof(ckfet_failure_details_v1)==192);
+static_assert(offsetof(ckfet_failure_details_v1,operation)==64);
+static_assert(offsetof(ckfet_failure_details_v1,reserved)==160);
 
 using namespace ck::files;
 namespace {
@@ -122,7 +128,9 @@ struct Shared {
     std::vector<CachedRow> rows;
     std::vector<ckfet_rule_counts_v1> rule_counts;
     std::size_t page_limit = 256;
-    std::optional<UnavailableObservation> failure;
+    std::array<char,96> failure_operation{};
+    std::uint32_t failure_operation_bytes=0;
+    bool failure_operation_truncated=false;
     void publish() noexcept {
         ++snapshot.sequence;
         if (event_count == events.size()) {
@@ -131,14 +139,21 @@ struct Shared {
         events[(event_head + event_count) % events.size()] = snapshot;
         ++event_count;
     }
-    void set_failure(const UnavailableObservation& f) {
-        failure = f;
-        snapshot.failure_state = static_cast<std::uint32_t>(f.state);
-        snapshot.failure_domain = static_cast<std::uint32_t>(f.error.domain);
-        snapshot.failure_code = f.error.code;
+    void set_failure(ObservationState state,ErrorDomain domain,std::int64_t code,std::string_view operation) noexcept {
+        snapshot.failure_state = static_cast<std::uint32_t>(state);
+        snapshot.failure_domain = static_cast<std::uint32_t>(domain);
+        snapshot.failure_code = code;
+        failure_operation={};
+        failure_operation_bytes=static_cast<std::uint32_t>(std::min(operation.size(),failure_operation.size()-1));
+        failure_operation_truncated=operation.size()>failure_operation_bytes;
+        if(failure_operation_bytes)std::memcpy(failure_operation.data(),operation.data(),failure_operation_bytes);
+    }
+    void set_failure(const UnavailableObservation& f) noexcept {
+        set_failure(f.state,f.error.domain,f.error.code,f.error.operation);
     }
     void clear_failure() noexcept {
-        failure.reset(); snapshot.failure_state = snapshot.failure_domain = 0; snapshot.failure_code = 0;
+        failure_operation={};failure_operation_bytes=0;failure_operation_truncated=false;
+        snapshot.failure_state = snapshot.failure_domain = 0; snapshot.failure_code = 0;
     }
 };
 bool terminal(ReviewedTreeState s) { return s >= ReviewedTreeState::Complete; }
@@ -358,9 +373,8 @@ void worker_body(std::shared_ptr<Shared> s, ReviewedTreePlanRequest request) noe
         // owned by this worker while unwinding, never by the releasing UI.
         std::lock_guard lock(s->mutex);
         s->snapshot.state = CKFET_NEEDS_RECONCILIATION; s->snapshot.recovery_required = 1;
-        s->snapshot.failure_state = CKFE_OBSERVATION_FAILED;
-        s->snapshot.failure_domain = CKFE_ERROR_ADAPTER;
-        s->snapshot.failure_code = CKFE_ADAPTER_INVALID_NATIVE_RESULT;
+        s->set_failure(ObservationState::Failed,ErrorDomain::Adapter,
+            CKFE_ADAPTER_INVALID_NATIVE_RESULT,"tree.worker_exception");
         s->terminal = true;
         s->snapshot.paused = 0;
         s->publish();
@@ -381,6 +395,30 @@ void worker(std::shared_ptr<Shared> s, std::optional<ReviewedTreePlanRequest> re
 struct ckfet_job { std::shared_ptr<Shared> state; };
 
 extern "C" {
+void ckfet_failure_details_init_v1(ckfet_failure_details_v1* out) noexcept {
+    if(!out)return;
+    *out={};out->version=CKFET_FAILURE_DETAILS_VERSION;out->struct_size=sizeof(*out);
+}
+ckfe_api_status ckfet_get_failure_details_v1(const ckfet_job* job,ckfet_failure_details_v1* out) noexcept {
+    if(!job||!out||out->version!=CKFET_FAILURE_DETAILS_VERSION||out->struct_size!=sizeof(*out))
+        return CKFE_API_INVALID_ARGUMENT;
+    for(const auto reserved:out->reserved)if(reserved)return CKFE_API_INVALID_ARGUMENT;
+    try {
+        std::lock_guard lock(job->state->mutex);
+        const auto& state=*job->state;
+        ckfet_failure_details_v1 value{};
+        ckfet_failure_details_init_v1(&value);
+        value.has_failure=state.snapshot.failure_state!=CKFE_OBSERVATION_AVAILABLE||
+            state.snapshot.failure_domain!=CKFE_ERROR_NONE||state.snapshot.failure_code!=0;
+        value.failure_state=state.snapshot.failure_state;value.failure_domain=state.snapshot.failure_domain;
+        value.failure_code=state.snapshot.failure_code;value.sequence=state.snapshot.sequence;
+        value.plan_generation=state.snapshot.plan_generation;value.current_row=state.snapshot.current_row;
+        value.has_current_row=state.snapshot.has_current_row;
+        value.operation_truncated=state.failure_operation_truncated;value.operation_bytes=state.failure_operation_bytes;
+        std::memcpy(value.operation,state.failure_operation.data(),sizeof(value.operation));
+        *out=value;return CKFE_API_OK;
+    } catch (...) {return CKFE_API_EXCEPTION;}
+}
 void ckfet_options_init_v1(ckfet_options_v1* o) {
     if (!o) return;
     *o = {}; o->version = CKFET_VERSION; o->struct_size = sizeof(*o);

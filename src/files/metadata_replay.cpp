@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "metadata_replay.hpp"
 #include <algorithm>
+#include "sha256.hpp"
 
 namespace ck::files {
 namespace {
@@ -41,6 +42,33 @@ bool MetadataReplayPolicy::valid() const noexcept {
         scope==RegularMetadataScope::OrdinaryCallerVisibleV1) &&
         (ownership==MetadataOwnership::Original || ownership==MetadataOwnership::CurrentCaller);
 }
+Observation<std::array<std::byte,32>> digest_metadata_replay_channel(const MetadataReplayChannelSource& stream,
+    const NativeFeatureIdentifier& identifier,const ObjectIdentity& owner,std::uint64_t size,std::stop_token stop) {
+    using Result=Observation<std::array<std::byte,32>>;
+    const auto check=[&]()->Observation<bool> {
+        const auto state=stream.inspect();
+        if(!state.value()) return propagate<bool>(*state.unavailable_detail());
+        if(state.value()->identifier!=identifier || state.value()->logical_size!=size ||
+            compare_identity(state.value()->owner,owner)!=IdentityComparison::Same)
+            return fail<bool>("metadata_replay.channel_identity_size",ObservationState::Changed,AdapterError::MetadataChanged);
+        return Observation<bool>::available(true);
+    };
+    auto stable=check();if(!stable.value())return propagate<std::array<std::byte,32>>(*stable.unavailable_detail());
+    Sha256 hash;std::uint64_t offset=0;
+    while(offset<size) {
+        if(stop.stop_requested())return propagate<std::array<std::byte,32>>(*interrupted().unavailable_detail());
+        const auto data=stream.read_content({64*1024},offset,stop);
+        if(!data.value())return propagate<std::array<std::byte,32>>(*data.unavailable_detail());
+        if(data.value()->bytes.empty() || data.value()->bytes.size()>size-offset ||
+            (data.value()->complete && data.value()->bytes.size()!=size-offset))
+            return fail<std::array<std::byte,32>>("metadata_replay.channel_read_shape",ObservationState::Changed,AdapterError::MetadataChanged);
+        hash.update(data.value()->bytes);offset+=data.value()->bytes.size();
+        if(offset==size&&!data.value()->complete)
+            return fail<std::array<std::byte,32>>("metadata_replay.channel_grew",ObservationState::Changed,AdapterError::MetadataChanged);
+    }
+    stable=check();if(!stable.value())return propagate<std::array<std::byte,32>>(*stable.unavailable_detail());
+    return Result::available(hash.digest());
+}
 Observation<MetadataReplaySnapshot> capture_metadata_replay(const OpenedEntry& entry, MetadataReplayPolicy policy,
                                                             std::stop_token stop) {
     using Result=Observation<MetadataReplaySnapshot>;
@@ -51,19 +79,14 @@ Observation<MetadataReplaySnapshot> capture_metadata_replay(const OpenedEntry& e
     auto qualified=entry.qualify_metadata_replay(policy);
     if(!qualified.value()) return propagate<MetadataReplaySnapshot>(*qualified.unavailable_detail());
     if(!*qualified.value()) return fail<MetadataReplaySnapshot>("metadata_replay.provider_not_qualified");
-    // Native ACL/xattr enumeration is not a proof that all mandatory label,
-    // capability and provider security classes are visible and replayable.
-    // No adapter currently supplies that proof. Refuse before replay effects;
-    // ordinary policy still records only its explicit caller-visible scope.
-    if(policy.scope==RegularMetadataScope::CompleteMetadataV1)
-        return fail<MetadataReplaySnapshot>("metadata_replay.complete_security_coverage_unproved");
     auto view=entry.open_metadata_replay_view(policy);
     if(!view.value()) return propagate<MetadataReplaySnapshot>(*view.unavailable_detail());
     const auto& query=*view.value() ? **view.value() : entry;
     MetadataReplaySnapshot result;result.policy=policy;result.basic=*before.value();
     const auto& basic=result.basic;
-    if(!basic.kind.value() || *basic.kind.value()!=ObjectKind::RegularFile || !basic.logical_size.value() ||
-       !basic.link_count.value() || *basic.link_count.value()!=1 ||
+    const bool directory=basic.kind.value()&&*basic.kind.value()==ObjectKind::Directory;
+    if(!basic.kind.value() || (!directory&&*basic.kind.value()!=ObjectKind::RegularFile) || (!directory&&!basic.logical_size.value()) ||
+       !basic.link_count.value() || *basic.link_count.value()<1 ||
        !basic.accessed.value() || !basic.modified.value() || !basic.changed.value() ||
        !basic.identity.value() || !identity(basic.identity,basic.identity))
         return fail<MetadataReplaySnapshot>("metadata_replay.required_basic");
@@ -100,7 +123,7 @@ Observation<MetadataReplaySnapshot> capture_metadata_replay(const OpenedEntry& e
     std::vector<SecurityPart> parts;
     switch(storage.value()->model) {
     case StorageModel::DarwinStatFlags: parts={SecurityPart::DarwinExtendedAcl}; break;
-    case StorageModel::LinuxStatx: parts={SecurityPart::LinuxAccessAcl}; break;
+    case StorageModel::LinuxStatx: parts=directory?std::vector{SecurityPart::LinuxAccessAcl,SecurityPart::LinuxDefaultAcl}:std::vector{SecurityPart::LinuxAccessAcl}; break;
     case StorageModel::WindowsHandleAttributes:
         parts=policy.scope==RegularMetadataScope::CompleteMetadataV1 ?
             std::vector{SecurityPart::WindowsFullDescriptor} :
@@ -117,6 +140,39 @@ Observation<MetadataReplaySnapshot> capture_metadata_replay(const OpenedEntry& e
             return fail<MetadataReplaySnapshot>("metadata_replay.aggregate_security_limit",ObservationState::Unknown,AdapterError::InventoryLimit);
         total+=security.value()->bytes.size(); result.security.push_back(std::move(security).take_value());
     }
+    if(storage.value()->model==StorageModel::WindowsHandleAttributes) {
+        const auto catalog=query.inspect_data_channels(policy.limits);
+        if(!catalog.value())return propagate<MetadataReplaySnapshot>(*catalog.unavailable_detail());
+        if(catalog.value()->coverage!=DataChannelCoverage::WindowsFileStreamInfo || !identity(catalog.value()->owner,basic.identity))
+            return fail<MetadataReplaySnapshot>("metadata_replay.channel_catalog_coverage");
+        result.channel_coverage=catalog.value()->coverage;
+        unsigned main_count=0;
+        for(const auto& channel:catalog.value()->channels) {
+            if(channel.kind==DataChannelKind::MainData){++main_count;continue;}
+            if(channel.kind!=DataChannelKind::NamedData || !channel.logical_size.value())
+                return fail<MetadataReplaySnapshot>("metadata_replay.channel_kind_size");
+            auto reader=query.open_metadata_replay_channel_read(channel.identifier);
+            if(!reader.value())return propagate<MetadataReplaySnapshot>(*reader.unavailable_detail());
+            if(!*reader.value())return fail<MetadataReplaySnapshot>("metadata_replay.channel_reader_missing",ObservationState::Failed,AdapterError::InvalidNativeResult);
+            auto digest=digest_metadata_replay_channel(**reader.value(),channel.identifier,*basic.identity.value(),*channel.logical_size.value(),stop);
+            if(!digest.value())return propagate<MetadataReplaySnapshot>(*digest.unavailable_detail());
+            result.channels.push_back({channel.identifier,*channel.logical_size.value(),*digest.value(),std::move(reader).take_value()});
+        }
+        if(main_count!=(directory?0U:1U))return fail<MetadataReplaySnapshot>("metadata_replay.main_channel_count");
+        auto evidence=issue_native_metadata_replay_channels(query,result,stop);
+        if(!evidence.value())return propagate<MetadataReplaySnapshot>(*evidence.unavailable_detail());
+        result.channel_evidence=std::move(evidence).take_value();
+    }
+    if(policy.scope==RegularMetadataScope::CompleteMetadataV1) {
+        auto evidence=query.issue_metadata_security_coverage(result);
+        if(!evidence.value())return propagate<MetadataReplaySnapshot>(*evidence.unavailable_detail());
+        if(!*evidence.value()||(*evidence.value())->family()==MetadataSecurityCoverage::Unknown)
+            return fail<MetadataReplaySnapshot>("metadata_replay.complete_security_evidence_missing");
+        result.security_coverage=std::move(evidence).take_value();
+        const auto verified=result.security_coverage->recheck(result);
+        if(!verified.value())return propagate<MetadataReplaySnapshot>(*verified.unavailable_detail());
+        if(!*verified.value())return fail<MetadataReplaySnapshot>("metadata_replay.complete_security_evidence_false");
+    }
     auto after=entry.inspect_basic();
     if(!after.value()) return propagate<MetadataReplaySnapshot>(*after.unavailable_detail());
     if(!stable(basic,*after.value())) return fail<MetadataReplaySnapshot>("metadata_replay.capture_changed",ObservationState::Changed,AdapterError::MetadataChanged);
@@ -124,15 +180,25 @@ Observation<MetadataReplaySnapshot> capture_metadata_replay(const OpenedEntry& e
     return Result::available(std::move(result));
 }
 Observation<bool> verify_metadata_replay_source(const OpenedEntry& entry,const MetadataReplaySnapshot& snapshot,std::stop_token stop) {
+    if(snapshot.channel_coverage==DataChannelCoverage::WindowsFileStreamInfo) {
+        auto checked=verify_native_metadata_replay_channels(snapshot);
+        if(!checked.value()||!*checked.value())return checked;
+    }
     auto fresh=capture_metadata_replay(entry,snapshot.policy,stop);
     if(!fresh.value()) return propagate<bool>(*fresh.unavailable_detail());
     if(!stable(snapshot.basic,fresh.value()->basic) || snapshot.attribute_coverage!=fresh.value()->attribute_coverage ||
-       !attributes_equal(snapshot.attributes,fresh.value()->attributes) || snapshot.security.size()!=fresh.value()->security.size())
+       !attributes_equal(snapshot.attributes,fresh.value()->attributes) || snapshot.security.size()!=fresh.value()->security.size() ||
+       snapshot.channel_coverage!=fresh.value()->channel_coverage || snapshot.channels.size()!=fresh.value()->channels.size())
         return fail<bool>("metadata_replay.source_changed",ObservationState::Changed,AdapterError::MetadataChanged);
     for(std::size_t i=0;i<snapshot.security.size();++i) {
         const auto& a=snapshot.security[i];const auto& b=fresh.value()->security[i];
         if(a.part!=b.part || a.presence!=b.presence || a.encoding!=b.encoding || a.bytes!=b.bytes || a.native_query_mask!=b.native_query_mask)
             return fail<bool>("metadata_replay.source_security_changed",ObservationState::Changed,AdapterError::MetadataChanged);
+    }
+    for(const auto& x:snapshot.channels) {
+        const auto found=std::find_if(fresh.value()->channels.begin(),fresh.value()->channels.end(),[&](const auto& c){return c.identifier==x.identifier;});
+        if(found==fresh.value()->channels.end() || found->logical_size!=x.logical_size || found->digest!=x.digest)
+            return fail<bool>("metadata_replay.source_channel_changed",ObservationState::Changed,AdapterError::MetadataChanged);
     }
     return Observation<bool>::available(true);
 }
@@ -149,12 +215,25 @@ Observation<bool> apply_metadata_replay(OpenedEntry& target,const MetadataReplay
         return fail<bool>("metadata_replay.apply_security_owner",ObservationState::Failed,AdapterError::UnqualifiedIdentity);
     auto qualified=target.qualify_metadata_replay(snapshot.policy);
     if(!qualified.value() || !*qualified.value()) return qualified;
-    if(snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1)
-        return fail<bool>("metadata_replay.complete_security_coverage_unproved");
+    if(snapshot.channel_coverage==DataChannelCoverage::WindowsFileStreamInfo) {
+        auto checked=verify_native_metadata_replay_channels(snapshot);
+        if(!checked.value()||!*checked.value())return checked;
+    }
+    if(snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1) {
+        if(!snapshot.security_coverage)return fail<bool>("metadata_replay.complete_security_coverage_unproved");
+        const auto preflight=target.preflight_metadata_security_coverage(snapshot);
+        if(!preflight.value()||!*preflight.value())return preflight;
+    }
     const auto target_before=target.inspect_basic();
     if(!target_before.value()) return propagate<bool>(*target_before.unavailable_detail());
-    if(!equal(target_before.value()->kind,snapshot.basic.kind) || !equal(target_before.value()->logical_size,snapshot.basic.logical_size))
+    if(target_before.value()->windows_attributes.value() && snapshot.channel_coverage!=DataChannelCoverage::WindowsFileStreamInfo)
+        return fail<bool>("metadata_replay.windows_channel_coverage_required");
+    if(!equal(target_before.value()->kind,snapshot.basic.kind) || (snapshot.basic.kind.value()&&*snapshot.basic.kind.value()!=ObjectKind::Directory&&!equal(target_before.value()->logical_size,snapshot.basic.logical_size)))
         return fail<bool>("metadata_replay.target_data_shape",ObservationState::Changed,AdapterError::MetadataChanged);
+    if(snapshot.channel_coverage==DataChannelCoverage::WindowsFileStreamInfo) {
+        const auto channels=target.apply_replay_channels(snapshot,stop);
+        if(!channels.value()||!*channels.value())return channels;
+    } else if(!snapshot.channels.empty())return fail<bool>("metadata_replay.channel_coverage_missing");
     auto result=target.apply_replay_ownership(snapshot.basic,snapshot.policy);
     if(!result.value() || !*result.value()) return result;
     // Replace inherited attributes as a set; never report success with extras.
@@ -189,15 +268,27 @@ Observation<bool> apply_metadata_replay(OpenedEntry& target,const MetadataReplay
         return fail<bool>("metadata_replay.apply_target_identity",ObservationState::Changed,AdapterError::MetadataChanged);
     return Observation<bool>::available(true);
 }
-Observation<bool> verify_metadata_replay(const OpenedEntry& target,const MetadataReplaySnapshot& snapshot,
-                                        const BasicMetadata& applied,std::stop_token stop) {
+namespace {
+Observation<bool> verify_metadata_replay_impl(const OpenedEntry& target,const MetadataReplaySnapshot& snapshot,
+                                        const BasicMetadata& applied,std::stop_token stop,bool read_channel_data) {
     if(stop.stop_requested()) return interrupted();
-    if(snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1)
-        return fail<bool>("metadata_replay.complete_security_coverage_unproved");
+    const auto qualified=target.qualify_metadata_replay(snapshot.policy);
+    if(!qualified.value()||!*qualified.value())return qualified;
+    if(snapshot.channel_coverage==DataChannelCoverage::WindowsFileStreamInfo) {
+        auto checked=verify_native_metadata_replay_channels(snapshot);
+        if(!checked.value()||!*checked.value())return checked;
+    }
+    if(snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1) {
+        if(!snapshot.security_coverage)return fail<bool>("metadata_replay.complete_security_coverage_unproved");
+        const auto verified=target.verify_metadata_security_coverage(snapshot);
+        if(!verified.value()||!*verified.value())return verified;
+    }
     auto now=target.inspect_basic();
     if(!now.value()) return propagate<bool>(*now.unavailable_detail());
     const auto& n=*now.value();const auto& s=snapshot.basic;
-    if(!identity(applied.identity,n.identity) || !equal(s.kind,n.kind) || !equal(s.logical_size,n.logical_size) ||
+    if(n.windows_attributes.value() && snapshot.channel_coverage!=DataChannelCoverage::WindowsFileStreamInfo)
+        return fail<bool>("metadata_replay.windows_channel_coverage_required");
+    if(!identity(applied.identity,n.identity) || !equal(s.kind,n.kind) || (s.kind.value()&&*s.kind.value()!=ObjectKind::Directory&&!equal(s.logical_size,n.logical_size)) ||
        !equal(s.accessed,n.accessed) || !equal(s.modified,n.modified) || !equal(s.posix_permissions,n.posix_permissions) ||
        !equal(s.windows_attributes,n.windows_attributes) || !equal(s.bsd_flags,n.bsd_flags))
         return fail<bool>("metadata_replay.target_basic",ObservationState::Changed,AdapterError::MetadataChanged);
@@ -222,10 +313,61 @@ Observation<bool> verify_metadata_replay(const OpenedEntry& target,const Metadat
         auto result=target.verify_replay_security(x,snapshot.policy);
         if(!result.value() || !*result.value()) return result;
     }
+    if(snapshot.channel_coverage==DataChannelCoverage::WindowsFileStreamInfo) {
+        auto checked=verify_native_metadata_replay_channels(snapshot);
+        if(!checked.value()||!*checked.value())return checked;
+    }
+    if(snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1) {
+        const auto verified=target.verify_metadata_security_coverage(snapshot);
+        if(!verified.value()||!*verified.value())return verified;
+    }
+    if(snapshot.channel_coverage==DataChannelCoverage::WindowsFileStreamInfo) {
+        const auto catalog=target.inspect_data_channels(snapshot.policy.limits);
+        if(!catalog.value())return propagate<bool>(*catalog.unavailable_detail());
+        if(catalog.value()->coverage!=snapshot.channel_coverage || !identity(catalog.value()->owner,n.identity) ||
+            catalog.value()->channels.size()!=snapshot.channels.size()+(s.kind.value()&&*s.kind.value()==ObjectKind::Directory?0U:1U))
+            return fail<bool>("metadata_replay.target_channel_set",ObservationState::Changed,AdapterError::MetadataChanged);
+        for(const auto& x:snapshot.channels) {
+            const auto found=std::find_if(catalog.value()->channels.begin(),catalog.value()->channels.end(),[&](const auto& c){return c.identifier==x.identifier&&c.kind==DataChannelKind::NamedData;});
+            if(found==catalog.value()->channels.end() || !found->logical_size.value() || *found->logical_size.value()!=x.logical_size)
+                return fail<bool>("metadata_replay.target_channel_size",ObservationState::Changed,AdapterError::MetadataChanged);
+            if(!read_channel_data)continue;
+            const auto reader=target.open_metadata_replay_channel_read(x.identifier);
+            if(!reader.value())return propagate<bool>(*reader.unavailable_detail());
+            if(!*reader.value())return fail<bool>("metadata_replay.target_channel_reader_missing",ObservationState::Failed,AdapterError::InvalidNativeResult);
+            const auto digest=digest_metadata_replay_channel(**reader.value(),x.identifier,*n.identity.value(),x.logical_size,stop);
+            if(!digest.value())return propagate<bool>(*digest.unavailable_detail());
+            if(*digest.value()!=x.digest)return fail<bool>("metadata_replay.target_channel_bytes",ObservationState::Changed,AdapterError::MetadataChanged);
+        }
+    }
+    const auto still_qualified=target.qualify_metadata_replay(snapshot.policy);
+    if(!still_qualified.value()||!*still_qualified.value())return still_qualified;
     auto after=target.inspect_basic();
     if(!after.value()) return propagate<bool>(*after.unavailable_detail());
-    if(!stable(n,*after.value()) || !equal(n.changed,applied.changed))
+    // Source read brackets deliberately tolerate observed access-time changes;
+    // target verification must not silently perturb the time just replayed.
+    if(!stable(n,*after.value()) || !equal(n.accessed,after.value()->accessed) || !equal(n.changed,applied.changed))
         return fail<bool>("metadata_replay.target_changed",ObservationState::Changed,AdapterError::MetadataChanged);
     return stop.stop_requested()?interrupted():Observation<bool>::available(true);
 }
+} // namespace
+Observation<bool> verify_metadata_replay(const OpenedEntry& target,const MetadataReplaySnapshot& snapshot,
+    const BasicMetadata& applied,std::stop_token stop) {
+    return verify_metadata_replay_impl(target,snapshot,applied,stop,true);
+}
+Observation<bool> verify_metadata_replay_values(const OpenedEntry& target,const MetadataReplaySnapshot& snapshot,
+    const BasicMetadata& applied,std::stop_token stop) {
+    return verify_metadata_replay_impl(target,snapshot,applied,stop,false);
+}
+Observation<bool> NativeCreatedDirectory::verify_metadata(const MetadataReplaySnapshot& snapshot,
+    const BasicMetadata& applied,std::stop_token stop) const {
+    if(!finish_result_||!finish_result_->value()||!*finish_result_->value())
+        return fail<bool>("directory_creation.verify_requires_finished_writer",ObservationState::Failed,AdapterError::InvalidAccess);
+    const auto& p=snapshot.policy;
+    if(p.version!=policy_.version||p.scope!=policy_.scope||p.ownership!=policy_.ownership||
+       p.allow_privilege_metadata!=policy_.allow_privilege_metadata)
+        return fail<bool>("directory_creation.policy_changed",ObservationState::Changed,AdapterError::MetadataChanged);
+    return verify_metadata_replay(*verifier_,snapshot,applied,stop);
+}
+
 } // namespace ck::files

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "sync_session.hpp"
 #include "sha256.hpp"
+#include "native_filesystem.hpp"
 #include <algorithm>
 #include <limits>
 
@@ -106,7 +107,16 @@ Observation<std::unique_ptr<SyncSession>> SyncSession::open(std::unique_ptr<Sync
     auto r=s->refresh(); if(!r.value()) return propagate<std::unique_ptr<SyncSession>>(r);
     return R::available(std::move(s));
 }
+Observation<bool> SyncSession::finish_io() {
+    finished_=true; // Even a throwing result construction revokes all I/O authority.
+    return backend_->finish_io();
+}
+Observation<bool> SyncSession::revalidate() {
+    if(finished_)return reject<bool>("sync_session.finished");
+    return backend_->revalidate();
+}
 Observation<bool> SyncSession::refresh() {
+    if(finished_)return reject<bool>("sync_session.finished");
     uncertain_=true;
     auto valid=backend_->revalidate(); if(!valid.value()) return valid;
     auto read=[&](const char* suffix) { return backend_->read(prefix_+suffix,limits_.max_wire_bytes+88); };
@@ -178,6 +188,7 @@ Observation<bool> SyncSession::refresh() {
 }
 Observation<SyncBaselineAdvance> SyncSession::commit(std::uint64_t expected,
     std::span<const SyncBaselineUpdate> updates, bool approve_first_run, std::function<bool()> cancelled) {
+    if(finished_)return reject<SyncBaselineAdvance>("sync_session.finished");
     if(uncertain_ || (snapshot_.state==SyncSessionState::ReviewRequired || snapshot_.state==SyncSessionState::HistoryChanged) ||
         expected!=snapshot_.generation || expected==UINT64_MAX ||
         (snapshot_.state==SyncSessionState::FirstRun && !approve_first_run))
@@ -237,5 +248,15 @@ Observation<SyncBaselineAdvance> SyncSession::commit(std::uint64_t expected,
     snapshot_.generation=expected+1; snapshot_.state=SyncSessionState::Ready;
     loaded_digest_=hash(bytes); uncertain_=false;
     return advanced;
+}
+Observation<PreparedJournalRoot::Pointer> acquire_native_sync_storage_root(const NativeAbsolutePath& address) {
+    NativeFileSystem fs;
+    auto directory=fs.open_native_directory(address);
+    if(!directory.value())return propagate<PreparedJournalRoot::Pointer>(directory);
+    PreparedJournalRootRequest request;
+    request.parent=std::move(directory).take_value();
+    request.navigation_hint=address;
+    JournalRootPreparationProgress progress;
+    return prepare_native_journal_root(std::move(request),progress);
 }
 } // namespace ck::files

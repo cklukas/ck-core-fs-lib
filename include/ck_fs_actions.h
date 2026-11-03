@@ -2,6 +2,7 @@
 #ifndef CK_FS_ACTIONS_H
 #define CK_FS_ACTIONS_H
 #include "ck_file_engine.h"
+#include "ck_fs_journal_root.h"
 #ifdef __cplusplus
 #define CKFEA_NOEXCEPT noexcept
 extern "C" {
@@ -118,6 +119,7 @@ enum { CKFEA_TRASH_ORIGINAL_NAME=0, CKFEA_TRASH_DATA_NAME=1, CKFEA_TRASH_METADAT
 CK_FILE_ENGINE_API void ckfea_restore_request_init(ckfea_restore_request*) CKFEA_NOEXCEPT;
 CK_FILE_ENGINE_API void ckfea_restore_item_init(ckfea_restore_item*) CKFEA_NOEXCEPT;
 CK_FILE_ENGINE_API ckfea_status ckfea_restore_job_create(const ckfea_restore_request*, ckfea_job**) CKFEA_NOEXCEPT;
+CK_FILE_ENGINE_API ckfea_status ckfea_restore_job_create_with_journal_root(const ckfea_restore_request*, const ckfjr_root*, ckfea_job**) CKFEA_NOEXCEPT;
 CK_FILE_ENGINE_API ckfea_status ckfea_job_trash_receipt(const ckfea_job*, uint32_t item, ckfea_trash_receipt**) CKFEA_NOEXCEPT;
 CK_FILE_ENGINE_API ckfea_status ckfea_trash_receipt_info(const ckfea_trash_receipt*, ckfea_trash_info*) CKFEA_NOEXCEPT;
 /* Returns CKFE_OBJECT_REGULAR_FILE or CKFE_OBJECT_DIRECTORY, without I/O.
@@ -136,6 +138,13 @@ CK_FILE_ENGINE_API void ckfea_native_text_init(ckfea_native_text*) CKFEA_NOEXCEP
 // pinned native cursor in another worker. Maximum four live jobs; one worker
 // per job. Native calls may block. No callbacks or exceptions cross this ABI.
 CK_FILE_ENGINE_API ckfea_status ckfea_job_create(const ckfea_request*, ckfea_job**) CKFEA_NOEXCEPT;
+/* Retains a READY native root. journal_directory is optional navigation/encoding
+ * metadata, never reopening authority. Empty stays empty; cached hints are not
+ * consulted for journal I/O.
+ * Journal name remains an exact native component. A finishing/unready root
+ * returns NOT_READY. No native I/O runs on this caller or existing v1 layout
+ * changes. Finalize the shared root only after all consuming jobs finish. */
+CK_FILE_ENGINE_API ckfea_status ckfea_job_create_with_journal_root(const ckfea_request*, const ckfjr_root*, ckfea_job**) CKFEA_NOEXCEPT;
 // Outputs require caller-initialized version/struct_size and zero reserved.
 // Invalid output headers are left untouched; valid outputs reset on failure.
 CK_FILE_ENGINE_API ckfea_status ckfea_job_summary(const ckfea_job*, ckfea_summary*) CKFEA_NOEXCEPT;

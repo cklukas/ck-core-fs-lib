@@ -1,5 +1,17 @@
 # Changes
 
+## Unreleased 0.5 development checkpoint
+
+- Add worker-owned stable C Actions-with-Root, Trash/restore, and verified
+  retry/prefix-copy jobs with one-use review and explicit native drain.
+- Add V3 semantic metadata evidence, bounded native source capture, independent
+  stream verification, and proof-backed regular/directory metadata workers.
+- Add durable native two-way coordination and reviewed version-retention
+  candidates, retaining lock, ledger, stale-review and pre-CAS close checks.
+- Keep whole Tree receipt integration, hierarchical convergence, provider
+  limitations and final matching sanitizer/consumer qualification as open gates.
+- This checkpoint is not a release or a frontend Apply/pin approval.
+
 ## 2026-11-03
 
 - Add the 0.4 owned journal-root factory and guarded Tree integration.

@@ -3,23 +3,24 @@
 #include "../sync_session.hpp"
 #include "../sha256.hpp"
 #include "../windows_name.hpp"
+#include "native_windows_journal_volume.hpp"
+#include "native_journal_directory_bridge.hpp"
 #include "../native_filesystem.hpp"
 #include "../windows_parent_record.hpp"
-#include "native_journal_directory_bridge.hpp"
 #include "prepared_journal_root_bridge.hpp"
-#include "native_windows_journal_volume.hpp"
-#include <winioctl.h>
-#include <cstring>
-#include <new>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winioctl.h>
+#include <cstring>
+#include <new>
 #include <winternl.h>
 #include <aclapi.h>
 #include <bit>
 #include <algorithm>
 #include <future>
+#include <atomic>
 #include <thread>
 
 namespace ck::files {
@@ -500,6 +501,54 @@ std::vector<SyncDigest> lease_scopes(const Chain& left,const Chain& right) {
     for(const auto* chain:{&left,&right})for(const auto& node:*chain)out.push_back(node.object.volume);
     return out;
 }
+// Read exact native parent IDs from held directory records and acquire those
+// IDs on that SAME volume. A final-path string is never used as an open address.
+Observation<Chain> held_storage_chain(PreparedJournalRoot::Pointer owner) {
+    auto duplicate=detail::duplicate_prepared_journal_directory(*owner);
+    if(!duplicate.value())return propagate<Chain>(duplicate);
+    Handle current(*duplicate.value(),Close{owner});Chain out;
+    for(;;) {
+        if(out.size()>=256)return reject<Chain>("sync_session.storage_ancestor_limit",ObservationState::Unsupported);
+        auto object=identity(current.get(),true);if(!object.value())return propagate<Chain>(object);
+        if(std::any_of(out.begin(),out.end(),[&](const auto& n){return n.object.id==object.value()->id;}))
+            return reject<Chain>("sync_session.storage_ancestor_cycle",ObservationState::Unsupported);
+        FILE_ID_INFO id{};if(!GetFileInformationByHandleEx(current.get(),FileIdInfo,&id,sizeof(id)))
+            return fail<Chain>(GetLastError(),"sync_session.storage_file_id");
+        READ_FILE_USN_DATA query{3,3};alignas(8) std::array<std::byte,65536+80> wire{};DWORD size{};
+        if(!DeviceIoControl(current.get(),FSCTL_READ_FILE_USN_DATA,&query,sizeof(query),wire.data(),static_cast<DWORD>(wire.size()),&size,nullptr))
+            return fail<Chain>(GetLastError(),"sync_session.storage_parent_record");
+        if(size>wire.size())return reject<Chain>("sync_session.storage_parent_record_size",ObservationState::Failed);
+        auto record=detail::decode_windows_parent_record(std::span<const std::byte>(wire).first(size),3);
+        if(!record.value())return propagate<Chain>(record);
+        NativeIdentifier actual;std::memcpy(actual.bytes.data(),id.FileId.Identifier,16);
+        if(record.value()->child!=actual||!(record.value()->attributes&FILE_ATTRIBUTE_DIRECTORY))
+            return reject<Chain>("sync_session.storage_parent_record_changed");
+        const bool top=record.value()->child==record.value()->parent;
+        if(top&&!object.value()->volume_root)return reject<Chain>("sync_session.storage_hidden_ancestors",ObservationState::Unsupported);
+        if(top) {out.push_back({std::move(current),{},std::move(object).take_value()});break;}
+        FILE_ID_DESCRIPTOR descriptor{};descriptor.dwSize=sizeof(descriptor);descriptor.Type=ExtendedFileIdType;
+        std::memcpy(descriptor.ExtendedFileId.Identifier,record.value()->parent.bytes.data(),16);
+        Handle parent(OpenFileById(current.get(),&descriptor,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL|SYNCHRONIZE,
+            FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+        parent.get_deleter().owner=owner;
+        if(parent.get()==INVALID_HANDLE_VALUE)return fail<Chain>(GetLastError(),"sync_session.storage_parent_by_id");
+        FILE_ID_INFO seen{};if(!GetFileInformationByHandleEx(parent.get(),FileIdInfo,&seen,sizeof(seen)))
+            return fail<Chain>(GetLastError(),"sync_session.storage_parent_identity");
+        if(seen.VolumeSerialNumber!=id.VolumeSerialNumber||std::memcmp(seen.FileId.Identifier,record.value()->parent.bytes.data(),16))
+            return reject<Chain>("sync_session.storage_parent_changed");
+        out.push_back({std::move(current),{},std::move(object).take_value()});current=std::move(parent);
+    }
+    std::reverse(out.begin(),out.end());auto checked=owner->revalidate();if(!checked.value())return propagate<Chain>(checked);
+    return Observation<Chain>::available(std::move(out));
+}
+Observation<bool> validate_storage(const Chain& chain,PreparedJournalRoot& owner) {
+    auto checked=owner.revalidate();if(!checked.value())return checked;
+    for(const auto& node:chain) {
+        auto current=identity(node.handle.get(),true);if(!current.value())return propagate<bool>(current);
+        if(current.value()->id!=node.object.id)return reject<bool>("sync_session.storage_identity_changed");
+    }
+    return owner.revalidate();
+}
 bool contains(const Chain& c,const SyncDigest& id) {
     return std::any_of(c.begin(),c.end(),[&](const auto& n){return n.object.id==id;});
 }
@@ -509,22 +558,51 @@ bool contains(const Chain& c,const SyncDigest& id) {
 // locks. A dedicated owner thread permits moving/destroying sessions on any
 // caller thread, and abandoned mutex acquisition is safe under journal recovery.
 class Lease {
+    PreparedJournalRoot::Pointer owner_;
     Handle release_{CreateEventW(nullptr,TRUE,FALSE,nullptr)};
     std::thread worker_;
+    std::atomic<bool> stopping_{false};
+    std::atomic<DWORD> failure_{0};
+    const char* operation_="sync_session.volume_lock_finish";
+    void remember(DWORD code,const char* operation) noexcept {
+        DWORD expected=0;
+        if(code&&failure_.compare_exchange_strong(expected,code)) {
+            operation_=operation;
+            if(owner_)detail::record_prepared_journal_consumer_failure(*owner_,ObservationState::Failed,ErrorDomain::Win32,code,operation);
+        }
+    }
 public:
-    ~Lease() { if(worker_.joinable()) { SetEvent(release_.get()); worker_.join(); } }
+    explicit Lease(PreparedJournalRoot::Pointer owner):owner_(std::move(owner)) {}
+    ~Lease() {try{(void)finish();}catch(...){remember(ERROR_GEN_FAILURE,"sync_session.lock_thread_join");if(worker_.joinable())std::terminate();}}
+    DWORD finish() {
+        stopping_.store(true);
+        if(release_&&!SetEvent(release_.get()))remember(GetLastError(),"sync_session.lock_event_signal");
+        if(worker_.joinable())worker_.join();
+        const auto event=release_.release();
+        if(event&&event!=INVALID_HANDLE_VALUE&&!CloseHandle(event))remember(GetLastError(),"sync_session.lock_event_close");
+        return failure_.load();
+    }
+    const char* finish_operation() const noexcept {return operation_;}
     Observation<bool> acquire(const SyncDigest& volume) {
         if(!release_) return fail<bool>(GetLastError(),"sync_session.lock_event");
         std::promise<DWORD> ready; auto future=ready.get_future();
         worker_=std::thread([this,name=L"Global\\ck-core-fs-sync-volume-v1-"+hex(volume),ready=std::move(ready)]() mutable {
             Handle mutex(CreateMutexW(nullptr,FALSE,name.c_str()));
             if(!mutex) { ready.set_value(GetLastError()); return; }
+            auto close=[&]{const auto raw=mutex.release();if(raw&&!CloseHandle(raw))remember(GetLastError(),"sync_session.volume_mutex_close");};
             const auto status=WaitForSingleObject(mutex.get(),0);
             if(status!=WAIT_OBJECT_0 && status!=WAIT_ABANDONED) {
-                ready.set_value(status==WAIT_TIMEOUT ? ERROR_LOCK_VIOLATION : GetLastError()); return;
+                ready.set_value(status==WAIT_TIMEOUT ? ERROR_LOCK_VIOLATION : GetLastError());close();return;
             }
             ready.set_value(ERROR_SUCCESS);
-            WaitForSingleObject(release_.get(),INFINITE); ReleaseMutex(mutex.get());
+            // The stop flag also drains if the wakeup event itself fails.
+            while(!stopping_.load()) {
+                const auto wait=WaitForSingleObject(release_.get(),20);
+                if(wait==WAIT_OBJECT_0)break;
+                if(wait!=WAIT_TIMEOUT){remember(wait==WAIT_FAILED?GetLastError():ERROR_GEN_FAILURE,"sync_session.lock_event_wait");break;}
+            }
+            if(!ReleaseMutex(mutex.get()))remember(GetLastError(),"sync_session.volume_unlock");
+            close();
         });
         const auto e=future.get(); if(e) return fail<bool>(e,"sync_session.volume_session_lock");
         return Observation<bool>::available(true);
@@ -539,17 +617,70 @@ std::optional<std::wstring> basename(std::string_view n) {
 }
 class WindowsBackend final:public SyncSessionBackend {
 public:
+    PreparedJournalRoot::Pointer owner; // outlives all duplicates and leases
     Chain store,left,right;
+    PreparedJournalRoot::Pointer storage_root() const noexcept override {return owner;}
     std::vector<std::unique_ptr<Lease>> leases;
-    Handle volume_flush;
+    // Set only by this provider's legacy address factory. An externally
+    // adopted shared root is NEVER finalized by a session consumer.
+    bool owns_root_lifecycle=false,root_finished=false;
+    bool closed=false;
+    DWORD close_error=0;
+    const char* close_operation="sync_session.directory_CloseHandle";
+    void close_native() noexcept {
+        if(closed)return;closed=true;
+        for(auto* chain:{&store,&left,&right})for(auto& node:*chain) {
+            const auto handle=node.handle.release();if(!handle||handle==INVALID_HANDLE_VALUE)continue;
+            if(!CloseHandle(handle)&&!close_error)close_error=GetLastError();
+            node.handle.get_deleter().owner.reset();
+            try {if(faults.before&&!faults.before(SyncSessionIo::NativeHandleClose)&&!close_error)close_error=ERROR_WRITE_FAULT;}
+            catch(...) {if(!close_error)close_error=ERROR_WRITE_FAULT;}
+        }
+        for(auto& lease:leases)try {
+            const auto code=lease->finish();if(code&&!close_error){close_error=code;close_operation=lease->finish_operation();}
+        }catch(...) {if(!close_error){close_error=ERROR_GEN_FAILURE;close_operation="sync_session.lock_thread_join";}}
+        leases.clear();
+        if(close_error&&owner)detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Failed,ErrorDomain::Win32,close_error,close_operation);
+    }
+    ~WindowsBackend() override {
+        close_native();
+        if(owns_root_lifecycle&&owner&&!root_finished)try{(void)finish_owned_root();}catch(...) {
+            detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"sync_session.root_finish_exception");
+        }
+    }
+    Observation<bool> finish_owned_root() {
+        if(!owns_root_lifecycle||root_finished)return Observation<bool>::available(true);
+        auto result=owner->finish_io();
+        if(result.value()) {
+            if(*result.value())root_finished=true;
+            else {
+                detail::record_prepared_journal_consumer_failure(*owner,ObservationState::Unknown,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"sync_session.root_finish_false");
+                return Observation<bool>::unavailable(ObservationState::Unknown,{ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"sync_session.root_finish_false"});
+            }
+        }
+        return result;
+    }
+    Observation<bool> finish_io() override {
+        close_native();
+        auto root=finish_owned_root();if(!root.value())return root;
+        detail::PreparedJournalConsumerFailure first;
+        if(owner&&detail::read_prepared_journal_consumer_failure(*owner,first))
+            return Observation<bool>::unavailable(first.state,{first.domain,first.code,first.operation.data()});
+        return close_error?fail<bool>(close_error,close_operation):Observation<bool>::available(true);
+    }
     SyncSessionFaults faults;
     const SyncDigest& left_identity() const noexcept override { return left.back().object.id; }
     const SyncDigest& right_identity() const noexcept override { return right.back().object.id; }
     std::intptr_t root_handle(bool r) const noexcept override {
-        return reinterpret_cast<std::intptr_t>((r?right:left).back().handle.get());
+        return closed?-1:reinterpret_cast<std::intptr_t>((r?right:left).back().handle.get());
     }
     Observation<bool> revalidate() override {
-        for(const auto* c:{&store,&left,&right}) { auto r=validate(*c); if(!r.value()) return r; }
+        if(closed)return reject<bool>("sync_session.finished");
+        auto held=validate_storage(store,*owner);if(!held.value())return held;
+        for(const auto* c:{&left,&right}) { auto r=validate(*c); if(!r.value()) return r; }
         return private_security(store.back().handle.get(),true);
     }
     Observation<bool> before(SyncSessionIo io) {
@@ -645,23 +776,33 @@ public:
     }
     Observation<bool> flush_directory() override {
         auto r=before(SyncSessionIo::ParentFlush); if(!r.value()) return r;
-        if(FlushFileBuffers(store.back().handle.get())) return Observation<bool>::available(true);
-        // Windows providers commonly refuse directory flush. A held native
-        // volume flush is stronger, but normally requires administrator access.
-        if(volume_flush && FlushFileBuffers(volume_flush.get())) return Observation<bool>::available(true);
-        return reject<bool>("sync_session.parent_durability_unavailable",ObservationState::Unsupported);
+        return owner->sync();
     }
 };
 }
 Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backend(
     const NativeAbsolutePath& coordinator,const NativeAbsolutePath& left,const NativeAbsolutePath& right,SyncSessionFaults faults) {
     using P=std::unique_ptr<SyncSessionBackend>;
+    auto initial=chain(coordinator,true);if(!initial.value())return propagate<P>(initial);
+    auto privacy=private_security(initial.value()->back().handle.get(),true);if(!privacy.value())return propagate<P>(privacy);
+    auto owner=acquire_native_sync_storage_root(coordinator);if(!owner.value())return propagate<P>(owner);
+    auto checked=validate(*initial.value());if(!checked.value())return propagate<P>(checked);
+    auto acquired=held_storage_chain(*owner.value());if(!acquired.value())return propagate<P>(acquired);
+    if(acquired.value()->back().object.id!=initial.value()->back().object.id)return reject<P>("sync_session.initial_storage_changed");
+    auto acquired_backend=open_native_sync_session_backend(std::move(owner).take_value(),left,right,std::move(faults));
+    if(acquired_backend.value())static_cast<WindowsBackend*>(acquired_backend.value()->get())->owns_root_lifecycle=true;
+    return acquired_backend;
+}
+Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backend(
+    PreparedJournalRoot::Pointer owner,const NativeAbsolutePath& left,const NativeAbsolutePath& right,SyncSessionFaults faults) {
+    using P=std::unique_ptr<SyncSessionBackend>;
     if(!faults.max_write_bytes || faults.max_write_bytes>1024*1024)
         return reject<P>("sync_session.write_limit",ObservationState::Failed);
-    auto s=chain(coordinator,true); if(!s.value()) return propagate<P>(s);
-    auto l=chain(left,false); if(!l.value()) return propagate<P>(l);
-    auto r=chain(right,false); if(!r.value()) return propagate<P>(r);
-    auto b=std::make_unique<WindowsBackend>(); b->store=std::move(s).take_value();
+    if(!owner)return reject<P>("sync_session.null_storage_owner",ObservationState::Failed);
+    auto s=held_storage_chain(owner); if(!s.value()) return propagate<P>(s);
+    auto l=chain(left,false,owner); if(!l.value()) return propagate<P>(l);
+    auto r=chain(right,false,owner); if(!r.value()) return propagate<P>(r);
+    auto b=std::make_unique<WindowsBackend>(); b->owner=std::move(owner); b->store=std::move(s).take_value();
     b->left=std::move(l).take_value(); b->right=std::move(r).take_value(); b->faults=std::move(faults);
     if(contains(b->left,b->right_identity()) || contains(b->right,b->left_identity()) ||
         contains(b->store,b->left_identity()) || contains(b->store,b->right_identity()))
@@ -669,17 +810,10 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     auto volumes=lease_scopes(b->left,b->right);
     std::sort(volumes.begin(),volumes.end()); volumes.erase(std::unique(volumes.begin(),volumes.end()),volumes.end());
     for(const auto& v:volumes) {
-        auto lease=std::make_unique<Lease>(); auto acquired=lease->acquire(v);
+        auto lease=std::make_unique<Lease>(b->owner); auto acquired=lease->acquire(v);
         if(!acquired.value()) return propagate<P>(acquired); b->leases.push_back(std::move(lease));
     }
     auto check=b->revalidate(); if(!check.value()) return propagate<P>(check);
-    // Probe parent durability without mutation. Never advertise an atomic-only
-    // rename as a durable commit when the platform refuses the required flush.
-    if(!FlushFileBuffers(b->store.back().handle.get())) {
-        b->volume_flush.reset(CreateFileW(b->store.back().object.volume_path.c_str(),GENERIC_READ|GENERIC_WRITE,
-            FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_FLAG_WRITE_THROUGH,nullptr));
-        if(b->volume_flush.get()==INVALID_HANDLE_VALUE) b->volume_flush.reset();
-    }
     check=b->flush_directory(); if(!check.value()) return propagate<P>(check);
     return Observation<P>::available(std::move(b));
 }

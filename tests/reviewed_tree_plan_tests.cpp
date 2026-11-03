@@ -4,6 +4,11 @@
 #include "native_filesystem.hpp"
 #include "private_journal_scope.hpp"
 #include "platform/journal_root_test_faults.hpp"
+#include "platform/prepared_journal_root_bridge.hpp"
+#include "metadata_semantic_digest.hpp"
+#include <atomic>
+#include <new>
+#include <cstring>
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -23,6 +28,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/xattr.h>
+#include <dlfcn.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -41,6 +48,61 @@ extern "C" int fsync(int fd) {
     }
     errno=saved;return static_cast<int>(::syscall(SYS_fsync,fd));
 }
+#endif
+namespace tree_capture_test {
+thread_local bool step=false,violation=false,arm_close=false,watch_close=false,oom_on_read=false,fail_alloc=false,oom_on_close=false,defer_debug_proxy=false;
+thread_local std::size_t reads=0,total_reads=0,chunk=0,close_faults=0,closed_views=0,skip_closes=0;
+thread_local std::stop_source* cancel=nullptr;
+#ifdef _WIN32
+FILE_ID_INFO target{};
+BOOL WINAPI read(HANDLE h,LPVOID data,DWORD n,LPDWORD copied,LPOVERLAPPED io){
+    using F=BOOL(WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED);
+    static const auto real=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"ReadFile"));
+    if(step){++reads;++total_reads;violation=violation||n>chunk;}
+    const auto result=real(h,data,n,copied,io);const auto e=GetLastError();
+    if(step&&oom_on_read){oom_on_read=false;fail_alloc=true;defer_debug_proxy=true;}
+    if(step&&cancel){auto* saved=cancel;cancel=nullptr;saved->request_stop();}SetLastError(e);return result;
+}
+BOOL WINAPI close(HANDLE h){using F=BOOL(WINAPI*)(HANDLE);static const auto real=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"CloseHandle"));
+    bool selected=false;if(step&&(arm_close||watch_close)&&total_reads){FILE_ID_INFO id{};selected=GetFileInformationByHandleEx(h,FileIdInfo,&id,sizeof(id))&&id.VolumeSerialNumber==target.VolumeSerialNumber&&!std::memcmp(&id.FileId,&target.FileId,sizeof(id.FileId));}
+    const auto result=real(h);const auto e=GetLastError();if(selected&&result){++closed_views;if(arm_close){if(skip_closes)--skip_closes;else{arm_close=false;++close_faults;if(oom_on_close)fail_alloc=true;SetLastError(ERROR_READ_FAULT);return FALSE;}}}SetLastError(e);return result;
+}
+#else
+dev_t device{};ino_t inode{};
+ssize_t read(int fd,void* data,size_t n,off_t off){using F=ssize_t(*)(int,void*,size_t,off_t);static const auto real=reinterpret_cast<F>(dlsym(RTLD_NEXT,"pread"));
+    if(step){++reads;++total_reads;violation=violation||n>chunk;}const auto result=real(fd,data,n,off);
+    if(step&&oom_on_read){oom_on_read=false;fail_alloc=true;defer_debug_proxy=true;}
+    if(step&&cancel){auto* saved=cancel;cancel=nullptr;saved->request_stop();}return result;
+}
+int close(int fd){using F=int(*)(int);static const auto real=reinterpret_cast<F>(dlsym(RTLD_NEXT,"close"));bool selected=false;
+    if(step&&(arm_close||watch_close)&&total_reads){struct stat st{};selected=!fstat(fd,&st)&&st.st_dev==device&&st.st_ino==inode;}
+    const auto result=real(fd);const auto e=errno;if(selected&&!result){++closed_views;if(arm_close){if(skip_closes)--skip_closes;else{arm_close=false;++close_faults;if(oom_on_close)fail_alloc=true;errno=EIO;return -1;}}}errno=e;return result;
+}
+#endif
+}
+void* operator new(std::size_t n){
+    bool inject=tree_capture_test::fail_alloc;
+#if defined(_MSC_VER) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL>0
+    // MSVC Debug string's noexcept default constructor allocates a proxy;
+    // failing that vendor allocation terminates rather than throwing to us.
+    // This fixture targets the next throwing APPLICATION allocation instead.
+    if(tree_capture_test::defer_debug_proxy&&n==sizeof(std::_Container_proxy))inject=false;
+#endif
+    if(inject){tree_capture_test::fail_alloc=false;tree_capture_test::defer_debug_proxy=false;throw std::bad_alloc();}
+    if(auto* p=std::malloc(n?n:1))return p;throw std::bad_alloc();
+}
+void operator delete(void* p)noexcept{std::free(p);}
+void* operator new[](std::size_t n){return ::operator new(n);}
+void operator delete[](void* p)noexcept{std::free(p);}
+#ifdef __cpp_sized_deallocation
+void operator delete(void* p,std::size_t)noexcept{std::free(p);}
+void operator delete[](void* p,std::size_t)noexcept{std::free(p);}
+#endif
+#ifdef _WIN32
+extern "C" {decltype(&ReadFile) __imp_ReadFile=&tree_capture_test::read;decltype(&CloseHandle) __imp_CloseHandle=&tree_capture_test::close;}
+#else
+extern "C" ssize_t pread(int fd,void* data,size_t n,off_t off){return tree_capture_test::read(fd,data,n,off);}
+extern "C" int close(int fd){return tree_capture_test::close(fd);}
 #endif
 using namespace ck::files;
 namespace {
@@ -848,8 +910,14 @@ void test_compare_acknowledges_descriptive_choices() {
     auto mutation_preference = take(job->assess_rules(std::span(&replace, 1), 0, 32));
     for (const auto& item : mutation_preference.items) {
         CHECK(item.action == ReviewedTreeAction::Report && !item.facts.retained_target_available);
-        if (item.facts.source_present && item.facts.destination_present)
-            CHECK(item.decision->state == ConflictRuleState::NeedsReview && item.decision->reason == ConflictRuleReason::RetentionUnavailable);
+        if (item.facts.source_present && item.facts.destination_present) {
+            CHECK(item.decision->state == ConflictRuleState::NeedsReview);
+            if(item.row.relation==ComparisonRelation::Unknown){
+                CHECK(item.decision->reason==ConflictRuleReason::UnqualifiedObjects);
+                CHECK(item.facts.source_metadata&&item.facts.destination_metadata);
+                CHECK(item.facts.source_metadata->state!=ComparisonDigestState::CompleteStable||item.facts.destination_metadata->state!=ComparisonDigestState::CompleteStable);
+            }else CHECK(item.decision->reason==ConflictRuleReason::RetentionUnavailable);
+        }
     }
     CHECK(!job->begin_execution(receipt).value()); // changed rules revoked it
     auto descriptive = take(job->review(std::span(&replace, 1)));
@@ -914,8 +982,249 @@ void test_exact_names_links_and_fifo() {
 }
 #endif
 }
+namespace {
+ReviewedTreeState bounded_advance(ReviewedTreePlanJob& job,std::size_t chunk,std::stop_token stop={}) {
+    tree_capture_test::reads=0;tree_capture_test::chunk=chunk;tree_capture_test::step=true;
+    ReviewedTreeState state;try{state=job.advance(stop);}catch(...){tree_capture_test::step=false;throw;}tree_capture_test::step=false;
+    CHECK(tree_capture_test::reads<=1);CHECK(!tree_capture_test::violation);return state;
+}
+void bounded_preview(ReviewedTreePlanJob& job,std::size_t chunk) {
+    for(unsigned i=0;i<500000&&job.state()==ReviewedTreeState::Inventory;++i)bounded_advance(job,chunk);
+    CHECK(job.state()==ReviewedTreeState::AwaitingReview);
+}
+void attribute(const std::filesystem::path& path,char value){
+#ifdef _WIN32
+    // Exact native ADS I/O; the manifest and hash must affect metadata facts.
+    FixtureHandle h{CreateFileW((extended(path)+L":native-stream:$DATA").c_str(),GENERIC_WRITE,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,CREATE_ALWAYS,FILE_FLAG_OPEN_REPARSE_POINT,nullptr)};
+    CHECK(h.value!=INVALID_HANDLE_VALUE);const std::string data(1537,value);DWORD copied=0;
+    CHECK(WriteFile(h.value,data.data(),DWORD(data.size()),&copied,nullptr)&&copied==data.size());h.close();
+#elif defined(__APPLE__)
+    CHECK(::setxattr(path.c_str(),"user.ck.reviewed-tree",&value,1,0,0)==0);
+#else
+    CHECK(::setxattr(path.c_str(),"user.ck.reviewed-tree",&value,1,0)==0);
+#endif
+}
+void match_times(const std::filesystem::path& source,const std::filesystem::path& dest){
+#ifdef _WIN32
+    FixtureHandle a{CreateFileW(extended(source).c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr)};
+    FixtureHandle b{CreateFileW(extended(dest).c_str(),FILE_WRITE_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr)};
+    FILE_BASIC_INFO info{};CHECK(a.value!=INVALID_HANDLE_VALUE&&b.value!=INVALID_HANDLE_VALUE);
+    CHECK(GetFileInformationByHandleEx(a.value,FileBasicInfo,&info,sizeof(info))&&SetFileInformationByHandle(b.value,FileBasicInfo,&info,sizeof(info)));a.close();b.close();
+#else
+    struct stat st{};CHECK(!::stat(source.c_str(),&st));
+#ifdef __APPLE__
+    timespec times[]{st.st_atimespec,st.st_mtimespec};
+#else
+    timespec times[]{st.st_atim,st.st_mtim};
+#endif
+    CHECK(!utimensat(AT_FDCWD,dest.c_str(),times,AT_SYMLINK_NOFOLLOW));
+#endif
+}
+void test_explicit_loss_main(){
+    Fixture f;write_file(f.path("s/a"),std::string(2049,'p'));write_file(f.path("d/a"),std::string(2049,'p'));
+    match_times(f.path("s/a"),f.path("d/a"));
+#ifdef _WIN32
+    FixtureHandle token;CHECK(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY|TOKEN_ADJUST_PRIVILEGES,&token.value));
+    TOKEN_PRIVILEGES disabled{},old{};disabled.PrivilegeCount=1;CHECK(LookupPrivilegeValueW(nullptr,L"SeSecurityPrivilege",&disabled.Privileges[0].Luid));
+    DWORD bytes=sizeof(old);CHECK(AdjustTokenPrivileges(token.value,FALSE,&disabled,sizeof(old),&old,&bytes));
+#endif
+    auto request=f.request(ComparisonProfile::Compare);request.copy_policy.metadata_scope=RegularMetadataScope::CompleteMetadataV1;
+    request.copy_policy.allow_unhandled_metadata_loss=true;request.digest_chunk_bytes=31;
+    auto job=take(ReviewedTreePlanJob::create(std::move(request)));tree_capture_test::total_reads=0;bounded_preview(*job,31);
+    const auto page=take(job->page(0,8));CHECK(page.items.size()==1);const auto& item=page.items.front();
+    CHECK(item.facts.source_metadata&&item.facts.destination_metadata);
+    CHECK(item.facts.source_metadata->state==ComparisonDigestState::Unknown&&item.facts.destination_metadata->state==ComparisonDigestState::Unknown);
+    CHECK(item.facts.source_metadata_failure&&item.facts.destination_metadata_failure);
+    CHECK(item.row.relation!=ComparisonRelation::Unknown);auto binding=take(job->native_binding(item.row.token));
+    CHECK(binding.source_digest&&binding.destination_digest&&binding.source_digest==binding.destination_digest);
+    CHECK(tree_capture_test::total_reads>=4*((2049+30)/31));binding={};
+    // Whole preexecution scan must use the same content producer. A changed
+    // main cannot pass merely because Complete metadata remains unavailable.
+    auto receipt=take(job->review({}));CHECK(take(job->begin_execution(receipt)));write_file(f.path("s/a"),std::string(2049,'x'),true);
+    for(unsigned i=0;i<500000&&job->state()<ReviewedTreeState::Complete;++i)bounded_advance(*job,31);
+    CHECK(job->state()==ReviewedTreeState::Failed&&job->progress().failure&&job->progress().failure->error.code==static_cast<std::int64_t>(AdapterError::PlanDecisionStale));
+    request=f.request(ComparisonProfile::Compare);request.copy_policy.metadata_scope=RegularMetadataScope::CompleteMetadataV1;
+    request.copy_policy.allow_unhandled_metadata_loss=false;request.digest_chunk_bytes=31;
+    job=take(ReviewedTreePlanJob::create(std::move(request)));bounded_preview(*job,31);
+    CHECK(take(job->page(0,8)).items.front().row.relation==ComparisonRelation::Unknown);
+    request=f.request(ComparisonProfile::Compare);request.copy_policy.metadata_scope=RegularMetadataScope::CompleteMetadataV1;
+    request.copy_policy.allow_unhandled_metadata_loss=true;request.digest_chunk_bytes=31;request.metadata_limits.max_logical_bytes=128;
+    job=take(ReviewedTreePlanJob::create(std::move(request)));tree_capture_test::total_reads=0;
+    for(unsigned i=0;i<2000&&job->state()<ReviewedTreeState::Complete;++i)bounded_advance(*job,31);
+    CHECK(job->state()==ReviewedTreeState::Failed&&tree_capture_test::total_reads==0);
+#ifdef _WIN32
+    CHECK(AdjustTokenPrivileges(token.value,FALSE,&old,0,nullptr,nullptr));token.close();
+#endif
+    std::printf("explicit-loss Complete unavailable: closed main-only proof, honest metadata Unknown, bounded two scans/preexecution and prehash cap PASS\n");
+}
+void test_progressive_metadata(){
+    Fixture f;write_file(f.path("s/a"),std::string(2049,'p'));write_file(f.path("d/a"),std::string(2049,'p'));
+    attribute(f.path("s/a"),'a');attribute(f.path("d/a"),'b');match_times(f.path("s/a"),f.path("d/a"));
+    auto request=f.request(ComparisonProfile::Compare);request.copy_policy.allow_unhandled_metadata_loss=false;
+    request.digest_chunk_bytes=31;auto job=take(ReviewedTreePlanJob::create(std::move(request)));bounded_preview(*job,31);
+    auto page=take(job->page(0,8));CHECK(page.items.size()==1);const auto& facts=page.items[0].facts;
+    CHECK(facts.source_metadata&&facts.destination_metadata);
+    CHECK(facts.source_metadata->state==ComparisonDigestState::CompleteStable);
+    CHECK(facts.source_metadata->ownership==ComparisonMetadataOwnership::CurrentCaller&&facts.source_metadata->canonical_owner_digest);
+    CHECK((facts.source_metadata->schema!=std::array<std::byte,32>{}));
+    CHECK(facts.source_metadata->policy_binding==facts.destination_metadata->policy_binding);
+    CHECK(facts.source_metadata->bytes!=facts.destination_metadata->bytes);
+    CHECK(page.items[0].row.relation==ComparisonRelation::MetadataDifferent);
+    auto binding=take(job->native_binding(page.items[0].row.token));CHECK(binding.source_digest==binding.destination_digest);
+    binding={};auto receipt=take(job->review({}));CHECK(take(job->begin_execution(receipt)));
+    // Whole-tree preexecution revalidation must include xattr/ADS bytes.
+    attribute(f.path("s/a"),'c');match_times(f.path("d/a"),f.path("s/a"));
+    for(unsigned i=0;i<500000&&job->state()<ReviewedTreeState::Complete;++i)bounded_advance(*job,31);
+    CHECK(job->state()==ReviewedTreeState::Failed);CHECK(job->progress().failure);
+    CHECK(job->progress().failure->error.code==static_cast<std::int64_t>(AdapterError::PlanDecisionStale));
+    CHECK(!job->native_binding(page.items[0].row.token).value());
+    // Required Complete coverage unavailable on POSIX is honest typed unknown.
+#ifndef _WIN32
+    request=f.request(ComparisonProfile::Compare);request.copy_policy.allow_unhandled_metadata_loss=false;
+    request.copy_policy.metadata_scope=RegularMetadataScope::CompleteMetadataV1;request.digest_chunk_bytes=29;
+    job=take(ReviewedTreePlanJob::create(std::move(request)));bounded_preview(*job,29);page=take(job->page(0,8));
+    CHECK(page.items[0].facts.source_metadata->state!=ComparisonDigestState::CompleteStable);
+    CHECK(page.items[0].facts.source_metadata_failure&&page.items[0].facts.source_metadata_failure->state==ObservationState::Unsupported);
+    CHECK(page.items[0].row.relation==ComparisonRelation::Unknown&&page.items[0].action==ReviewedTreeAction::Report);
+#endif
+    // A requested all-stream logical cap is admitted before any content read.
+    request=f.request(ComparisonProfile::Compare);request.copy_policy.allow_unhandled_metadata_loss=false;
+    request.digest_chunk_bytes=31;
+#ifdef _WIN32
+    request.metadata_limits.max_logical_bytes=2113; // Main fits; main+ADS does not.
+#else
+    request.metadata_limits.max_logical_bytes=128;
+#endif
+    job=take(ReviewedTreePlanJob::create(std::move(request)));tree_capture_test::total_reads=0;
+    for(unsigned i=0;i<2000&&job->state()<ReviewedTreeState::Complete;++i)bounded_advance(*job,31);
+    CHECK(job->state()==ReviewedTreeState::Failed);CHECK(tree_capture_test::total_reads==0);
+    // Cancellation drains capture owners, including a stop during native read.
+    request=f.request(ComparisonProfile::Compare);request.copy_policy.allow_unhandled_metadata_loss=false;request.digest_chunk_bytes=31;
+    std::weak_ptr<const HeldChild> source_root=request.source_root,destination_root=request.destination_root;
+    job=take(ReviewedTreePlanJob::create(std::move(request)));std::stop_source cancel;tree_capture_test::cancel=&cancel;
+    for(unsigned i=0;i<2000&&job->state()<ReviewedTreeState::Complete;++i)bounded_advance(*job,31,cancel.get_token());
+    tree_capture_test::cancel=nullptr;CHECK(job->state()==ReviewedTreeState::Cancelled);
+    CHECK(source_root.expired()&&destination_root.expired());
+    std::printf("progressive Scanner source facts, bounded reads, V3/current owner, metadata/ADS revalidation, unknown coverage, budgets and terminal drain PASS\n");
+}
+void select_close_target(const std::filesystem::path& path){
+#ifdef _WIN32
+    HANDLE h=CreateFileW(extended(path).c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    CHECK(h!=INVALID_HANDLE_VALUE&&GetFileInformationByHandleEx(h,FileIdInfo,&tree_capture_test::target,sizeof(tree_capture_test::target)));CHECK(CloseHandle(h));
+#else
+    struct stat st{};CHECK(!::stat(path.c_str(),&st));tree_capture_test::device=st.st_dev;tree_capture_test::inode=st.st_ino;
+#endif
+}
+void test_progressive_exception(){
+    Fixture f;write_file(f.path("s/a"),std::string(2049,'p'));auto request=f.request();request.copy_policy.allow_unhandled_metadata_loss=false;request.digest_chunk_bytes=31;
+    auto root=take(acquire_native_journal_root(*request.journal_root));request.prepared_journal_root=root;
+    std::weak_ptr<const HeldChild> source_root=request.source_root,destination_root=request.destination_root;
+    auto job=take(ReviewedTreePlanJob::create(std::move(request)));select_close_target(f.path("s/a"));
+    tree_capture_test::closed_views=0;tree_capture_test::total_reads=0;tree_capture_test::watch_close=true;tree_capture_test::oom_on_read=true;bool threw=false;
+    try{for(unsigned i=0;i<10000&&job->state()<ReviewedTreeState::Complete;++i)bounded_advance(*job,31);}catch(const std::bad_alloc&){threw=true;}
+    tree_capture_test::watch_close=false;tree_capture_test::fail_alloc=false;tree_capture_test::defer_debug_proxy=false;tree_capture_test::oom_on_read=false;
+    CHECK(threw);CHECK(tree_capture_test::closed_views>0);CHECK(source_root.expired()&&destination_root.expired());
+    CHECK(job->state()==ReviewedTreeState::Failed);CHECK(take(root->finish_io()));
+    std::printf("progressive Scanner allocation exception after actual native read explicitly drains source owners PASS\n");
+}
+void test_original_scan_close(bool oom=false){
+    Fixture f;write_file(f.path("s/a"),std::string(2049,'p'));auto request=f.request();request.copy_policy.allow_unhandled_metadata_loss=false;request.digest_chunk_bytes=31;
+    auto root=take(acquire_native_journal_root(*request.journal_root));request.prepared_journal_root=root;
+    std::weak_ptr<const HeldChild> source_root=request.source_root,destination_root=request.destination_root;
+    auto job=take(ReviewedTreePlanJob::create(std::move(request)));select_close_target(f.path("s/a"));
+    tree_capture_test::total_reads=0;
+    for(unsigned i=0;i<10000&&!tree_capture_test::total_reads&&job->state()==ReviewedTreeState::Inventory;++i)bounded_advance(*job,31);
+    CHECK(tree_capture_test::total_reads>0&&job->state()==ReviewedTreeState::Inventory);
+    tree_capture_test::closed_views=0;tree_capture_test::close_faults=0;tree_capture_test::skip_closes=1;tree_capture_test::arm_close=true;
+    std::stop_source stop;stop.request_stop();tree_capture_test::oom_on_close=oom;bool threw=false;
+    try{bounded_advance(*job,31,stop.get_token());}catch(const std::bad_alloc&){threw=true;}
+    tree_capture_test::arm_close=false;tree_capture_test::oom_on_close=false;tree_capture_test::fail_alloc=false;CHECK(threw==oom);
+    CHECK(tree_capture_test::close_faults==1&&tree_capture_test::closed_views>=2);CHECK(job->state()==ReviewedTreeState::NeedsReconciliation);
+    CHECK(source_root.expired()&&destination_root.expired());detail::PreparedJournalConsumerFailure failure;
+    CHECK(detail::read_prepared_journal_consumer_failure(*root,failure));
+#ifdef _WIN32
+    CHECK(failure.domain==ErrorDomain::Win32&&failure.code==ERROR_READ_FAULT);
+    CHECK(std::string_view(failure.operation.data())=="metadata_capture.temporary_CloseHandle");
+#else
+    CHECK(failure.domain==ErrorDomain::Posix&&failure.code==EIO);
+    CHECK(std::string_view(failure.operation.data())=="metadata_capture.temporary_close");
+#endif
+    CHECK(job->progress().failure&&job->progress().failure->error.code==failure.code);
+    CHECK(!root->finish_io().value());
+    std::printf("original Scanner HeldChild close after successful capture-duplicate close reaches borrowed Root before cached terminal PASS\n");
+}
+#ifdef _WIN32
+void test_reviewed_metadata_capture_binding(){
+    Fixture f;write_file(f.path("s/a"),std::string(2049,'p'));write_file(f.path("shadow"),"times");
+    attribute(f.path("s/a"),'a');match_times(f.path("s/a"),f.path("shadow"));
+    auto request=f.request();request.copy_policy.allow_unhandled_metadata_loss=false;request.digest_chunk_bytes=31;
+    auto job=take(ReviewedTreePlanJob::create(std::move(request)));bounded_preview(*job,31);
+    CHECK(take(job->begin_execution(take(job->review({})))));
+    for(unsigned i=0;i<10000&&job->state()==ReviewedTreeState::Revalidating;++i)bounded_advance(*job,31);
+    CHECK(job->state()==ReviewedTreeState::Executing);
+    attribute(f.path("s/a"),'b');match_times(f.path("shadow"),f.path("s/a"));
+    job->advance();CHECK(job->state()==ReviewedTreeState::Failed);CHECK(!f.exists("d/a"));
+    CHECK(job->progress().failure&&job->progress().failure->error.operation=="reviewed_tree.source_metadata_capture_changed");
+    std::printf("post-revalidation ADS mutation with restored Basic times cannot supersede reviewed metadata before journal/staging effects PASS\n");
+}
+#endif
+void test_loss_root_close(){
+    Fixture f;write_file(f.path("s/a"),std::string(2049,'p'));auto request=f.request();
+    request.copy_policy.allow_unhandled_metadata_loss=true;request.copy_policy.metadata_scope=RegularMetadataScope::CompleteMetadataV1;request.digest_chunk_bytes=31;
+#ifdef _WIN32
+    FixtureHandle token;CHECK(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY|TOKEN_ADJUST_PRIVILEGES,&token.value));
+    TOKEN_PRIVILEGES disabled{},old{};disabled.PrivilegeCount=1;CHECK(LookupPrivilegeValueW(nullptr,L"SeSecurityPrivilege",&disabled.Privileges[0].Luid));
+    DWORD bytes=sizeof(old);CHECK(AdjustTokenPrivileges(token.value,FALSE,&disabled,sizeof(old),&old,&bytes));
+#endif
+    auto root=take(acquire_native_journal_root(*request.journal_root));request.prepared_journal_root=root;
+    std::weak_ptr<const HeldChild> source_root=request.source_root,destination_root=request.destination_root;
+    auto job=take(ReviewedTreePlanJob::create(std::move(request)));select_close_target(f.path("s/a"));tree_capture_test::total_reads=0;
+    for(unsigned i=0;i<10000&&!tree_capture_test::total_reads&&job->state()==ReviewedTreeState::Inventory;++i)bounded_advance(*job,31);
+    CHECK(tree_capture_test::total_reads>0&&job->state()==ReviewedTreeState::Inventory);
+    tree_capture_test::closed_views=0;tree_capture_test::close_faults=0;tree_capture_test::skip_closes=0;tree_capture_test::arm_close=true;tree_capture_test::watch_close=true;
+    std::stop_source stop;stop.request_stop();bounded_advance(*job,31,stop.get_token());tree_capture_test::arm_close=false;tree_capture_test::watch_close=false;
+    CHECK(tree_capture_test::close_faults==1&&tree_capture_test::closed_views>=2);CHECK(job->state()==ReviewedTreeState::NeedsReconciliation);
+    CHECK(source_root.expired()&&destination_root.expired());
+    detail::PreparedJournalConsumerFailure failure;CHECK(detail::read_prepared_journal_consumer_failure(*root,failure));
+#ifdef _WIN32
+    CHECK(failure.domain==ErrorDomain::Win32&&failure.code==ERROR_READ_FAULT);
+    CHECK(AdjustTokenPrivileges(token.value,FALSE,&old,0,nullptr,nullptr));token.close();
+#else
+    CHECK(failure.domain==ErrorDomain::Posix&&failure.code==EIO);
+#endif
+    CHECK(job->progress().failure&&job->progress().failure->error.code==failure.code);CHECK(!root->finish_io().value());
+    std::printf("explicit-loss Scanner cancel drains native content clone/original inputs and preserves genuine borrowed Root first close failure PASS\n");
+}
+void test_progressive_root_close(){
+    Fixture f;write_file(f.path("s/a"),std::string(2049,'p'));
+    auto request=f.request();request.copy_policy.allow_unhandled_metadata_loss=false;request.digest_chunk_bytes=31;
+    auto root=take(acquire_native_journal_root(*request.journal_root));request.prepared_journal_root=root;
+    auto job=take(ReviewedTreePlanJob::create(std::move(request)));
+    select_close_target(f.path("s/a"));
+    tree_capture_test::total_reads=0;tree_capture_test::close_faults=0;tree_capture_test::arm_close=true;
+    for(unsigned i=0;i<10000&&job->state()<ReviewedTreeState::Complete;++i)bounded_advance(*job,31);
+    tree_capture_test::arm_close=false;CHECK(tree_capture_test::close_faults==1);CHECK(job->state()==ReviewedTreeState::NeedsReconciliation);
+    detail::PreparedJournalConsumerFailure failure;CHECK(detail::read_prepared_journal_consumer_failure(*root,failure));
+#ifdef _WIN32
+    CHECK(failure.domain==ErrorDomain::Win32&&failure.code==ERROR_READ_FAULT);
+#else
+    CHECK(failure.domain==ErrorDomain::Posix&&failure.code==EIO);
+#endif
+    CHECK(!root->revalidate().value());CHECK(!root->finish_io().value());
+    std::printf("progressive Scanner actual consumed-close error reaches genuine Root first-error latch PASS\n");
+}
+}
 int main(int argc, char** argv) {
     try {
+        if(argc==2&&std::string_view(argv[1])=="--loss-main") {test_explicit_loss_main();test_loss_root_close();std::printf("explicit loss Scanner: %u checks passed\n",checks);return 0;}
+        if(argc==2&&std::string_view(argv[1])=="--progressive-metadata") {
+            test_progressive_metadata();test_progressive_root_close();test_original_scan_close();test_original_scan_close(true);test_progressive_exception();
+#ifdef _WIN32
+            test_reviewed_metadata_capture_binding();
+#endif
+            std::printf("reviewed_tree progressive metadata: %u checks passed\n",checks);return 0;
+        }
         if(argc==2&&std::string_view(argv[1])=="--changed-receipts-only") {
             test_changed_receipts();
             std::printf("reviewed_tree_plan stale receipts: %u checks passed\n",checks);return 0;

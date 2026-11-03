@@ -24,6 +24,8 @@ static_assert(static_cast<unsigned>(ObjectKind::Other) == CKFSP_OTHER);
 static_assert(static_cast<unsigned>(ComparisonReason::SameObject) == CKFSP_REASON_SAME_OBJECT);
 static_assert(static_cast<unsigned>(ComparisonAction::RemoveDestinationDirectory) == CKFSP_ACTION_REMOVE_EMPTY_DIRECTORY);
 static_assert(static_cast<unsigned>(ComparisonRelation::Protected) == CKFSP_REL_PROTECTED);
+static_assert(static_cast<unsigned>(ComparisonRelation::MetadataDifferent) == CKFSP_REL_METADATA_DIFFERENT);
+static_assert(static_cast<unsigned>(ComparisonReason::DirectoryMetadataUnsupported) == CKFSP_REASON_DIRECTORY_METADATA_UNSUPPORTED);
 
 void require(bool condition) { if (!condition) throw std::invalid_argument("invalid preview input"); }
 bool boolean(std::uint32_t v) noexcept { return v <= 1; }

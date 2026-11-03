@@ -77,6 +77,16 @@ The regular source closure's three-file manifest is
 (fixture). The explicit-loss producer/Scanner frozen manifest is
 `0da17b28cc220a63b24a27cbfa3e7186fe6a5b80e27e336572b65f54dbdcfcce`.
 
+A subsequent coherent 411-file macOS component snapshot has manifest
+`b48cac6c7c5b0cdceeddde41e2a193f0486a35d2786e6224df4547da71b00466`.
+Its clean 120-step build completed in 306.20s with one compiler, `-O1 -g0`,
+and no compiler cache. All six selected tests passed in 2.63s: main-content
+producer, regular execution source, directory workers, metadata capture,
+progressive metadata Scanner, and explicit-loss Scanner. The snapshot uses
+directory worker v1; the subsequently integrated v3 values cache has separate
+native evidence (3,238 macOS checks and 11,173 each on NTFS/ReFS). Neither
+result establishes whole Tree composition or matching sanitizer qualification.
+
 The later coherent Windows and macOS integration runs still fail Tree receipt
 validation after publication. Passing source and metadata components therefore
 do not establish receipt-bound execution completion. The Linux mount candidate

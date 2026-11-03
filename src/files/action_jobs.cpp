@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "action_jobs.hpp"
 #include "directory_name_rules.hpp"
+#include "prepared_journal_root.hpp"
+#include "platform/prepared_journal_root_bridge.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -88,8 +90,10 @@ ActionJob::ActionJob(ActionRequest request, std::shared_ptr<const ActionNativeBo
         throw std::invalid_argument("invalid action bounds");
     results_.resize(count);
     journal_affected_.assign(count,false);
+    trash_finish_attempted_.assign(count,false);
     if(!request_.open_journal) request_.open_journal=[](const NativeAbsolutePath& p,const NativeName& n,bool create){return open_native_operation_journal_file(p,n,create);};
     trash_transactions_.resize(count); trash_receipts_.resize(count);
+    scope_guards_.resize(count);
     // Every item has at most preview + intent + result + two retries.
     events_.reserve(count * 8);
     dependencies_.assign(count, -1);
@@ -109,7 +113,13 @@ ActionJob::ActionJob(ActionRequest request, std::shared_ptr<const ActionNativeBo
 }
 void ActionJob::start() {
     auto self = shared_from_this();
-    std::thread([self=std::move(self)] { self->run(); }).detach();
+    std::thread worker([self=std::move(self)] { self->run(); });
+    try { worker.detach(); }
+    catch (...) {
+        cancel();
+        if (worker.joinable()) worker.join();
+        throw;
+    }
 }
 ckfea_summary ActionJob::summary() const {
     std::lock_guard lock(mutex_);
@@ -176,6 +186,7 @@ void ActionJob::event(size_t i, uint32_t kind) {
 }
 bool ActionJob::revalidate(size_t i) {
     if (cancelled()) { set(i, CKFEA_ITEM_CANCELLED); return false; }
+    if (!check_private_scope(i)) return false;
     const auto& s = request_.items[i].source;
     const auto* parent_id = s->parent_identity().value();
     const auto* source_id = s->metadata().identity.value();
@@ -273,7 +284,7 @@ void ActionJob::preview_rename() {
             else set(i,CKFEA_UNSUPPORTED);
             if (row(i).state==CKFEA_UNSUPPORTED) set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_SOURCE_NOT_BOUND);
         }
-        else if (!request_.journal_directory || !request_.journal_name)
+        else if ((!request_.prepared_journal_root&&!request_.journal_directory) || !request_.journal_name)
             set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_JOURNAL_REQUIRED);
     }
     // Native lookup proves distinctness when at least one target already exists.
@@ -289,7 +300,93 @@ void ActionJob::preview_rename() {
         } else if (!*distinct.value()) { set(i,CKFEA_COLLISION); set(j,CKFEA_COLLISION); }
     }
 }
+bool ActionJob::initialize_private_root() {
+    if(model_boundary_) {
+        // Native cursors always expose a native adapter namespace. The model
+        // entry point cannot consume one, even if a test policy mistakenly
+        // accepts it. A real prepared Root is never a model input either.
+        bool model_inputs=!request_.prepared_journal_root;
+        for(const auto& item:request_.items)if(item.source) {
+            const auto scope=item.source->parent()->source_scope();
+            model_inputs=model_inputs&&!scope.value()&&scope.state()==ObservationState::Unsupported;
+        }
+        if(request_.recovery_destination) {
+            const auto scope=request_.recovery_destination->source_scope();
+            model_inputs=model_inputs&&!scope.value()&&scope.state()==ObservationState::Unsupported;
+        }
+        if(!model_inputs) {
+            for(size_t i=0;i<results_.size();++i){set(i,CKFEA_UNSUPPORTED);event(i,CKFEA_EVIDENCE_PREVIEW);}
+            return false;
+        }
+        auto checked=model_boundary_->check_request(request_);
+        if(checked.value()&&*checked.value())return true;
+        for(size_t i=0;i<results_.size();++i) {
+            if(!checked.value())unavailable(i,*checked.unavailable_detail());else set(i,CKFEA_UNSUPPORTED);
+            event(i,CKFEA_EVIDENCE_PREVIEW);
+        }
+        return false;
+    }
+    if(request_.operation==CKFEA_VERIFY_RECOVERY)return true; // Read-only inspection.
+    if(!request_.prepared_journal_root&&request_.journal_directory) {
+        // Initial worker navigation only. Every subsequent journal open uses
+        // this retained owner, including legacy pathname callers.
+        auto acquired=acquire_native_journal_root(*request_.journal_directory,stop_.get_token());
+        if(!acquired.value()) {
+            for(size_t i=0;i<results_.size();++i) {
+                unavailable(i,*acquired.unavailable_detail());event(i,CKFEA_EVIDENCE_PREVIEW);
+            }
+            return false;
+        }
+        request_.prepared_journal_root=std::move(acquired).take_value();owns_private_root_=true;
+    }
+    if(request_.prepared_journal_root) {
+        // A prepared capability is checked on this worker before any backend
+        // preview, including Trash's possible native-bin provisioning.
+        const auto valid=request_.prepared_journal_root->revalidate();
+        if(!valid.value()||!*valid.value()) {
+            for(size_t i=0;i<results_.size();++i) {
+                if(!valid.value())unavailable(i,*valid.unavailable_detail());
+                else unavailable(i,{ObservationState::Changed,{ErrorDomain::Adapter,
+                    static_cast<int64_t>(AdapterError::PlanDecisionStale),"actions.prepared_journal_root"}});
+                event(i,CKFEA_EVIDENCE_PREVIEW);
+            }
+            return false;
+        }
+        request_.open_journal=[root=request_.prepared_journal_root](const NativeAbsolutePath&,const NativeName& name,bool create) {
+            return root->open_journal(name,create);
+        };
+    }
+    return true;
+}
+bool ActionJob::check_private_scope(size_t i) {
+    if(model_boundary_) {
+        const auto checked=model_boundary_->check_source(*request_.items[i].source);
+        if(checked.value()&&*checked.value())return true;
+        if(!checked.value())unavailable(i,*checked.unavailable_detail());else set(i,CKFEA_UNSUPPORTED);
+        return false;
+    }
+    if(!request_.prepared_journal_root) {
+        set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_JOURNAL_REQUIRED);return false;
+    }
+    if(!scope_guards_[i]) {
+        auto guarded=JournalScopeGuard::create_for_entry(request_.prepared_journal_root,
+            *request_.items[i].source,stop_.get_token());
+        if(!guarded.value()) {unavailable(i,*guarded.unavailable_detail());return false;}
+        scope_guards_[i]=std::move(guarded).take_value();
+    }
+    auto root=scope_guards_[i]->check_root(stop_.get_token());
+    if(!root.value()) {unavailable(i,*root.unavailable_detail());return false;}
+    auto entry=scope_guards_[i]->check_entry(*request_.items[i].source,stop_.get_token());
+    if(!entry.value()) {unavailable(i,*entry.unavailable_detail());return false;}
+    if(!*root.value()||!*entry.value()) {set(i,CKFEA_REVIEW_REQUIRED);return false;}
+    return true;
+}
+Observation<std::unique_ptr<OperationJournalFile>> ActionJob::open_action_journal() {
+    if(request_.prepared_journal_root)return request_.prepared_journal_root->open_journal(*request_.journal_name,true);
+    return request_.open_journal(*request_.journal_directory,*request_.journal_name,true);
+}
 void ActionJob::preview() {
+    if(!initialize_private_root())return;
     if (request_.operation==CKFEA_RENAME) preview_rename();
     else if (request_.operation==CKFEA_VERIFY_RECOVERY) {
         if (!request_.recovery || !request_.recovery_destination ||
@@ -331,7 +428,7 @@ void ActionJob::preview_trash() {
         if(cancelled()) { set(i,CKFEA_ITEM_CANCELLED); continue; }
         if(!(request_.capabilities&capability)) { set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_CAPABILITY_REQUIRED); continue; }
         if(restore&&request_.restore_items.empty()) { set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_NATIVE_RECEIPT_UNAVAILABLE); continue; }
-        if(!request_.journal_directory||!request_.journal_name) { set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_JOURNAL_REQUIRED); continue; }
+        if((!request_.prepared_journal_root&&!request_.journal_directory)||!request_.journal_name) { set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_JOURNAL_REQUIRED); continue; }
         if(!restore) {
             bool duplicate=false;
             for(size_t j=0;j<request_.items.size();++j) if(i!=j) {
@@ -341,19 +438,24 @@ void ActionJob::preview_trash() {
             }
             if(duplicate) { set(i,CKFEA_COLLISION); continue; }
             if(!revalidate(i)) continue;
-        } else {
+        }
+        if(restore) {
             const auto& input=request_.restore_items[i]; bool duplicate=false;
             for(size_t j=0;j<request_.restore_items.size();++j)
                 if(i!=j&&input.receipt->object==request_.restore_items[j].receipt->object&&
                     input.receipt->original_parent==request_.restore_items[j].receipt->original_parent) duplicate=true;
             if(duplicate) { set(i,CKFEA_COLLISION); continue; }
         }
-        auto prepared=restore ? trash_backend_->prepare_restore(*request_.restore_items[i].receipt,request_.restore_items[i].original_parent,stop_.get_token()) :
-            trash_backend_->prepare_trash(request_.items[i].source,stop_.get_token());
+        auto prepared=model_boundary_ ? (restore ? trash_backend_->prepare_restore(*request_.restore_items[i].receipt,
+            request_.restore_items[i].original_parent,stop_.get_token()):trash_backend_->prepare_trash(request_.items[i].source,stop_.get_token())) :
+            (restore ? trash_backend_->prepare_restore_scoped(*request_.restore_items[i].receipt,
+                request_.restore_items[i].original_parent,request_.prepared_journal_root,stop_.get_token()) :
+                trash_backend_->prepare_trash_scoped(request_.items[i].source,request_.prepared_journal_root,stop_.get_token()));
         if(!prepared.value()) { unavailable(i,*prepared.unavailable_detail());
             if(row(i).state==CKFEA_UNSUPPORTED) set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_SOURCE_NOT_BOUND); continue; }
         trash_transactions_[i]=std::move(prepared).take_value();
         if(!trash_transactions_[i]) { set(i,CKFEA_REVIEW_REQUIRED); continue; }
+        if(!revalidate_trash_scope(i))continue;
         if(restore) {
             const auto& r=trash_transactions_[i]->receipt();
             auto copy_id=[](const NativeDurableIdentity& id) { ckfea_identity c{}; c.scheme=static_cast<uint32_t>(id.scheme);
@@ -364,10 +466,23 @@ void ActionJob::preview_trash() {
         set(i,CKFEA_READY);
     }
 }
+bool ActionJob::revalidate_trash_scope(size_t i) {
+    if(cancelled()){set(i,CKFEA_ITEM_CANCELLED);return false;}
+    if(model_boundary_) {
+        if(request_.operation==CKFEA_RESTORE){set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_NATIVE_RECEIPT_UNAVAILABLE);return false;}
+        return check_private_scope(i);
+    }
+    const auto valid=trash_transactions_[i]->revalidate_private_scope(stop_.get_token());
+    if(!valid.value()){unavailable(i,*valid.unavailable_detail(),trash_transactions_[i]->mutation_attempted());return false;}
+    if(!*valid.value()){set(i,CKFEA_REVIEW_REQUIRED);return false;}
+    return true;
+}
 void ActionJob::perform_trash() {
+    for(size_t i=0;i<results_.size();++i)if(row(i).state==CKFEA_READY)
+        if((request_.operation==CKFEA_TRASH&&!revalidate(i))||!revalidate_trash_scope(i))event(i,CKFEA_EVIDENCE_RESULT);
     bool any=false; for(size_t i=0;i<results_.size();++i) any|=row(i).state==CKFEA_READY;
     if(!any) return;
-    auto file=request_.open_journal(*request_.journal_directory,*request_.journal_name,true);
+    auto file=open_action_journal();
     if(!file.value()) {
         for(size_t i=0;i<results_.size();++i) if(row(i).state==CKFEA_READY) {
             unavailable(i,*file.unavailable_detail());event(i,CKFEA_EVIDENCE_RESULT);
@@ -381,6 +496,8 @@ void ActionJob::perform_trash() {
     for(size_t i=0;i<results_.size();++i) {
         if(row(i).state!=CKFEA_READY) continue;
         if(cancelled()) { set(i,CKFEA_ITEM_CANCELLED);event(i,CKFEA_EVIDENCE_RESULT);continue; }
+        if(request_.operation==CKFEA_TRASH&&!revalidate(i)) {event(i,CKFEA_EVIDENCE_RESULT);continue;}
+        if(!revalidate_trash_scope(i)){event(i,CKFEA_EVIDENCE_RESULT);continue;}
         event(i,CKFEA_EVIDENCE_INTENT);
         { std::lock_guard lock(mutex_);results_[i].state=CKFEA_EXECUTING;results_[i].attempts=1; }
         const NativeTrashJournal append=[&](OperationJournalState state,const NativeTrashReceipt& receipt) {
@@ -446,9 +563,10 @@ void ActionJob::perform() {
         event(0,CKFEA_EVIDENCE_RESULT); return;
     }
     bool any=false;
+    for(auto i:order_)if(row(i).state==CKFEA_READY&&!revalidate(i))event(i,CKFEA_EVIDENCE_RESULT);
     for (auto i:order_) any |= row(i).state==CKFEA_READY;
     if (!any) return;
-    auto file=request_.open_journal(*request_.journal_directory,*request_.journal_name,true);
+    auto file=open_action_journal();
     if (!file.value()) {
         for (auto i:order_) if (row(i).state==CKFEA_READY) { unavailable(i,*file.unavailable_detail()); event(i,CKFEA_EVIDENCE_RESULT); }
         return;
@@ -519,7 +637,9 @@ void ActionJob::journal_finish_failed(ObservationState observation,ErrorDomain d
     // Emergency finalization must work even after allocation failure. Only
     // cached POD rows and already-reserved event storage may be touched here.
     std::lock_guard lock(mutex_);
-    journal_finish_ok_=false;
+    if(journal_finish_ok_) {
+        finish_observation_=observation;finish_domain_=domain;finish_code_=code;journal_finish_ok_=false;
+    } else {observation=finish_observation_;domain=finish_domain_;code=finish_code_;}
     const bool any=std::any_of(journal_affected_.begin(),journal_affected_.end(),[](bool b){return b;});
     for(size_t i=0;i<results_.size();++i) {
         auto& r=results_[i];
@@ -531,6 +651,27 @@ void ActionJob::journal_finish_failed(ObservationState observation,ErrorDomain d
         if(events_.size()<events_.capacity())
             events_.push_back({CKFEA_VERSION,sizeof(ckfea_evidence),CKFEA_EVIDENCE_RESULT,
                 static_cast<uint32_t>(i),events_.size()+1,id_,r,{0,0}});
+    }
+}
+void ActionJob::finish_trash_transactions() noexcept {
+    for(size_t i=0;i<trash_transactions_.size();++i) {
+        if(!trash_transactions_[i]||trash_finish_attempted_[i])continue;
+        trash_finish_attempted_[i]=true;
+        try {
+            const auto result=trash_transactions_[i]->finish_io();
+            if(result.value()&&*result.value())continue;
+            journal_affected_[i]=true;
+            if(!result.value()) {
+                const auto& failure=*result.unavailable_detail();
+                journal_finish_failed(failure.state,failure.error.domain,failure.error.code);
+            } else journal_finish_failed(ObservationState::Unknown,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult));
+        } catch(...) {
+            journal_affected_[i]=true;
+            detail::PreparedJournalConsumerFailure failure;
+            if(request_.prepared_journal_root&&detail::read_prepared_journal_consumer_failure(*request_.prepared_journal_root,failure)&&!failure.pending)
+                journal_finish_failed(failure.state,failure.domain,failure.code);
+            else journal_finish_failed(ObservationState::Unknown,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult));
+        }
     }
 }
 bool ActionJob::finish_journal() noexcept {
@@ -557,9 +698,29 @@ void ActionJob::release_native_inputs() noexcept {
     trash_transactions_.clear(); trash_backend_.reset();
     request_.restore_items.clear();
     journal_file_.reset(); journal_.reset(); artifact_.reset();
+    scope_guards_.clear();
     request_.open_journal={};
+    if(owns_private_root_) {
+        owns_private_root_=false;
+        const auto failed=[this](ObservationState state,ErrorDomain domain,int64_t code) noexcept {
+            if(!journal_finish_ok_)return; // Preserve the first real close failure.
+            std::fill(journal_affected_.begin(),journal_affected_.end(),true);
+            journal_finish_failed(state,domain,code);
+        };
+        try {
+            const auto finished=request_.prepared_journal_root->finish_io();
+            if(!finished.value()) {
+                const auto& error=*finished.unavailable_detail();
+                failed(error.state,error.error.domain,error.error.code);
+            } else if(!*finished.value())failed(ObservationState::Failed,ErrorDomain::Adapter,
+                static_cast<int64_t>(AdapterError::InvalidNativeResult));
+        } catch(...) {failed(ObservationState::Failed,ErrorDomain::Adapter,
+            static_cast<int64_t>(AdapterError::InvalidNativeResult));}
+    }
+    request_.prepared_journal_root.reset();
     request_.items.clear(); request_.recovery_destination.reset(); request_.recovery.reset();
     native_.reset();
+    model_boundary_.reset();
 }
 void ActionJob::run() noexcept {
     try {
@@ -572,15 +733,26 @@ void ActionJob::run() noexcept {
             if (row(i).state==CKFEA_READY || row(i).state==CKFEA_PENDING) {
                 set(i,CKFEA_ITEM_CANCELLED); event(i,CKFEA_EVIDENCE_RESULT);
             }
-        const bool finished=finish_journal();
+        finish_trash_transactions();finish_journal();
         release_native_inputs();
-        { std::lock_guard lock(mutex_); phase_=!finished?CKFEA_JOB_FAILED:cancelled()?CKFEA_CANCELLED:CKFEA_FINISHED; cv_.notify_all(); }
+        { std::lock_guard lock(mutex_); phase_=!journal_finish_ok_?CKFEA_JOB_FAILED:cancelled()?CKFEA_CANCELLED:CKFEA_FINISHED; cv_.notify_all(); }
     } catch (...) {
-        finish_journal();
+        finish_trash_transactions();finish_journal();
+        detail::PreparedJournalConsumerFailure failure;
+        if(request_.prepared_journal_root&&detail::read_prepared_journal_consumer_failure(*request_.prepared_journal_root,failure)&&!failure.pending) {
+            std::fill(journal_affected_.begin(),journal_affected_.end(),true);
+            journal_finish_failed(failure.state,failure.domain,failure.code);
+        }
         release_native_inputs();
         std::lock_guard lock(mutex_);
-        for (auto& r:results_) if (r.state==CKFEA_READY || r.state==CKFEA_PENDING || r.state==CKFEA_EXECUTING)
+        for (auto& r:results_) if (r.state==CKFEA_READY || r.state==CKFEA_PENDING || r.state==CKFEA_EXECUTING) {
             r.state=CKFEA_REVIEW_REQUIRED;
+            if(!r.error_domain) {
+                r.observation=static_cast<uint32_t>(ObservationState::Unknown);
+                r.error_domain=static_cast<uint32_t>(ErrorDomain::Adapter);
+                r.error_code=static_cast<int64_t>(AdapterError::InvalidNativeResult);
+            }
+        }
         phase_=CKFEA_JOB_FAILED; cv_.notify_all();
     }
 }

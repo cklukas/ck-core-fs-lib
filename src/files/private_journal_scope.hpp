@@ -31,6 +31,12 @@ public:
     // regular file outside Root remains usable when its parent contains Root.
     static Observation<Pointer> create_for_entry(PreparedJournalRoot::Pointer,
         const HeldChild&, std::stop_token = {});
+    // A new child may be created beside Root, but never inside/equal Root.
+    // This grants no replacement or source-removal authority.
+    static Observation<Pointer> create_for_namespace_child(PreparedJournalRoot::Pointer root,
+        std::shared_ptr<const DirectoryCursor> parent, std::stop_token stop = {}) {
+        return create_impl(std::move(root), std::move(parent), true, stop);
+    }
     Observation<bool> check_root(std::stop_token = {}) const;
     // One worker assessment: the SAME native Root is checked around both
     // readonly ancestry walks. No result survives this call or skips entry

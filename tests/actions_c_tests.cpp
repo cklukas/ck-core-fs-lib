@@ -3,6 +3,8 @@
 #include "native_handles.hpp"
 #include "action_jobs.hpp"
 #include "sha256.hpp"
+#include "platform/journal_root_test_faults.hpp"
+#include "journal_root_handles.hpp"
 #undef NDEBUG
 #include <cassert>
 #include <chrono>
@@ -24,6 +26,18 @@
 #include <thread>
 
 using namespace ck::files;
+namespace ck::files::detail {
+// Compiled only into this protocol test. No factory is exported by the native
+// library/C ABI, and the model below rejects every native cursor and Root.
+class ActionModelTestAccess final {
+public:
+    static std::shared_ptr<ActionJob> create(ActionRequest request,std::shared_ptr<const ActionNativeBoundary> native,
+        std::shared_ptr<const ActionModelBoundary> model,std::shared_ptr<const NativeTrashBackend> trash=native_trash_backend()) {
+        auto job=std::make_shared<ActionJob>(std::move(request),std::move(native),std::move(trash));
+        job->model_boundary_=std::move(model);return job;
+    }
+};
+}
 namespace {
 NativeName name(const char* s) { return *NativeName::from_posix(s); }
 NativeName host_name(const std::string& s) {
@@ -51,6 +65,16 @@ public:
     }
 };
 struct Block { std::mutex mutex; std::condition_variable cv; bool entered=false, release=false; };
+std::mutex release_pause_mutex;
+std::shared_ptr<Block> release_pause;
+std::optional<int64_t> pause_root_io(detail::JournalRootFaultPoint point) {
+    std::shared_ptr<Block> block;{std::lock_guard lock(release_pause_mutex);block=release_pause;}
+    if(point==detail::JournalRootFaultPoint::DirectoryFlush&&block) {
+        std::unique_lock lock(block->mutex);block->entered=true;block->cv.notify_all();
+        block->cv.wait(lock,[&]{return block->release;});
+    }
+    return std::nullopt;
+}
 class Directory final : public DirectoryCursor {
 public:
     AdapterScope scope;
@@ -137,18 +161,67 @@ public:
         return Observation<bool>::available(true);
     }
 };
+class ModelBoundary final:public detail::ActionModelBoundary {
+public:
+    Observation<bool> check_source(const HeldChild& source)const override {
+        const auto* model=dynamic_cast<const Directory*>(source.parent().get());
+        const auto* id=source.metadata().identity.value();
+        if(!model||!id||id->scope!=Directory::scope_for_parent())return refused();
+        return Observation<bool>::available(true);
+    }
+    Observation<bool> check_request(const ActionRequest& request)const override {
+        if(request.prepared_journal_root||!request.restore_items.empty())return refused();
+        if(request.recovery_destination&&!dynamic_cast<const Directory*>(request.recovery_destination.get()))return refused();
+        for(const auto& item:request.items) {
+            if(!item.source)return refused();auto checked=check_source(*item.source);if(!checked.value())return checked;
+        }
+        return Observation<bool>::available(true);
+    }
+private:
+    static Observation<bool> refused(){return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::ProviderReviewRequired),"test.model_rejects_native_namespace"});}
+};
+struct ModelJournalBytes {std::mutex mutex;std::vector<std::byte> bytes;};
+class ModelJournal final:public OperationJournalFile {
+public:
+    explicit ModelJournal(std::shared_ptr<ModelJournalBytes> data):data_(std::move(data)){}
+    Observation<uint64_t> size()override {std::lock_guard lock(data_->mutex);return Observation<uint64_t>::available(data_->bytes.size());}
+    Observation<size_t> read_at(uint64_t offset,std::span<std::byte> out)override {
+        std::lock_guard lock(data_->mutex);if(offset>data_->bytes.size())return Observation<size_t>::available(0);
+        const auto n=std::min(out.size(),data_->bytes.size()-static_cast<size_t>(offset));
+        std::copy_n(data_->bytes.begin()+static_cast<ptrdiff_t>(offset),n,out.begin());return Observation<size_t>::available(n);
+    }
+    Observation<size_t> write_at(uint64_t offset,std::span<const std::byte> bytes)override {
+        std::lock_guard lock(data_->mutex);assert(offset<=data_->bytes.size());data_->bytes.resize(static_cast<size_t>(offset)+bytes.size());
+        std::copy(bytes.begin(),bytes.end(),data_->bytes.begin()+static_cast<ptrdiff_t>(offset));return Observation<size_t>::available(bytes.size());
+    }
+    Observation<bool> flush()override{return Observation<bool>::available(true);}
+private:std::shared_ptr<ModelJournalBytes> data_;
+};
+Observation<std::unique_ptr<OperationJournalFile>> model_journal(const NativeName& name,bool create) {
+    static std::mutex mutex;static std::map<NativeName,std::shared_ptr<ModelJournalBytes>,NativeNameLess> journals;
+    std::lock_guard lock(mutex);auto found=journals.find(name);
+    if(create&&found!=journals.end())return Observation<std::unique_ptr<OperationJournalFile>>::unavailable(ObservationState::Changed,
+        {ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"test.model_journal_exists"});
+    if(found==journals.end()) {
+        if(!create)return Observation<std::unique_ptr<OperationJournalFile>>::unavailable(ObservationState::Gone);
+        found=journals.emplace(name,std::make_shared<ModelJournalBytes>()).first;
+    }
+    return Observation<std::unique_ptr<OperationJournalFile>>::available(std::make_unique<ModelJournal>(found->second));
+}
 HeldChild::Pointer held(std::shared_ptr<Directory> d,const char* n) {
     auto result=HeldChild::observe(d,name(n)); assert(result.value()); return *result.value();
 }
-std::optional<NativeAbsolutePath> root;
+std::optional<NativeAbsolutePath> root, journal_root;
 unsigned journal_sequence=0;
 ActionRequest rename_request(std::initializer_list<std::pair<HeldChild::Pointer,const char*>> rows) {
-    ActionRequest r; r.journal_directory=root;
+    ActionRequest r; r.journal_directory=journal_root;
     r.journal_name=host_name("actions-"+std::to_string(++journal_sequence)+".journal");
+    r.open_journal=[](const NativeAbsolutePath&,const NativeName& name,bool create){return model_journal(name,create);};
     for(const auto& [s,n]:rows) r.items.push_back({s,name(n),false}); return r;
 }
 std::shared_ptr<ActionJob> start(ActionRequest r,std::shared_ptr<Boundary> b) {
-    auto j=std::make_shared<ActionJob>(std::move(r),std::move(b)); j->start();
+    auto j=detail::ActionModelTestAccess::create(std::move(r),std::move(b),std::make_shared<ModelBoundary>()); j->start();
     for(unsigned i=0;i<20&&j->summary().state==CKFEA_PREVIEWING;++i) j->wait(1000);
     assert(j->summary().state==CKFEA_AWAITING_RECEIPT); return j;
 }
@@ -186,11 +259,7 @@ void abi_tests() {
     assert(ckfea_job_create(&r,&j)==CKFEA_OK); wait_c(j);
     auto summary=output<ckfea_summary>(); assert(ckfea_job_summary(j,&summary)==CKFEA_OK);
     auto result=output<ckfea_result>(); assert(ckfea_job_item(j,0,&result)==CKFEA_OK);
-#ifndef _WIN32
-    assert(result.state==CKFEA_UNSUPPORTED&&result.reason==CKFEA_REASON_SOURCE_NOT_BOUND);
-#else
     assert(result.state==CKFEA_UNSUPPORTED&&result.reason==CKFEA_REASON_JOURNAL_REQUIRED);
-#endif
     auto receipt=output<ckfea_receipt>(); assert(ckfea_job_receipt(j,&receipt)==CKFEA_OK);
     ++receipt.job_id; assert(ckfea_job_execute(j,&receipt)==CKFEA_STALE_RECEIPT); --receipt.job_id;
     receipt.reserved[0]=1; assert(ckfea_job_execute(j,&receipt)==CKFEA_INVALID_ARGUMENT); receipt.reserved[0]=0;
@@ -227,7 +296,7 @@ void rename_tests() {
     }
     assert(item(j,0).state==CKFEA_VERIFIED&&item(j,1).state==CKFEA_VERIFIED&&b->calls==2);
     assert(!d->has("a")&&d->has("b")&&d->has("c"));
-    auto file=open_native_operation_journal_file(*root,journal_name,false); assert(file.value());
+    auto file=model_journal(journal_name,false); assert(file.value());
     auto loaded=load_operation_journal(**file.value()); assert(loaded.value()&&!loaded.value()->tail);
     assert(loaded.value()->journal->records().size()==14);
     auto inspection=inspect_native_operation_recovery_evidence(*loaded.value()->journal); assert(inspection.value());
@@ -286,7 +355,7 @@ void exact_names_tests() {
 void journal_failure_test() {
     auto d=std::make_shared<Directory>(); d->add("a"); auto b=std::make_shared<Boundary>();
     auto r=rename_request({{held(d,"a"),"b"}});
-    auto file=open_native_operation_journal_file(*root,*r.journal_name,true); assert(file.value());
+    auto file=model_journal(*r.journal_name,true); assert(file.value());
     auto j=start(std::move(r),b); assert(item(j,0).state==CKFEA_READY); execute(j);
     assert(!b->calls&&d->has("a")&&!d->has("b")&&item(j,0).state!=CKFEA_VERIFIED);
 }
@@ -370,7 +439,8 @@ void journal_finish_tests() {
         auto d=std::make_shared<Directory>();d->add("trash");auto request=rename_request({{held(d,"trash"),"unused"}});
         request.operation=CKFEA_TRASH;request.capabilities=CKFEA_ALLOW_NATIVE_TRASH;
         auto fault=std::make_shared<FinishFault>();fault->fail=fail;fault->block=std::make_shared<Block>();inject_finish(request,fault);
-        auto job=std::make_shared<ActionJob>(std::move(request),std::make_shared<Boundary>(),std::make_shared<FinishTrashBackend>());job->start();
+        auto job=detail::ActionModelTestAccess::create(std::move(request),std::make_shared<Boundary>(),std::make_shared<ModelBoundary>(),
+            std::make_shared<FinishTrashBackend>());job->start();
         for(unsigned i=0;i<20&&job->summary().state==CKFEA_PREVIEWING;++i)job->wait(1000);
         ckfea_receipt approval{};assert(job->receipt(approval)==CKFEA_OK);assert(job->execute(approval)==CKFEA_OK);
         {std::unique_lock lock(fault->block->mutex);assert(fault->block->cv.wait_for(lock,std::chrono::seconds(5),[&]{return fault->block->entered;}));}
@@ -486,8 +556,8 @@ void native_gate_test() {
     i.source=&entry; i.destination_name=native_text(target);
     ckfea_request r; ckfea_request_init(&r); r.items=&i; r.item_count=1;
     ckfea_native_text_init(&r.journal_directory);
-    if(auto p=root->posix_bytes()) { r.journal_directory.data=p->data(); r.journal_directory.byte_count=p->size(); }
-    else { auto w=root->windows_units(); r.journal_directory.encoding=CKFEA_WINDOWS_UTF16;
+    if(auto p=journal_root->posix_bytes()) { r.journal_directory.data=p->data(); r.journal_directory.byte_count=p->size(); }
+    else { auto w=journal_root->windows_units(); r.journal_directory.encoding=CKFEA_WINDOWS_UTF16;
         r.journal_directory.data=w->data(); r.journal_directory.byte_count=w->size()*2; }
     r.journal_name=native_text(journal_name);
     ckfea_job* j=nullptr; assert(ckfea_job_create(&r,&j)==CKFEA_OK);
@@ -508,6 +578,84 @@ void native_gate_test() {
     }
 #endif
     ckfea_job_destroy(j);
+}
+void model_namespace_refusal() {
+    NativeFileSystem filesystem;auto opened=filesystem.open_native_directory(*root);assert(opened.value());
+    std::shared_ptr<const DirectoryCursor> parent(std::move(opened).take_value());
+    const auto source=host_name("model-must-not-touch-native");
+    auto created=parent->create_child_file(source);assert(created.value());
+    assert((*created.value())->finish_content_writes().value());created=Observation<std::unique_ptr<OpenedEntry>>{};
+    auto observed=HeldChild::observe(parent,source);assert(observed.value());
+    auto boundary=std::make_shared<Boundary>();ActionRequest request;
+    request.items.push_back({*observed.value(),host_name("model-must-not-publish"),false});
+    auto model=detail::ActionModelTestAccess::create(std::move(request),boundary,std::make_shared<ModelBoundary>());
+    model->start();for(unsigned i=0;i<20&&model->summary().state==CKFEA_PREVIEWING;++i)model->wait(1000);
+    assert(item(model,0).state==CKFEA_UNSUPPORTED);execute(model);assert(boundary->calls==0);
+    auto still=(*observed.value())->refresh();assert(still.value()&&(*still.value())->continues(**observed.value()));
+    // Even otherwise valid model entries cannot consume a real prepared Root.
+    auto held_root=acquire_native_journal_root(*journal_root);assert(held_root.value());
+    auto fake=std::make_shared<Directory>();fake->add("a");request=rename_request({{held(fake,"a"),"b"}});
+    request.prepared_journal_root=*held_root.value();model=detail::ActionModelTestAccess::create(std::move(request),boundary,std::make_shared<ModelBoundary>());
+    model->start();for(unsigned i=0;i<20&&model->summary().state==CKFEA_PREVIEWING;++i)model->wait(1000);
+    assert(item(model,0).state==CKFEA_UNSUPPORTED);execute(model);assert(boundary->calls==0&&fake->has("a"));
+    assert((*held_root.value())->finish_io().value());
+}
+void pathless_prepared_root_case() {
+    NativeFileSystem filesystem;auto opened=filesystem.open_native_directory(*journal_root);assert(opened.value());
+    ckfe_directory supplied{};supplied.cursor=std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value());
+    // Intentionally omit the caller's address. The factory may still cache a
+    // kernel navigation hint; Actions must bind journal I/O to the held Root.
+    ckfjr_options_v1 options;ckfjr_options_init_v1(&options);options.parent=&supplied;options.disposition=CKFJR_ADOPT_HELD;
+    ckfjr_root* capability=nullptr;assert(ckfjr_start_v1(&options,&capability)==CKFE_API_OK);supplied.cursor.reset();
+    ckfjr_snapshot_v1 snapshot;
+    for(unsigned n=0;n<3000;++n) {
+        ckfjr_snapshot_init_v1(&snapshot);assert(ckfjr_poll_v1(capability,&snapshot)==CKFE_API_OK);
+        if(snapshot.state!=CKFJR_PREPARING)break;ckfjr_wait_v1(capability,10);
+    }
+    assert(snapshot.state==CKFJR_READY);
+    {auto native=retain_prepared_journal_root(capability);assert(native.value());
+     // Native factories may cache an optional kernel path query. Linux and
+     // mounted Windows volumes also exercise the genuinely absent-hint case.
+     std::fprintf(stderr,"typed Actions root: caller address absent, cached hint=%u\n",unsigned((*native.value())->navigation_address().has_value()));}
+    opened=filesystem.open_native_directory(*root);assert(opened.value());
+    auto parent=std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value());
+    const auto a=host_name("pathless-source"),b=host_name("pathless-renamed");
+    auto created=parent->create_child_file(a);assert(created.value());
+    assert((*created.value())->finish_content_writes().value());created={};
+    std::vector<ckfea_job*> terminal_handles;
+    for(unsigned pass=0;pass<2;++pass) {
+        auto observed=HeldChild::observe(parent,pass?b:a);assert(observed.value());
+        ckfe_entry entry{};entry.child=*observed.value();ckfea_item item;ckfea_item_init(&item);
+        item.source=&entry;item.destination_name=native_text(pass?a:b);
+        ckfea_request request;ckfea_request_init(&request);request.items=&item;request.item_count=1;
+        const auto journal=host_name(pass?"pathless-back.journal":"pathless-forward.journal");request.journal_name=native_text(journal);
+        ckfea_job* job=nullptr;assert(ckfea_job_create_with_journal_root(&request,capability,&job)==CKFEA_OK);entry.child.reset();wait_c(job);
+        auto row=output<ckfea_result>();assert(ckfea_job_item(job,0,&row)==CKFEA_OK);
+#ifdef _WIN32
+        assert(row.state==CKFEA_READY);
+#else
+        assert(row.state==CKFEA_UNSUPPORTED&&row.reason==CKFEA_REASON_SOURCE_NOT_BOUND);
+#endif
+        auto receipt=output<ckfea_receipt>();assert(ckfea_job_receipt(job,&receipt)==CKFEA_OK);
+        assert(ckfea_job_execute(job,&receipt)==CKFEA_OK);wait_c(job);terminal_handles.push_back(job);
+#ifdef _WIN32
+        row=output<ckfea_result>();assert(ckfea_job_item(job,0,&row)==CKFEA_OK&&row.state==CKFEA_VERIFIED);
+#else
+        break;
+#endif
+    }
+    assert(ckfjr_finish_v1(capability)==CKFE_API_OK);
+    for(unsigned n=0;n<3000;++n) {
+        ckfjr_snapshot_init_v1(&snapshot);assert(ckfjr_poll_v1(capability,&snapshot)==CKFE_API_OK);
+        if(snapshot.worker_drained)break;ckfjr_wait_v1(capability,10);
+    }
+    assert(snapshot.state==CKFJR_COMPLETE&&snapshot.worker_drained&&!snapshot.failure_domain);
+    // Terminal action handles remain alive and pollable while Root is closed.
+    for(auto* job:terminal_handles) {
+        auto row=output<ckfea_result>();assert(ckfea_job_item(job,0,&row)==CKFEA_OK);ckfea_job_destroy(job);
+    }
+    ckfjr_release(capability);
+    auto original=parent->lookup_child(a,ChildLookupMode::NativeDefault);assert(original.value()&&original.value()->state()==ChildLookupState::Found);
 }
 #ifdef _WIN32
 ckfea_native_text native_path_text(const NativeAbsolutePath& path) {
@@ -550,7 +698,7 @@ void windows_native_trash_case(std::shared_ptr<const DirectoryCursor> cursor,con
     security_entry=Observation<std::unique_ptr<OpenedEntry>>{};
     ckfe_entry input{}; input.child=*observed.value();ckfea_item item;ckfea_item_init(&item);item.source=&input;
     ckfea_request request;ckfea_request_init(&request);request.operation=CKFEA_TRASH;request.capabilities=CKFEA_ALLOW_NATIVE_TRASH;
-    request.items=&item;request.item_count=1;request.journal_directory=native_path_text(*root);request.journal_name=native_text(journal);
+    request.items=&item;request.item_count=1;request.journal_directory=native_path_text(*journal_root);request.journal_name=native_text(journal);
     ckfea_job* job=nullptr;assert(ckfea_job_create(&request,&job)==CKFEA_OK);wait_c(job);
     auto result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK);
     if(result.state!=CKFEA_READY) {
@@ -575,7 +723,7 @@ void windows_native_trash_case(std::shared_ptr<const DirectoryCursor> cursor,con
     ckfe_directory original{}; original.cursor=cursor;ckfea_restore_item restore_item;ckfea_restore_item_init(&restore_item);restore_item.receipt=trash;restore_item.original_parent=&original;
     ckfea_restore_request restore;ckfea_restore_request_init(&restore);restore.capabilities=CKFEA_ALLOW_NATIVE_RESTORE;restore.items=&restore_item;restore.item_count=1;
     auto restore_journal=*NativeName::from_windows(std::u16string(u"restore-")+std::u16string(suffix.begin(),suffix.end()));
-    restore.journal_directory=native_path_text(*root);restore.journal_name=native_text(restore_journal);
+    restore.journal_directory=native_path_text(*journal_root);restore.journal_name=native_text(restore_journal);
     assert(ckfea_restore_job_create(&restore,&job)==CKFEA_OK);if(!collision&&!directory)ckfea_trash_receipt_destroy(trash);wait_c(job);
     result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK);
     if(collision) {
@@ -661,7 +809,7 @@ struct TestTrashJournal {
         OperationJournalId id{};const auto n=++journal_sequence;id.bytes[0]=std::byte{0x74};
         for(unsigned i=0;i<8;++i)id.bytes[i+1]=std::byte(static_cast<unsigned char>(uint64_t(n)>>(i*8)));
         auto j=OperationJournal::create(FileOperation::Move,id);assert(j.value());journal=*j.value();
-        auto f=open_native_operation_journal_file(*root,host_name("critical-"+std::to_string(n)+".journal"),true);assert(f.value());file=std::move(f).take_value();
+        auto f=open_native_operation_journal_file(*journal_root,host_name("critical-"+std::to_string(n)+".journal"),true);assert(f.value());file=std::move(f).take_value();
     }
     NativeTrashJournal callback() {return [this](OperationJournalState state,const NativeTrashReceipt& r){
         auto encoded=encode_native_trash_receipt(r);assert(encoded.value());
@@ -729,7 +877,7 @@ void opaque_parent_critical_test() {
     auto held=HeldChild::observe(cursor,source);assert(held.value());ckfe_entry entry{};entry.child=*held.value();
     ckfea_item item;ckfea_item_init(&item);item.source=&entry;auto journal_name=host_name("opaque-parent-trash.journal");
     ckfea_request request;ckfea_request_init(&request);request.operation=CKFEA_TRASH;request.capabilities=CKFEA_ALLOW_NATIVE_TRASH;request.items=&item;request.item_count=1;
-    request.journal_directory=native_path_text(*root);request.journal_name=native_text(journal_name);ckfea_job* job=nullptr;
+    request.journal_directory=native_path_text(*journal_root);request.journal_name=native_text(journal_name);ckfea_job* job=nullptr;
     assert(ckfea_job_create(&request,&job)==CKFEA_OK);wait_c(job);auto state=output<ckfea_result>();assert(ckfea_job_item(job,0,&state)==CKFEA_OK&&state.state==CKFEA_READY);
     execute_c(job);state=output<ckfea_result>();assert(ckfea_job_item(job,0,&state)==CKFEA_OK&&state.state==CKFEA_VERIFIED);
     ckfea_trash_receipt* receipt=nullptr;assert(ckfea_job_trash_receipt(job,0,&receipt)==CKFEA_OK);ckfea_job_destroy(job);
@@ -743,7 +891,7 @@ void opaque_parent_critical_test() {
     assert(CreateDirectoryW(path.c_str(),nullptr));opened=fs.open_native_directory(*original_address.value());assert(opened.value());cursor=std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value());
     ckfe_directory replacement{};replacement.cursor=cursor;ckfea_restore_item ri;ckfea_restore_item_init(&ri);ri.receipt=receipt;ri.original_parent=&replacement;
     ckfea_restore_request restore;ckfea_restore_request_init(&restore);restore.capabilities=CKFEA_ALLOW_NATIVE_RESTORE;restore.items=&ri;restore.item_count=1;
-    auto restore_name=host_name("opaque-parent-restore.journal");restore.journal_directory=native_path_text(*root);restore.journal_name=native_text(restore_name);
+    auto restore_name=host_name("opaque-parent-restore.journal");restore.journal_directory=native_path_text(*journal_root);restore.journal_name=native_text(restore_name);
     assert(ckfea_restore_job_create(&restore,&job)==CKFEA_OK);wait_c(job);state=output<ckfea_result>();assert(ckfea_job_item(job,0,&state)==CKFEA_OK);
     assert(state.state==CKFEA_CHANGED||state.state==CKFEA_REVIEW_REQUIRED);ckfea_job_destroy(job);ckfea_trash_receipt_destroy(receipt);
     auto missing=cursor->lookup_child(source,ChildLookupMode::NativeDefault);assert(missing.value()&&missing.value()->state()==ChildLookupState::Missing);
@@ -797,7 +945,7 @@ void windows_short_link_and_reparse(const std::shared_ptr<const DirectoryCursor>
     ckfe_entry input{};input.child=*held.value();ckfea_item item;ckfea_item_init(&item);item.source=&input;
     const auto journal=host_name("reparse-refusal.journal");
     ckfea_request request;ckfea_request_init(&request);request.operation=CKFEA_TRASH;request.capabilities=CKFEA_ALLOW_NATIVE_TRASH;
-    request.items=&item;request.item_count=1;request.journal_directory=native_path_text(*root);request.journal_name=native_text(journal);
+    request.items=&item;request.item_count=1;request.journal_directory=native_path_text(*journal_root);request.journal_name=native_text(journal);
     ckfea_job* job=nullptr;assert(ckfea_job_create(&request,&job)==CKFEA_OK);wait_c(job);
     auto result=output<ckfea_result>();assert(ckfea_job_item(job,0,&result)==CKFEA_OK&&result.state==CKFEA_UNSUPPORTED);
     execute_c(job);assert(ckfea_job_item(job,0,&result)==CKFEA_OK&&result.state==CKFEA_UNSUPPORTED);ckfea_job_destroy(job);
@@ -833,9 +981,16 @@ void windows_native_trash_tests() {
 #endif
 void release_test() {
     auto d=std::make_shared<Directory>(); d->add("a"); ckfe_entry entry{}; entry.child=held(d,"a");
-    auto block=std::make_shared<Block>(); d->block=block;
+    // Pause real worker Root I/O before scope qualification. The later fake
+    // input is still refused by production; it cannot inject native authority.
+    auto block=std::make_shared<Block>();{std::lock_guard lock(release_pause_mutex);release_pause=block;}
+    const auto prior=detail::journal_root_test_worker_fault.exchange(pause_root_io);
     ckfea_item i; ckfea_item_init(&i); i.source=&entry; i.destination_name=text("b");
     ckfea_request r; ckfea_request_init(&r); r.items=&i; r.item_count=1;
+    if(auto p=journal_root->posix_bytes()){r.journal_directory.data=p->data();r.journal_directory.byte_count=p->size();}
+    else {auto w=journal_root->windows_units();r.journal_directory.encoding=CKFEA_WINDOWS_UTF16;
+        r.journal_directory.data=w->data();r.journal_directory.byte_count=w->size()*2;}
+    const auto journal=host_name("release-root.journal");r.journal_name=native_text(journal);
     ckfea_job* job=nullptr; assert(ckfea_job_create(&r,&job)==CKFEA_OK);
     { std::unique_lock lock(block->mutex); assert(block->cv.wait_for(lock,std::chrono::seconds(5),[&]{return block->entered;})); }
     std::weak_ptr<Directory> retained=d; entry.child.reset(); d.reset();
@@ -845,6 +1000,7 @@ void release_test() {
     { std::lock_guard lock(block->mutex); block->release=true; block->cv.notify_all(); }
     for(unsigned n=0;n<5000&&!retained.expired();++n) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     assert(retained.expired());
+    detail::journal_root_test_worker_fault.store(prior);{std::lock_guard lock(release_pause_mutex);release_pause.reset();}
 }
 void bounded_jobs_test() {
     auto d=std::make_shared<Directory>(); d->add("a"); ckfe_entry entry{}; entry.child=held(d,"a");
@@ -865,7 +1021,7 @@ void bounded_jobs_test() {
 int main(int argc,char** argv) {
     assert(argc==2||argc==3);
     auto address=NativeAbsolutePath::from_host(std::filesystem::path(argv[1])); assert(address.value());
-    root=std::move(address).take_value();
+    root=std::move(address).take_value();journal_root=*root;
     if(argc==3&&std::string_view(argv[2])=="--journal-finalization") {
         // Injected journal adapters test delayed errors independently of the
         // host volume's native private-storage qualification.
@@ -873,13 +1029,20 @@ int main(int argc,char** argv) {
         std::puts("actions: journal finalization and recovery authority regressions passed");return 0;
     }
     assert(prepare_native_operation_journal_root(*root).value());
+    // Data and private operation state occupy separate native subtrees. An
+    // ordinary file in their common parent must remain usable.
+    NativeFileSystem setup;auto base=setup.open_native_directory(*root);assert(base.value());
+    auto child=(*base.value())->create_child_directory(host_name(".action-journals"));assert(child.value());
+    auto private_address=root->child_address(host_name(".action-journals"));assert(private_address.value());
+    journal_root=std::move(private_address).take_value();
+    assert(prepare_native_operation_journal_root(*journal_root).value());
 #ifdef _WIN32
     if(argc==3&&std::string_view(argv[2])=="--critical-trash") {
         windows_native_trash_tests();native_bin_critical_tests();opaque_parent_critical_test();
         std::puts("Windows critical Trash regressions passed");return 0;
     }
 #endif
-    abi_tests(); rename_tests(); exact_names_tests(); journal_failure_test(); journal_finish_tests(); retry_tests(); recovery_tests(); trash_metadata_tests(); native_gate_test();
+    abi_tests(); rename_tests(); exact_names_tests(); journal_failure_test(); journal_finish_tests(); retry_tests(); recovery_tests(); trash_metadata_tests(); native_gate_test();model_namespace_refusal();pathless_prepared_root_case();
 #ifdef _WIN32
     windows_native_trash_tests();
 #endif

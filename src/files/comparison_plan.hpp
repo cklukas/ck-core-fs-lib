@@ -15,7 +15,8 @@
 
 namespace ck::files {
 
-// Pure, main-data comparison/planning. No native I/O, mutation, consent, or
+// Pure comparison/planning, main-data only unless explicitly opted into
+// preserved-metadata comparison. No native I/O, mutation, consent, or
 // preservation authorization. Adapter facts are claims to compare, never
 // authority to execute an action. Executors must acquire held native evidence,
 // validate topology/preservation, obtain review receipts, and revalidate again.
@@ -51,6 +52,25 @@ struct ComparisonDigest final {
     ComparisonObject after;
 };
 
+enum class ComparisonMetadataOwnership { Unknown, Original, CurrentCaller };
+struct ComparisonMetadataDigest final {
+    ComparisonDigestState state = ComparisonDigestState::Unknown;
+    ComparisonDigestAlgorithm algorithm = ComparisonDigestAlgorithm::Unknown;
+    // Opaque canonical metadata schema and preservation-policy identifiers.
+    // All-zero identifiers mean unknown. Equal hashes are comparable only
+    // under the same qualified schema, policy and ownership interpretation.
+    std::array<std::byte, 32> schema{}, policy_binding{}, bytes{};
+    ComparisonMetadataOwnership ownership = ComparisonMetadataOwnership::Unknown;
+    // Required and compared under CurrentCaller, whose preservation hash may
+    // omit actual ownership. Original includes ownership in bytes' schema.
+    // These are declarative canonical facts, never native issuer authority.
+    std::optional<std::array<std::byte, 32>> canonical_owner_digest;
+    // CompleteStable asserts a full stable metadata observation; matching
+    // timestamps alone cannot establish it. Bind both observations exactly to
+    // the entry, just as for a main-data digest. Main data is NOT in bytes.
+    ComparisonObject before, after;
+};
+
 struct ComparisonEntry final {
     // Exact, lossless adapter comparison key, '/' separated relative components.
     // No empty, '.', '..', NUL or backslash components, absolute/drive paths.
@@ -61,6 +81,7 @@ struct ComparisonEntry final {
     std::optional<ComparisonDigest> digest;
     bool excluded = false;       // protects this path and its entire subtree
     bool name_collision = false;
+    std::optional<ComparisonMetadataDigest> metadata_digest;
 };
 
 struct ComparisonInventory final {
@@ -89,6 +110,11 @@ struct ComparisonOptions final {
     ComparisonTopology topology = ComparisonTopology::Unknown;
     std::uint64_t timestamp_quantum_ns = 1;
     ComparisonFilters filters;
+    // Require qualified stable metadata for EVERY observed, nonprotected
+    // regular file, including one-sided copy/removal candidates. Directories
+    // remain unresolved until directory metadata has a preservation contract.
+    // Byte-count completeness continues to describe main-data byte counts.
+    bool compare_preserved_metadata = false;
 };
 
 struct ComparisonLimits final {
@@ -108,7 +134,7 @@ struct ComparisonLimits final {
 enum class ComparisonRelation {
     Unknown, SourceOnly, DestinationOnly, SameSize, SameSizeAndMtime, Identical,
     SourceNewer, DestinationNewer, SizeDifferent, ContentDifferent, TypeConflict,
-    DirectoryPair, Protected
+    DirectoryPair, Protected, MetadataDifferent
 };
 enum class ComparisonReason {
     UnknownObject, IncompleteInventory, UnqualifiedIdentity, MissingSize,
@@ -117,7 +143,10 @@ enum class ComparisonReason {
     SameSize, SameSizeAndMtime, SameContent, SourceNewer, DestinationNewer,
     SizeMismatch, DigestMismatch, TypeMismatch, UnsupportedKind, DirectoryPair,
     Excluded, Filtered, FilterUnknown, ProtectedDescendant, NameCollision,
-    ExistingDestination, EqualTimeConflict, AncestorConflict, SameObject
+    ExistingDestination, EqualTimeConflict, AncestorConflict, SameObject,
+    MetadataDigestUnavailable, MetadataDigestIncomplete, MetadataDigestChanged,
+    MetadataDigestBindingMismatch, MetadataSchemaMismatch, MetadataPolicyMismatch,
+    MetadataOwnerUnavailable, MetadataMismatch, DirectoryMetadataUnsupported
 };
 // Declarative proposals only. MoveAfterCommit requires verified publication of
 // the whole affected subtree before source retirement; directory removal means

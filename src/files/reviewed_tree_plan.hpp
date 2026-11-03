@@ -4,6 +4,7 @@
 
 #include "comparison_plan.hpp"
 #include "conflict_rules.hpp"
+#include "metadata_capture_job.hpp"
 #include "native_operation_copy_job.hpp"
 #include <stop_token>
 
@@ -25,6 +26,9 @@ struct ReviewedTreePlanRequest final {
     std::size_t digest_chunk_bytes = 64 * 1024;
     // Typed native authority; journal_root remains a navigation/encoding hint.
     std::shared_ptr<PreparedJournalRoot> prepared_journal_root = {};
+    // Cumulative native metadata/data-stream admission for each independent
+    // scan; read.max_bytes is always replaced by digest_chunk_bytes.
+    MetadataCaptureLimits metadata_limits{};
 };
 
 enum class ReviewedTreeState {
@@ -50,6 +54,10 @@ struct ReviewedTreeFacts final {
     std::uint64_t allowed_choices = 0;
     bool retained_target_available = false;
     ConflictClass conflict_class = ConflictClass::Unavailable;
+    // Closed native source observations, value facts only. Unknown metadata
+    // never grants strict mutation authority. Main data has a separate digest.
+    std::optional<ComparisonMetadataDigest> source_metadata, destination_metadata;
+    std::optional<UnavailableObservation> source_metadata_failure, destination_metadata_failure;
 };
 struct ReviewedTreeItem final {
     ComparisonRow row;

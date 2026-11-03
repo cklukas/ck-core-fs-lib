@@ -2,21 +2,33 @@
 #include "ck_fs_tree.h"
 #include "ck_fs_actions.h"
 #include "ck_fs_session.h"
+#include "ck_fs_diagnostics.h"
 
 #undef NDEBUG
 #include <assert.h>
 #include <string.h>
+#include <stddef.h>
+
+_Static_assert(sizeof(ckfet_failure_details_v1)==192,"diagnostic ABI size");
+_Static_assert(offsetof(ckfet_failure_details_v1,operation)==64,"diagnostic tag offset");
+_Static_assert(offsetof(ckfet_failure_details_v1,reserved)==160,"diagnostic reserve offset");
 
 int main(void) {
+    ckfet_failure_details_v1 details;
+    ckfet_failure_details_init_v1(&details);
+    assert(details.version==1&&details.struct_size==sizeof(details));
+    ckfet_failure_details_v1 unchanged=details;
+    assert(ckfet_get_failure_details_v1(NULL,&details)==CKFE_API_INVALID_ARGUMENT);
+    assert(memcmp(&details,&unchanged,sizeof(details))==0);
     uint32_t trash_kind=UINT32_MAX;
     assert(ckfea_trash_receipt_get_kind(NULL,&trash_kind)==CKFEA_INVALID_ARGUMENT);
     assert(trash_kind==CKFE_OBJECT_UNKNOWN);
     assert(ckfea_trash_receipt_get_kind(NULL,NULL)==CKFEA_INVALID_ARGUMENT);
     ckfe_error error;
     ckfe_error_init(&error);
-    assert(strcmp(ckfe_version(), "0.4.0") == 0);
+    assert(strcmp(ckfe_version(), "0.5.0") == 0);
     assert(ckfe_abi_version_major() == 0);
-    assert(ckfe_abi_version_minor() == 4);
+    assert(ckfe_abi_version_minor() == 5);
     assert(strcmp(ckfe_api_status_name(CKFE_API_OK), "ok") == 0);
     assert(strcmp(ckfe_job_state_name(CKFE_JOB_RECOVERY_REQUIRED), "recovery_required") == 0);
     assert(strcmp(ckfe_api_status_name(CKFE_API_OPERATION_UNAVAILABLE), "operation_unavailable") == 0);

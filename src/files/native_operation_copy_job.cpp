@@ -384,6 +384,11 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
                     static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"native_operation_copy.writer_finish_exception");
             }
         }
+        if(state->request.finish_metadata) {
+            try{failure.record(state->request.finish_metadata(),"native_operation_copy.metadata_finish_false");}
+            catch(...){failure.record(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"native_operation_copy.metadata_finish_exception");}
+        }
         // Attempt the journal close even when the writer failed. Each native
         // owner consumes its handle once; retain the first observed failure.
         try {
@@ -626,7 +631,7 @@ Observation<OperationBatchJob::Pointer> create_native_operation_copy_batch(
             destination_name,
             request.policy.copy_limits,
             {},
-            FileOperation::Copy, {}, {}, {}, {}};
+            FileOperation::Copy, {}, {}, {}, {}, {}};
         const auto metadata_policy = *preservation.value();
         copy_request.prepare_metadata = [metadata_policy](OpenedEntry& staging, std::stop_token stop) {
             return metadata_policy->prepare(staging, stop);

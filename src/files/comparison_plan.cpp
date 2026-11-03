@@ -71,15 +71,26 @@ bool same_digest(const std::optional<ComparisonDigest>& a, const std::optional<C
         a->bytes_read == b->bytes_read && same_object(a->before, b->before) && same_object(a->after, b->after);
 }
 
+bool same_metadata_digest(const std::optional<ComparisonMetadataDigest>& a,
+    const std::optional<ComparisonMetadataDigest>& b) noexcept {
+    if (!a || !b) return !a && !b;
+    return a->state == b->state && a->algorithm == b->algorithm && a->schema == b->schema &&
+        a->policy_binding == b->policy_binding && a->bytes == b->bytes && a->ownership == b->ownership &&
+        a->canonical_owner_digest == b->canonical_owner_digest &&
+        same_object(a->before, b->before) && same_object(a->after, b->after);
+}
+
 bool same_entry(const ComparisonEntry& a, const ComparisonEntry& b) noexcept {
     return a.relative_path == b.relative_path && same_object(a.object, b.object) &&
-        same_digest(a.digest, b.digest) && a.excluded == b.excluded && a.name_collision == b.name_collision;
+        same_digest(a.digest, b.digest) && same_metadata_digest(a.metadata_digest, b.metadata_digest) &&
+        a.excluded == b.excluded && a.name_collision == b.name_collision;
 }
 
 bool same_options(const ComparisonOptions& a, const ComparisonOptions& b) noexcept {
     const auto& x = a.filters; const auto& y = b.filters;
     return a.profile == b.profile && a.mode == b.mode && a.topology == b.topology &&
-        a.timestamp_quantum_ns == b.timestamp_quantum_ns && x.minimum_size == y.minimum_size &&
+        a.timestamp_quantum_ns == b.timestamp_quantum_ns && a.compare_preserved_metadata == b.compare_preserved_metadata &&
+        x.minimum_size == y.minimum_size &&
         x.maximum_size == y.maximum_size && x.modified_not_before == y.modified_not_before &&
         x.modified_before == y.modified_before && x.allowed_kind_mask == y.allowed_kind_mask &&
         x.maximum_depth == y.maximum_depth;
@@ -95,7 +106,12 @@ bool entry_fields_valid(const ComparisonEntry& e) noexcept {
     return object_fields_valid(e.object) && (!e.digest ||
         (in_range(e.digest->state, ComparisonDigestState::Failed) &&
          in_range(e.digest->algorithm, ComparisonDigestAlgorithm::Sha256) &&
-         object_fields_valid(e.digest->before) && object_fields_valid(e.digest->after)));
+         object_fields_valid(e.digest->before) && object_fields_valid(e.digest->after))) &&
+        (!e.metadata_digest ||
+         (in_range(e.metadata_digest->state, ComparisonDigestState::Failed) &&
+          in_range(e.metadata_digest->algorithm, ComparisonDigestAlgorithm::Sha256) &&
+          in_range(e.metadata_digest->ownership, ComparisonMetadataOwnership::CurrentCaller) &&
+          object_fields_valid(e.metadata_digest->before) && object_fields_valid(e.metadata_digest->after)));
 }
 
 bool options_valid(const ComparisonOptions& o) noexcept {
@@ -232,6 +248,23 @@ std::optional<ComparisonReason> digest_problem(const ComparisonEntry& e) {
     return {};
 }
 
+std::optional<ComparisonReason> metadata_digest_problem(const ComparisonEntry& e) {
+    if (!e.metadata_digest || e.metadata_digest->algorithm != ComparisonDigestAlgorithm::Sha256)
+        return ComparisonReason::MetadataDigestUnavailable;
+    const auto& d = *e.metadata_digest;
+    if (d.state == ComparisonDigestState::Changed) return ComparisonReason::MetadataDigestChanged;
+    if (d.state != ComparisonDigestState::CompleteStable) return ComparisonReason::MetadataDigestIncomplete;
+    if (d.schema == std::array<std::byte, 32>{}) return ComparisonReason::MetadataSchemaMismatch;
+    if (d.policy_binding == std::array<std::byte, 32>{} || d.ownership == ComparisonMetadataOwnership::Unknown)
+        return ComparisonReason::MetadataPolicyMismatch;
+    if ((!e.object.modified && !e.object.change_cookie) ||
+        !same_object(d.before, e.object) || !same_object(d.after, e.object))
+        return ComparisonReason::MetadataDigestBindingMismatch;
+    if (d.ownership == ComparisonMetadataOwnership::CurrentCaller && !d.canonical_owner_digest)
+        return ComparisonReason::MetadataOwnerUnavailable;
+    return {};
+}
+
 void unknown(ComparisonRow& row, ComparisonReason reason) {
     row.relation = ComparisonRelation::Unknown;
     row.reason = reason;
@@ -247,6 +280,14 @@ void classify(ComparisonRow& row, const ComparisonEntry* s, const ComparisonEntr
         if (s && s->object.kind == ObjectKind::RegularFile) if (auto problem = digest_problem(*s)) { unknown(row, *problem); return; }
         if (d && d->object.kind == ObjectKind::RegularFile) if (auto problem = digest_problem(*d)) { unknown(row, *problem); return; }
     }
+    if (o.compare_preserved_metadata) {
+        for (const auto* entry : {s, d}) if (entry) {
+            if (entry->object.kind == ObjectKind::Directory) {
+                unknown(row, ComparisonReason::DirectoryMetadataUnsupported); return;
+            }
+            if (auto problem = metadata_digest_problem(*entry)) { unknown(row, *problem); return; }
+        }
+    }
     if (!s) { row.relation = ComparisonRelation::DestinationOnly; row.reason = ComparisonReason::SourceMissing; return; }
     if (!d) { row.relation = ComparisonRelation::SourceOnly; row.reason = ComparisonReason::DestinationMissing; return; }
     const auto& a = s->object; const auto& b = d->object;
@@ -256,6 +297,18 @@ void classify(ComparisonRow& row, const ComparisonEntry* s, const ComparisonEntr
     if (a.kind != b.kind) { row.relation = ComparisonRelation::TypeConflict; row.reason = ComparisonReason::TypeMismatch; return; }
     if (*a.kind == ObjectKind::Directory) {
         row.relation = ComparisonRelation::DirectoryPair; row.reason = ComparisonReason::DirectoryPair; return;
+    }
+    if (o.compare_preserved_metadata) {
+        const auto& x = *s->metadata_digest; const auto& y = *d->metadata_digest;
+        if (x.schema != y.schema) { unknown(row, ComparisonReason::MetadataSchemaMismatch); return; }
+        if (x.policy_binding != y.policy_binding || x.ownership != y.ownership) {
+            unknown(row, ComparisonReason::MetadataPolicyMismatch); return;
+        }
+        if (x.bytes != y.bytes || (x.ownership == ComparisonMetadataOwnership::CurrentCaller &&
+            x.canonical_owner_digest != y.canonical_owner_digest)) {
+            row.relation = ComparisonRelation::MetadataDifferent;
+            row.reason = ComparisonReason::MetadataMismatch; return;
+        }
     }
     if (o.mode == ComparisonMode::CompleteDigest) {
         const auto same_size = a.size == b.size;
@@ -306,12 +359,13 @@ void propose(ComparisonRow& row, const ComparisonEntry* s, const ComparisonEntry
         row.action = ComparisonAction::Skip;
     } else if (o.profile == ComparisonProfile::Copy || o.profile == ComparisonProfile::Move) {
         row.action = ComparisonAction::Review;
-        row.reason = ComparisonReason::ExistingDestination;
+        if (row.relation != ComparisonRelation::MetadataDifferent) row.reason = ComparisonReason::ExistingDestination;
     } else if (o.profile == ComparisonProfile::Update) {
         if (auto problem = time_problem(s->object, d->object, o.timestamp_quantum_ns)) { unknown(row, *problem); return; }
         const auto time = rounded_time(*s->object.modified, *d->object.modified, o.timestamp_quantum_ns);
         row.action = time > 0 ? ComparisonAction::ReplaceDestination : time < 0 ? ComparisonAction::Skip : ComparisonAction::Review;
-        row.reason = time > 0 ? ComparisonReason::SourceNewer : time < 0 ? ComparisonReason::DestinationNewer : ComparisonReason::EqualTimeConflict;
+        if (row.relation != ComparisonRelation::MetadataDifferent)
+            row.reason = time > 0 ? ComparisonReason::SourceNewer : time < 0 ? ComparisonReason::DestinationNewer : ComparisonReason::EqualTimeConflict;
     } else {
         row.action = ComparisonAction::ReplaceDestination;
     }

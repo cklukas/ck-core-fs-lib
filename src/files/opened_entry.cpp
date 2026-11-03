@@ -5,6 +5,32 @@
 #include "native_name.hpp"
 
 namespace ck::files {
+Observation<std::shared_ptr<const MetadataReplayChannelSource>> OpenedEntry::open_metadata_replay_channel_read(
+    const NativeFeatureIdentifier&) const {
+    return Observation<std::shared_ptr<const MetadataReplayChannelSource>>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"metadata_replay.native_channel_reader"});
+}
+Observation<bool> OpenedEntry::apply_replay_channels(const MetadataReplaySnapshot&,std::stop_token) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"metadata_replay.native_channel_writer"});
+}
+Observation<std::unique_ptr<OpenedEntry>> OpenedEntry::open_directory_metadata_target(const MetadataReplayPolicy&) const {
+    return Observation<std::unique_ptr<OpenedEntry>>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"metadata_replay.directory_writer_unavailable"});
+}
+Observation<std::shared_ptr<const MetadataSecurityCoverageEvidence>> OpenedEntry::issue_metadata_security_coverage(
+    const MetadataReplaySnapshot&) const {
+    return Observation<std::shared_ptr<const MetadataSecurityCoverageEvidence>>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_replay.complete_security_coverage_unproved"});
+}
+Observation<bool> OpenedEntry::preflight_metadata_security_coverage(const MetadataReplaySnapshot&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_replay.complete_target_coverage_unproved"});
+}
+Observation<bool> OpenedEntry::verify_metadata_security_coverage(const MetadataReplaySnapshot&) const {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"metadata_replay.complete_target_coverage_unproved"});
+}
 Observation<std::unique_ptr<OpenedEntry>> OpenedEntry::open_parent_directory() const {
     return Observation<std::unique_ptr<OpenedEntry>>::unavailable(ObservationState::Unsupported,
         {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "parent.native_query"});

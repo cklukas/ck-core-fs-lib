@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "../native_trash.hpp"
+#include "../private_journal_scope.hpp"
+#include "prepared_journal_root_bridge.hpp"
+#include "native_windows_journal_volume.hpp"
+#include "journal_root_test_faults.hpp"
+#include "../windows_parent_record.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <winternl.h>
+#include <winioctl.h>
 #include <sddl.h>
 #include <aclapi.h>
 #include <bcrypt.h>
@@ -23,6 +29,25 @@ WindowsTrashHandle::WindowsTrashHandle(WindowsTrashHandle&& o) noexcept : value_
 void* WindowsTrashHandle::release() noexcept {return std::exchange(value_,nullptr);}
 WindowsTrashHandle& WindowsTrashHandle::operator=(WindowsTrashHandle&& o) noexcept {
     if(this!=&o) { WindowsTrashHandle old(std::exchange(value_,std::exchange(o.value_,nullptr))); } return *this;
+}
+WindowsTrashScopeHandle::~WindowsTrashScopeHandle() {
+    const auto raw=handle_.release();if(!raw||raw==INVALID_HANDLE_VALUE)return;
+    if(!CloseHandle(raw)&&root_)detail::record_prepared_journal_consumer_failure(*root_,ObservationState::Unknown,
+        ErrorDomain::Win32,GetLastError(),"trash.scope_token_close");
+}
+namespace detail {
+// Only this translation unit can mint the token consumed by the genuine
+// query-only metadata projection. The original native owner stays alive.
+class WindowsTrashScopeIssuer final {
+public:
+    static Observation<std::unique_ptr<NativeTrashDirectoryProjection>> project(HANDLE held,std::shared_ptr<PreparedJournalRoot> root) {
+        HANDLE raw=nullptr;
+        if(!DuplicateHandle(GetCurrentProcess(),held,GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+            return Observation<std::unique_ptr<NativeTrashDirectoryProjection>>::unavailable(ObservationState::Unknown,
+                {ErrorDomain::Win32,GetLastError(),"trash.scope_duplicate"});
+        return project_windows_trash_directory(WindowsTrashScopeHandle(WindowsTrashHandle(raw),std::move(root)));
+    }
+};
 }
 namespace {
 using Handle=WindowsTrashHandle;
@@ -46,6 +71,145 @@ bool valid_name(const NativeName& n) {
     const auto* w=n.windows_units();
     return n.is_valid()&&w&&w->size()<=32767&&w->find(u':')==w->npos;
 }
+Observation<NativeDurableIdentity> native_id(HANDLE,bool);
+class PrivateScope final {
+public:
+    explicit PrivateScope(std::shared_ptr<PreparedJournalRoot> root):root_(std::move(root)) {
+        views_.reserve(5);guards_.reserve(6);
+    }
+    ~PrivateScope() {
+        try {(void)finish_io();}
+        catch(...) {if(root_)detail::record_prepared_journal_consumer_failure(*root_,ObservationState::Unknown,
+            ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"trash.scope_finish_exception");}
+    }
+    Observation<std::shared_ptr<const DirectoryCursor>> project_directory(HANDLE handle) {
+        auto projected=detail::WindowsTrashScopeIssuer::project(handle,root_);
+        if(!projected.value())return forward<std::shared_ptr<const DirectoryCursor>>(projected);
+        auto view=std::move(projected).take_value();
+        auto cursor=view->cursor();views_.push_back(std::move(view));
+        return Observation<std::shared_ptr<const DirectoryCursor>>::available(std::move(cursor));
+    }
+    Observation<bool> bind_destination(HANDLE handle,std::stop_token stop) {
+        auto cursor=project_directory(handle);if(!cursor.value())return forward<bool>(cursor);
+        auto guard=JournalScopeGuard::create_for_namespace_child(root_,*cursor.value(),stop);
+        if(!guard.value())return forward<bool>(guard);
+        guards_.push_back(std::move(guard).take_value());
+        return check(stop);
+    }
+    Observation<bool> bind_source(HeldChild::Pointer source,std::stop_token stop) {
+        auto guard=JournalScopeGuard::create_for_entry(root_,*source,stop);
+        if(!guard.value())return forward<bool>(guard);
+        source_=std::move(source);guards_.push_back(std::move(guard).take_value());
+        return check(stop);
+    }
+    Observation<bool> bind_restore_source(HANDLE actual_held,bool directory,std::stop_token stop) {
+        auto bound=capture_source(actual_held,directory,false);if(!bound.value())return bound;
+        if(directory) {
+            // Project the live receipt owner's actual object, not its name or
+            // persisted ID. No namespace/path reopen grants this scope proof.
+            auto cursor=project_directory(actual_held);if(!cursor.value())return forward<bool>(cursor);
+            auto guard=JournalScopeGuard::create(root_,*cursor.value(),stop);
+            if(!guard.value())return forward<bool>(guard);
+            guards_.push_back(std::move(guard).take_value());
+        }
+        return check(stop);
+    }
+    Observation<bool> bind_mutation_source(HANDLE actual_held,bool directory,std::stop_token stop) {
+        auto bound=capture_source(actual_held,directory,true);if(!bound.value())return bound;
+        source_.reset(); // The qualified native rename owner now pins it.
+        return check(stop);
+    }
+    Observation<bool> check(std::stop_token stop,bool membership=true) const {
+        if(finished_||!root_)return reject<bool>("trash.scope_finished_or_unbound",ObservationState::Changed);
+        if(stop.stop_requested())return reject<bool>("trash.scope_cancelled",ObservationState::Changed);
+        for(size_t n=0;n<guards_.size();n+=2) {
+            auto valid=n+1<guards_.size()?JournalScopeGuard::check_pair(guards_[n],guards_[n+1],stop):guards_[n]->check_root(stop);
+            if(!valid.value())return valid;
+            if(!*valid.value())return reject<bool>("trash.scope_false");
+        }
+        if(source_&&membership) {
+            auto current=source_->refresh(stop);if(!current.value())return forward<bool>(current);
+            if(!(*current.value())->continues(*source_))return reject<bool>("trash.scope_source_changed",ObservationState::Changed);
+        }
+        if(native_source_) {
+            auto current=native_id(native_source_,native_directory_);if(!current.value())return forward<bool>(current);
+            if(!native_source_identity_||*current.value()!=*native_source_identity_)
+                return reject<bool>("trash.scope_live_source_changed",ObservationState::Changed);
+        }
+        if(source_)for(const auto& guard:guards_) {
+            auto entry=guard->check_entry(*source_,stop);if(!entry.value())return entry;
+            if(!*entry.value())return reject<bool>("trash.scope_entry_false");
+        }
+        return Observation<bool>::available(true);
+    }
+    bool source_bound() const noexcept {return mutation_source_bound_;}
+    bool read_failure(detail::PreparedJournalConsumerFailure& failure)const noexcept {
+        return detail::read_prepared_journal_consumer_failure(*root_,failure);
+    }
+    void record_failure(ObservationState state,ErrorDomain domain,int64_t code,std::string_view operation)noexcept {
+        detail::record_prepared_journal_consumer_failure(*root_,state,domain,code,operation);
+    }
+    Observation<bool> finish_io() {
+        if(finished_)return finish_result();
+        source_.reset();native_source_=nullptr;mutation_source_bound_=false;guards_.clear();
+        // Release query handles even if an earlier one fails. The provider
+        // caches close outcomes and consumes each handle exactly once.
+        for(const auto& view:views_)try {
+            auto closed=view->finish_io();
+            if(!closed.value()) {
+                const auto& error=*closed.unavailable_detail();
+                remember(error.state,error.error.domain,error.error.code,error.error.operation);
+            } else if(!*closed.value())remember(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<int64_t>(AdapterError::InvalidNativeResult),"trash.scope_finish_false");
+        } catch(...) {
+            // The native projection publishes the real close error to Root
+            // before allocating a returned diagnostic. Do not replace it by
+            // a generic exception if diagnostic construction failed.
+            detail::PreparedJournalConsumerFailure latched;
+            if(detail::read_prepared_journal_consumer_failure(*root_,latched)&&!latched.pending)
+                remember(latched.state,latched.domain,latched.code,latched.operation.data());
+            else remember(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<int64_t>(AdapterError::InvalidNativeResult),"trash.scope_finish_exception");
+        }
+        views_.clear();
+        detail::PreparedJournalConsumerFailure latched;
+        if(detail::read_prepared_journal_consumer_failure(*root_,latched)&&!latched.pending)
+            remember(latched.state,latched.domain,latched.code,latched.operation.data());
+        finished_=true;
+        return finish_result();
+    }
+private:
+    Observation<bool> capture_source(HANDLE handle,bool directory,bool mutation_owner) {
+        auto current=native_id(handle,directory);if(!current.value())return forward<bool>(current);
+        if(native_source_identity_&&*current.value()!=*native_source_identity_)
+            return reject<bool>("trash.scope_live_source_rebound",ObservationState::Changed);
+        // The actual backend/receipt owner remains live until finish_io clears
+        // this borrowed handle. The value never rehydrates native authority.
+        native_source_=handle;native_directory_=directory;native_source_identity_=*current.value();
+        mutation_source_bound_=mutation_owner;
+        return Observation<bool>::available(true);
+    }
+    void remember(ObservationState state,ErrorDomain domain,int64_t code,std::string_view operation) noexcept {
+        detail::record_prepared_journal_consumer_failure(*root_,state,domain,code,operation);
+        if(finish_failure_.pending)return;
+        finish_failure_.state=state;finish_failure_.domain=domain;finish_failure_.code=code;finish_failure_.pending=true;
+        const auto size=std::min(operation.size(),finish_failure_.operation.size()-1);
+        std::copy_n(operation.data(),size,finish_failure_.operation.data());
+    }
+    Observation<bool> finish_result() const {
+        return finish_failure_.pending?Observation<bool>::unavailable(finish_failure_.state,
+            {finish_failure_.domain,finish_failure_.code,finish_failure_.operation.data()}):Observation<bool>::available(true);
+    }
+    std::shared_ptr<PreparedJournalRoot> root_;
+    HeldChild::Pointer source_;
+    HANDLE native_source_=nullptr;
+    std::optional<NativeDurableIdentity> native_source_identity_;
+    bool native_directory_=false,mutation_source_bound_=false;
+    std::vector<std::unique_ptr<NativeTrashDirectoryProjection>> views_;
+    std::vector<JournalScopeGuard::Pointer> guards_;
+    bool finished_=false;
+    detail::PreparedJournalConsumerFailure finish_failure_;
+};
 Observation<Handle> component(HANDLE parent,const NativeName& n,ACCESS_MASK rights,std::optional<bool> directory,
     ULONG disposition=FILE_OPEN,bool guard=false,PSECURITY_DESCRIPTOR security=nullptr,bool pin_namespace=false) {
     if(!valid_name(n)) return reject<Handle>("trash.component_name",ObservationState::Failed);
@@ -79,6 +243,175 @@ Observation<NativeDurableIdentity> native_id(HANDLE h,bool directory) {
     std::memcpy(out.object.bytes.data(),id.FileId.Identifier,16);
     return Observation<NativeDurableIdentity>::available(std::move(out));
 }
+// A separate native provider, deliberately exposing none of the ordinary
+// Windows cursor's mutation/rights-upgrade methods. Every underlying handle
+// carries query-only rights; parent opens use only kernel parent-ID evidence.
+class QueryOwner final {
+public:
+    QueryOwner(Handle handle,std::shared_ptr<PreparedJournalRoot> root,AdapterScope scope) noexcept
+        :handle_(std::move(handle)),root_(std::move(root)),scope_(std::move(scope)) {}
+    QueryOwner(QueryOwner&& other) noexcept:handle_(std::move(other.handle_)),root_(std::move(other.root_)),
+        scope_(std::move(other.scope_)),closed_(std::exchange(other.closed_,true)),failure_(other.failure_) {}
+    ~QueryOwner(){close();}
+    HANDLE handle() const noexcept{return handle_.get();}
+    const AdapterScope& scope()const noexcept{return scope_;}
+    const std::shared_ptr<PreparedJournalRoot>& root()const noexcept{return root_;}
+    void close() noexcept {
+        if(closed_)return;closed_=true;
+        const auto raw=handle_.release();if(!raw||raw==INVALID_HANDLE_VALUE)return;
+        if(!CloseHandle(raw))record(ObservationState::Unknown,ErrorDomain::Win32,GetLastError(),"trash.scope_query_close");
+        try {
+            if(const auto fault=detail::journal_root_fault(detail::JournalRootFaultPoint::DirectoryClose))
+                record(ObservationState::Unknown,ErrorDomain::Win32,*fault,"trash.scope_query_close");
+        } catch(...) {record(ObservationState::Unknown,ErrorDomain::Adapter,
+            static_cast<int64_t>(AdapterError::InvalidNativeResult),"trash.scope_query_close_exception");}
+    }
+    Observation<bool> finish_io() {
+        close();
+        detail::PreparedJournalConsumerFailure published;
+        if(detail::read_prepared_journal_consumer_failure(*root_,published)&&!published.pending)
+            return Observation<bool>::unavailable(published.state,{published.domain,published.code,published.operation.data()});
+        return failure_.pending?Observation<bool>::unavailable(failure_.state,
+            {failure_.domain,failure_.code,failure_.operation.data()}):Observation<bool>::available(true);
+    }
+    Observation<BasicMetadata> inspect()const {
+        if(closed_)return reject<BasicMetadata>("trash.scope_query_finished",ObservationState::Changed);
+        FILE_BASIC_INFO basic{};FILE_STANDARD_INFO standard{};FILE_ATTRIBUTE_TAG_INFO tag{};
+        if(!GetFileInformationByHandleEx(handle(),FileBasicInfo,&basic,sizeof(basic))||
+            !GetFileInformationByHandleEx(handle(),FileStandardInfo,&standard,sizeof(standard))||
+            !GetFileInformationByHandleEx(handle(),FileAttributeTagInfo,&tag,sizeof(tag)))
+            return fail<BasicMetadata>(GetLastError(),"trash.scope_query_metadata");
+        const bool directory=(basic.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+        if(tag.ReparseTag||basic.FileAttributes!=tag.FileAttributes||standard.DeletePending||
+            basic.ChangeTime.QuadPart<0||basic.LastWriteTime.QuadPart<0)
+            return reject<BasicMetadata>("trash.scope_query_kind_or_time");
+        auto id=native_id(handle(),directory);if(!id.value())return forward<BasicMetadata>(id);
+        BasicMetadata result;
+        result.identity=Observation<ObjectIdentity>::available({scope_,id.value()->scheme,id.value()->volume,id.value()->object,{}});
+        result.kind=Observation<ObjectKind>::available(directory?ObjectKind::Directory:ObjectKind::RegularFile);
+        result.link_count=Observation<uint64_t>::available(standard.NumberOfLinks);
+        FILE_ID_INFO file_id{};
+        if(!GetFileInformationByHandleEx(handle(),FileIdInfo,&file_id,sizeof(file_id)))return fail<BasicMetadata>(GetLastError(),"trash.scope_query_mount");
+        result.mount_id=Observation<uint64_t>::available(file_id.VolumeSerialNumber);
+        result.windows_attributes=Observation<uint32_t>::available(basic.FileAttributes);
+        result.reparse_tag=Observation<uint32_t>::available(0);
+        result.changed=Observation<FileTimestamp>::available(FileTimestamp::from_windows_ticks(static_cast<uint64_t>(basic.ChangeTime.QuadPart)));
+        result.modified=Observation<FileTimestamp>::available(FileTimestamp::from_windows_ticks(static_cast<uint64_t>(basic.LastWriteTime.QuadPart)));
+        if(!directory&&standard.EndOfFile.QuadPart>=0)result.logical_size=Observation<uint64_t>::available(static_cast<uint64_t>(standard.EndOfFile.QuadPart));
+        return Observation<BasicMetadata>::available(std::move(result));
+    }
+private:
+    void record(ObservationState state,ErrorDomain domain,int64_t code,std::string_view operation) noexcept {
+        detail::record_prepared_journal_consumer_failure(*root_,state,domain,code,operation);
+        if(failure_.pending)return;
+        failure_.pending=true;failure_.state=state;failure_.domain=domain;failure_.code=code;
+        std::copy_n(operation.data(),std::min(operation.size(),failure_.operation.size()-1),failure_.operation.data());
+    }
+    Handle handle_;
+    std::shared_ptr<PreparedJournalRoot> root_;
+    AdapterScope scope_;
+    bool closed_=false;
+    detail::PreparedJournalConsumerFailure failure_;
+};
+Observation<detail::WindowsParentIds> query_parent_ids(HANDLE handle) {
+    READ_FILE_USN_DATA input{3,3};alignas(8) std::array<std::byte,65536+80> bytes{};DWORD count=0;
+    if(!DeviceIoControl(handle,FSCTL_READ_FILE_USN_DATA,&input,sizeof(input),bytes.data(),static_cast<DWORD>(bytes.size()),&count,nullptr))
+        return fail<detail::WindowsParentIds>(GetLastError(),"trash.scope_parent_usn");
+    if(count>bytes.size())return reject<detail::WindowsParentIds>("trash.scope_parent_usn_size");
+    return detail::decode_windows_parent_record(std::span<const std::byte>(bytes).first(count),3);
+}
+Observation<std::shared_ptr<QueryOwner>> query_parent(const std::shared_ptr<QueryOwner>& child) {
+    auto before=child->inspect();if(!before.value())return forward<std::shared_ptr<QueryOwner>>(before);
+    if(!before.value()->kind.value()||*before.value()->kind.value()!=ObjectKind::Directory)
+        return reject<std::shared_ptr<QueryOwner>>("trash.scope_parent_directory_required");
+    auto ids=query_parent_ids(child->handle());if(!ids.value())return forward<std::shared_ptr<QueryOwner>>(ids);
+    if(ids.value()->scheme!=IdentityScheme::WindowsFileId128||ids.value()->child!=before.value()->identity.value()->object||
+        !(ids.value()->attributes&FILE_ATTRIBUTE_DIRECTORY))return reject<std::shared_ptr<QueryOwner>>("trash.scope_parent_child_changed",ObservationState::Changed);
+    FILE_ID_DESCRIPTOR descriptor{};descriptor.dwSize=sizeof(descriptor);descriptor.Type=ExtendedFileIdType;
+    std::memcpy(descriptor.ExtendedFileId.Identifier,ids.value()->parent.bytes.data(),16);
+    Handle raw(OpenFileById(child->handle(),&descriptor,FILE_READ_ATTRIBUTES|SYNCHRONIZE,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+    if(!raw.get()||raw.get()==INVALID_HANDLE_VALUE)return fail<std::shared_ptr<QueryOwner>>(GetLastError(),"trash.scope_parent_open_by_id");
+    QueryOwner acquired(std::move(raw),child->root(),child->scope());
+    auto parent=std::make_shared<QueryOwner>(std::move(acquired));
+    auto metadata=parent->inspect();if(!metadata.value())return forward<std::shared_ptr<QueryOwner>>(metadata);
+    const auto& actual=*metadata.value()->identity.value();
+    if(!metadata.value()->kind.value()||*metadata.value()->kind.value()!=ObjectKind::Directory||
+        actual.volume!=before.value()->identity.value()->volume||actual.object!=ids.value()->parent)
+        return reject<std::shared_ptr<QueryOwner>>("trash.scope_parent_identity_changed",ObservationState::Changed);
+    const auto proof=detail::prove_windows_journal_volume(parent->handle());
+    if(!proof.qualified)return Observation<std::shared_ptr<QueryOwner>>::unavailable(proof.state,{proof.domain,proof.code,proof.operation});
+    auto again=query_parent_ids(child->handle());if(!again.value())return forward<std::shared_ptr<QueryOwner>>(again);
+    auto after=child->inspect();if(!after.value())return forward<std::shared_ptr<QueryOwner>>(after);
+    if(*again.value()!=*ids.value()||compare_identity(*before.value()->identity.value(),*after.value()->identity.value())!=IdentityComparison::Same||
+        *before.value()->changed.value()!=*after.value()->changed.value()||*before.value()->modified.value()!=*after.value()->modified.value())
+        return reject<std::shared_ptr<QueryOwner>>("trash.scope_parent_changed",ObservationState::Changed);
+    return Observation<std::shared_ptr<QueryOwner>>::available(std::move(parent));
+}
+class QueryEntry final:public OpenedEntry {
+public:
+    explicit QueryEntry(std::shared_ptr<QueryOwner> owner):owner_(std::move(owner)){}
+    Observation<BasicMetadata> inspect_basic()const override{return owner_->inspect();}
+    Observation<std::unique_ptr<OpenedEntry>> open_parent_directory()const override {
+        auto parent=query_parent(owner_);if(!parent.value())return forward<std::unique_ptr<OpenedEntry>>(parent);
+        return Observation<std::unique_ptr<OpenedEntry>>::available(std::make_unique<QueryEntry>(std::move(parent).take_value()));
+    }
+private:std::shared_ptr<QueryOwner> owner_;
+};
+class QueryDirectory final:public DirectoryCursor {
+public:
+    QueryDirectory(std::shared_ptr<QueryOwner> owner,ObjectIdentity id):DirectoryCursor(Observation<ObjectIdentity>::available(std::move(id))),owner_(std::move(owner)){}
+    Observation<BasicMetadata> inspect_basic()const override{return owner_->inspect();}
+    Observation<AdapterScope> source_scope()const override{return Observation<AdapterScope>::available(owner_->scope());}
+    Observation<std::unique_ptr<OpenedEntry>> open_parent_directory()const override {
+        auto parent=query_parent(owner_);if(!parent.value())return forward<std::unique_ptr<OpenedEntry>>(parent);
+        return Observation<std::unique_ptr<OpenedEntry>>::available(std::make_unique<QueryEntry>(std::move(parent).take_value()));
+    }
+    Observation<std::unique_ptr<OpenedEntry>> open_child(const NativeName& name,EntryAccess access)const override {
+        if(access!=EntryAccess::MetadataOnly)return reject<std::unique_ptr<OpenedEntry>>("trash.scope_query_only_access");
+        auto child=open_query(name,{});if(!child.value())return forward<std::unique_ptr<OpenedEntry>>(child);
+        return Observation<std::unique_ptr<OpenedEntry>>::available(std::make_unique<QueryEntry>(std::move(child).take_value()));
+    }
+    Observation<std::unique_ptr<DirectoryCursor>> open_directory_child(const NativeName& name)const override {
+        auto child=open_query(name,true);if(!child.value())return forward<std::unique_ptr<DirectoryCursor>>(child);
+        auto metadata=(*child.value())->inspect();if(!metadata.value())return forward<std::unique_ptr<DirectoryCursor>>(metadata);
+        const auto proof=detail::prove_windows_journal_volume((*child.value())->handle());
+        if(!proof.qualified)return Observation<std::unique_ptr<DirectoryCursor>>::unavailable(proof.state,{proof.domain,proof.code,proof.operation});
+        return Observation<std::unique_ptr<DirectoryCursor>>::available(std::make_unique<QueryDirectory>(std::move(child).take_value(),*metadata.value()->identity.value()));
+    }
+    Observation<void*> duplicate()const {
+        auto valid=owner_->inspect();if(!valid.value())return forward<void*>(valid);
+        HANDLE raw=nullptr;
+        if(!DuplicateHandle(GetCurrentProcess(),owner_->handle(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))return fail<void*>(GetLastError(),"trash.scope_duplicate_query");
+        return Observation<void*>::available(raw);
+    }
+protected:
+    Observation<DirectoryStep> next_step()override{return reject<DirectoryStep>("trash.scope_no_enumeration");}
+private:
+    Observation<std::shared_ptr<QueryOwner>> open_query(const NativeName& name,std::optional<bool> directory)const {
+        auto valid=owner_->inspect();if(!valid.value())return forward<std::shared_ptr<QueryOwner>>(valid);
+        auto raw=component(owner_->handle(),name,FILE_READ_ATTRIBUTES|SYNCHRONIZE,directory);
+        if(!raw.value())return forward<std::shared_ptr<QueryOwner>>(raw);
+        QueryOwner acquired(std::move(raw).take_value(),owner_->root(),owner_->scope());
+        auto result=std::make_shared<QueryOwner>(std::move(acquired));
+        auto metadata=result->inspect();if(!metadata.value())return forward<std::shared_ptr<QueryOwner>>(metadata);
+        return Observation<std::shared_ptr<QueryOwner>>::available(std::move(result));
+    }
+    std::shared_ptr<QueryOwner> owner_;
+};
+class DirectoryProjection final:public NativeTrashDirectoryProjection {
+public:
+    DirectoryProjection(std::shared_ptr<QueryOwner> owner,ObjectIdentity id):owner_(std::move(owner)),
+        cursor_(std::make_shared<QueryDirectory>(owner_,std::move(id))){}
+    const std::shared_ptr<const DirectoryCursor>& cursor()const noexcept override{return cursor_;}
+    Observation<bool> finish_io()override {
+        if(cursor_.use_count()!=1)return reject<bool>("trash.scope_query_consumers_active",ObservationState::Changed);
+        return owner_->finish_io();
+    }
+private:
+    std::shared_ptr<QueryOwner> owner_;
+    std::shared_ptr<const DirectoryCursor> cursor_;
+};
 Observation<Handle> write_parent(HANDLE held,const NativeDurableIdentity& expected) {
     FILE_ID_DESCRIPTOR id{}; id.dwSize=sizeof(id); id.Type=ExtendedFileIdType;
     std::memcpy(id.ExtendedFileId.Identifier,expected.object.bytes.data(),16);
@@ -157,7 +490,8 @@ Observation<bool> private_bin(HANDLE h,const User& user,bool protected_dacl=fals
     return Observation<bool>::available(true);
 }
 struct Bin { Handle volume,root,user; NativeDurableIdentity id; NativeName sid; NativeDurableIdentity volume_id,root_id; };
-Observation<Bin> open_bin(HANDLE parent,const NativeDurableIdentity& parent_id,bool create) {
+Observation<Bin> open_bin(HANDLE parent,const NativeDurableIdentity& parent_id,bool create,
+    const std::shared_ptr<PrivateScope>& scope={},std::stop_token stop={}) {
     auto path=final_path(parent,FILE_NAME_OPENED|VOLUME_NAME_GUID); if(!path.value()) return forward<Bin>(path);
     const auto end=path.value()->find(L'}');
     if(!path.value()->starts_with(L"\\\\?\\Volume{")||end==std::wstring::npos||end+1>=path.value()->size()||(*path.value())[end+1]!=L'\\')
@@ -169,11 +503,13 @@ Observation<Bin> open_bin(HANDLE parent,const NativeDurableIdentity& parent_id,b
     auto vid=native_id(volume.get(),true); if(!vid.value()) return forward<Bin>(vid);
     if(vid.value()->volume!=parent_id.volume) return reject<Bin>("trash.volume_changed",ObservationState::Changed);
     auto user=current_user(); if(!user.value()) return forward<Bin>(user);
+    if(scope) {auto valid=scope->bind_destination(volume.get(),stop);if(!valid.value()||!*valid.value())return forward<Bin>(valid);}
     auto root_name=*NativeName::from_windows(u"$Recycle.Bin");
     constexpr ACCESS_MASK directory_rights=FILE_LIST_DIRECTORY|FILE_ADD_FILE|FILE_ADD_SUBDIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL|SYNCHRONIZE;
     auto root=component(volume.get(),root_name,directory_rights,true,create?FILE_OPEN_IF:FILE_OPEN,false,nullptr,true);
     if(!root.value()) return forward<Bin>(root); auto rid=native_id(root.value()->get(),true); if(!rid.value()) return forward<Bin>(rid);
     if(rid.value()->volume!=parent_id.volume) return reject<Bin>("trash.bin_volume_changed",ObservationState::Changed);
+    if(scope) {auto valid=scope->bind_destination(root.value()->get(),stop);if(!valid.value()||!*valid.value())return forward<Bin>(valid);}
     auto sid=*NativeName::from_windows(std::u16string(user.value()->sid.begin(),user.value()->sid.end()));
     const auto sddl=L"O:"+user.value()->sid+L"G:"+user.value()->sid+L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;"+user.value()->sid+L")";
     PSECURITY_DESCRIPTOR sd=nullptr;
@@ -184,6 +520,7 @@ Observation<Bin> open_bin(HANDLE parent,const NativeDurableIdentity& parent_id,b
     auto safe=private_bin(own.value()->get(),*user.value()); if(!safe.value()) return forward<Bin>(safe);
     auto id=native_id(own.value()->get(),true); if(!id.value()) return forward<Bin>(id);
     if(id.value()->volume!=parent_id.volume) return reject<Bin>("trash.user_bin_volume_changed",ObservationState::Changed);
+    if(scope) {auto valid=scope->bind_destination(own.value()->get(),stop);if(!valid.value()||!*valid.value())return forward<Bin>(valid);}
     return Observation<Bin>::available({std::move(volume),std::move(root).take_value(),std::move(own).take_value(),*id.value(),std::move(sid),*vid.value(),*rid.value()});
 }
 Observation<bool> validate_bin(const Bin& bin) {
@@ -300,26 +637,29 @@ Observation<bool> metadata_matches(HANDLE h,const NativeTrashReceipt& receipt) {
     if(got!=bytes.size()||bytes!=receipt.metadata_bytes) return reject<bool>("restore.metadata_changed",ObservationState::Changed);
     return Observation<bool>::available(true);
 }
-Observation<bool> close_checked(Handle& handle,const char* operation) {
-    const auto raw=handle.release();
-    if(!raw || raw==INVALID_HANDLE_VALUE)return Observation<bool>::available(true);
-    if(!CloseHandle(raw))return fail<bool>(GetLastError(),operation);
-    return Observation<bool>::available(true);
-}
 class Transaction final : public NativeTrashTransaction {
 public:
-    Transaction(NativeTrashReceipt receipt,Handle parent,Handle object,Bin bin,bool restore,Handle metadata=Handle{})
+    Transaction(NativeTrashReceipt receipt,Handle parent,Handle object,Bin bin,bool restore,Handle metadata=Handle{},
+        std::shared_ptr<PrivateScope> scope={})
         : receipt_(std::move(receipt)),parent_(std::move(parent)),object_(std::move(object)),bin_(std::move(bin)),
-          metadata_(std::move(metadata)),restore_(restore) {}
+          metadata_(std::move(metadata)),scope_(std::move(scope)),restore_(restore) {}
+    ~Transaction() override {try {(void)finish_io();}catch(...) {}}
     const NativeTrashReceipt& receipt() const noexcept override { return receipt_; }
     bool mutation_attempted() const noexcept override { return attempted_; }
+    Observation<bool> revalidate_private_scope(std::stop_token stop) const override {
+        if(!scope_||!scope_->source_bound())return reject<bool>("trash.private_scope_unbound");
+        return scope_->check(stop);
+    }
+    Observation<bool> finish_io() override {return finish_handles();}
     Observation<bool> commit(const NativeTrashJournal& journal,std::stop_token stop) override {
         if(started_) return reject<bool>("trash.one_shot",ObservationState::Changed); started_=true;
         if(stop.stop_requested()) return reject<bool>("trash.cancelled",ObservationState::Unknown);
+        if(scope_) {auto valid=scope_->check(stop);if(!valid.value()||!*valid.value())return valid;}
         auto namespace_valid=validate_bin(bin_);if(!namespace_valid.value())return namespace_valid;
         for(auto s:{OperationJournalState::Planned,OperationJournalState::Prepared}) { auto r=journal(s,receipt_); if(!r.value()||!*r.value()) return r; }
         namespace_valid=validate_bin(bin_);if(!namespace_valid.value())return namespace_valid;
         if(!restore_) {
+            if(scope_) {auto valid=scope_->check(stop);if(!valid.value()||!*valid.value())return valid;}
             auto clear=absent(bin_.user.get(),receipt_.data_name); if(!clear.value()) return clear;
             auto user=current_user();if(!user.value())return forward<bool>(user);
             auto sd=private_file_descriptor(*user.value());if(!sd.value())return forward<bool>(sd);
@@ -339,6 +679,7 @@ public:
         auto intended=journal(OperationJournalState::CommitIntended,receipt_); if(!intended.value()||!*intended.value()) return intended;
         if(stop.stop_requested()) return reject<bool>("trash.cancelled_before_move",ObservationState::Unknown);
         namespace_valid=validate_bin(bin_);if(!namespace_valid.value())return namespace_valid;
+        if(scope_) {auto valid=scope_->check(stop);if(!valid.value()||!*valid.value())return valid;}
         const auto target=restore_?parent_.get():bin_.user.get(); const auto& name=restore_?receipt_.original_name:receipt_.data_name;
         auto clear=absent(target,name); if(!clear.value()) return clear;
         const bool directory=receipt_.object_kind==ObjectKind::Directory;
@@ -354,13 +695,14 @@ public:
         auto committed=journal(OperationJournalState::DestinationCommitted,receipt_); if(!committed.value()||!*committed.value()) return committed;
         auto removal=journal(OperationJournalState::SourceRemovalIntended,receipt_); if(!removal.value()||!*removal.value()) return removal;
         if(restore_) {
+            if(scope_) {auto valid=scope_->check(stop,false);if(!valid.value()||!*valid.value())return valid;}
             // Only this verified $I metadata handle is disposed. The user's $R
             // object has already been published and verified at its original name.
             auto m=metadata_matches(metadata_.get(),receipt_); if(!m.value()) return m;
             FILE_DISPOSITION_INFO_EX disposition{};
             disposition.Flags=FILE_DISPOSITION_FLAG_DELETE|FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
             if(!SetFileInformationByHandle(metadata_.get(),FileDispositionInfoEx,&disposition,sizeof(disposition))) return fail<bool>(GetLastError(),"restore.metadata_cleanup");
-            const auto closed=close_checked(metadata_,"restore.metadata_close");if(!closed.value())return closed;
+            close_handle(metadata_,"restore.metadata_close");if(finish_failure_.pending)return finish_result();
             const auto gone=absent(bin_.user.get(),receipt_.metadata_name);if(!gone.value())return gone;
             if(!FlushFileBuffers(bin_.user.get())) return fail<bool>(GetLastError(),"restore.metadata_cleanup_flush");
             receipt_.metadata_retired=true;
@@ -371,17 +713,50 @@ public:
     }
 private:
     Observation<bool> finish_handles() {
-        std::optional<UnavailableObservation> first;
+        if(finished_)return finish_result();
+        if(scope_)try {
+            const auto closed=scope_->finish_io();
+            if(!closed.value())remember_finish(*closed.unavailable_detail());
+        } catch(...) {
+            detail::PreparedJournalConsumerFailure failure;
+            if(scope_->read_failure(failure)&&!failure.pending)remember_finish(failure.state,failure.domain,failure.code,failure.operation.data());
+            else remember_finish_exception("trash.scope_finish_exception");
+        }
         for(const auto& item:{std::pair{&metadata_,"trash.metadata_close"},
             std::pair{&object_,"trash.object_close"},std::pair{&parent_,"trash.parent_close"},
             std::pair{&bin_.user,"trash.bin_close"},std::pair{&bin_.root,"trash.bin_root_close"},std::pair{&bin_.volume,"trash.volume_close"}}) {
-            const auto closed=close_checked(*item.first,item.second);
-            if(!closed.value() && !first)first=*closed.unavailable_detail();
+            close_handle(*item.first,item.second);
         }
-        return first?Observation<bool>::unavailable(first->state,first->error):Observation<bool>::available(true);
+        finished_=true;return finish_result();
+    }
+    void remember_finish(const UnavailableObservation& error) noexcept {
+        remember_finish(error.state,error.error.domain,error.error.code,error.error.operation);
+    }
+    void remember_finish(ObservationState state,ErrorDomain domain,int64_t code,std::string_view operation)noexcept {
+        if(scope_)scope_->record_failure(state,domain,code,operation);
+        if(finish_failure_.pending)return;
+        finish_failure_.pending=true;finish_failure_.state=state;
+        finish_failure_.domain=domain;finish_failure_.code=code;
+        std::copy_n(operation.data(),std::min(operation.size(),finish_failure_.operation.size()-1),finish_failure_.operation.data());
+    }
+    void close_handle(Handle& handle,std::string_view operation)noexcept {
+        const auto raw=handle.release();if(!raw||raw==INVALID_HANDLE_VALUE)return;
+        if(!CloseHandle(raw))remember_finish(ObservationState::Unknown,ErrorDomain::Win32,GetLastError(),operation);
+    }
+    void remember_finish_exception(std::string_view operation) noexcept {
+        if(finish_failure_.pending)return;
+        finish_failure_.pending=true;finish_failure_.state=ObservationState::Unknown;
+        finish_failure_.domain=ErrorDomain::Adapter;finish_failure_.code=static_cast<int64_t>(AdapterError::InvalidNativeResult);
+        std::copy_n(operation.data(),std::min(operation.size(),finish_failure_.operation.size()-1),finish_failure_.operation.data());
+    }
+    Observation<bool> finish_result() const {
+        return finish_failure_.pending?Observation<bool>::unavailable(finish_failure_.state,
+            {finish_failure_.domain,finish_failure_.code,finish_failure_.operation.data()}):Observation<bool>::available(true);
     }
     NativeTrashReceipt receipt_; Handle parent_,object_; Bin bin_; Handle metadata_;
-    bool restore_=false,started_=false,attempted_=false;
+    std::shared_ptr<PrivateScope> scope_;
+    detail::PreparedJournalConsumerFailure finish_failure_;
+    bool restore_=false,started_=false,attempted_=false,finished_=false;
 };
 class Backend final : public NativeTrashBackend {
     using R=Observation<std::unique_ptr<NativeTrashTransaction>>;
@@ -393,8 +768,7 @@ class Backend final : public NativeTrashBackend {
         if(*id.value()!=expected) return reject<Handle>("trash.parent_substituted",ObservationState::Changed);
         return write_parent(duplicate.value()->get(),expected);
     }
-public:
-    R prepare_trash(HeldChild::Pointer held,std::stop_token stop) const override {
+    R prepare_trash_impl(HeldChild::Pointer held,std::stop_token stop,const std::shared_ptr<PrivateScope>& scope) const {
         if(!held||stop.stop_requested()||!held->parent_identity().value()||!held->metadata().identity.value()||!valid_name(held->name()))
             return reject<std::unique_ptr<NativeTrashTransaction>>("trash.held_input");
         auto pid=NativeDurableIdentity::from_live(*held->parent_identity().value()); auto sid=NativeDurableIdentity::from_live(*held->metadata().identity.value());
@@ -403,11 +777,13 @@ public:
         if(!kind || (*kind!=ObjectKind::RegularFile && *kind!=ObjectKind::Directory))
             return reject<std::unique_ptr<NativeTrashTransaction>>("trash.input_kind");
         const bool directory=*kind==ObjectKind::Directory;
+        if(scope) {auto valid=scope->bind_source(held,stop);if(!valid.value()||!*valid.value())return forward<std::unique_ptr<NativeTrashTransaction>>(valid);}
         auto p=parent(held->parent(),*pid); if(!p.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(p);
         auto object=component(p.value()->get(),held->name(),DELETE|FILE_READ_ATTRIBUTES|READ_CONTROL,directory,FILE_OPEN,true);
         if(!object.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(object);
         auto id=native_id(object.value()->get(),directory); if(!id.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(id);
         if(*id.value()!=*sid) return reject<std::unique_ptr<NativeTrashTransaction>>("trash.source_substituted",ObservationState::Changed);
+        if(scope) {auto valid=scope->bind_mutation_source(object.value()->get(),directory,stop);if(!valid.value())return forward<std::unique_ptr<NativeTrashTransaction>>(valid);}
         auto path=original_parent_path(p.value()->get()); if(!path.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(path);
         std::wstring original=*path.value(); if(original.starts_with(L"\\\\?\\UNC\\")) return reject<std::unique_ptr<NativeTrashTransaction>>("trash.remote_namespace");
         if(original.starts_with(L"\\\\?\\")&&original.size()>=7&&original[5]==L':') original.erase(0,4);
@@ -418,7 +794,7 @@ public:
         auto bytes=windows_trash_metadata(std::u16string(original.begin(),original.end()),directory?0:static_cast<uint64_t>(standard.EndOfFile.QuadPart),
             (static_cast<uint64_t>(time.dwHighDateTime)<<32)|time.dwLowDateTime);
         if(!bytes.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(bytes);
-        auto bin=open_bin(p.value()->get(),*pid,true); if(!bin.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(bin);
+        auto bin=open_bin(p.value()->get(),*pid,true,scope,stop); if(!bin.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(bin);
         if(directory && (*sid==bin.value()->volume_id || *sid==bin.value()->root_id || *sid==bin.value()->id))
             return reject<std::unique_ptr<NativeTrashTransaction>>("trash.protected_bin_ancestor");
         std::array<unsigned char,16> random{};
@@ -431,9 +807,10 @@ public:
         clear=absent(bin.value()->user.get(),metadata); if(!clear.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(clear);
         NativeTrashReceipt receipt{held->name(),std::move(data),std::move(metadata),bin.value()->sid,*pid,*sid,bin.value()->id,{},std::move(bytes).take_value(),{}};
         receipt.object_kind=*kind;
-        return R::available(std::make_unique<Transaction>(std::move(receipt),std::move(p).take_value(),std::move(object).take_value(),std::move(bin).take_value(),false));
+        return R::available(std::make_unique<Transaction>(std::move(receipt),std::move(p).take_value(),std::move(object).take_value(),std::move(bin).take_value(),false,Handle{},scope));
     }
-    R prepare_restore(const NativeTrashReceipt& receipt,std::shared_ptr<const DirectoryCursor> original,std::stop_token stop) const override {
+    R prepare_restore_impl(const NativeTrashReceipt& receipt,std::shared_ptr<const DirectoryCursor> original,std::stop_token stop,
+        const std::shared_ptr<PrivateScope>& scope) const {
         if(!original||stop.stop_requested()||!valid_name(receipt.original_name)||!valid_name(receipt.data_name)||!valid_name(receipt.metadata_name)||
             !receipt.metadata_identity||receipt.metadata_bytes.size()>65564 ||
             (receipt.object_kind!=ObjectKind::RegularFile && receipt.object_kind!=ObjectKind::Directory))
@@ -442,22 +819,78 @@ public:
         if(!owner)return reject<std::unique_ptr<NativeTrashTransaction>>("restore.live_identity_owner_required");
         auto continuous=owner->validate(receipt);if(!continuous.value())return forward<std::unique_ptr<NativeTrashTransaction>>(continuous);
         auto p=parent(std::move(original),receipt.original_parent); if(!p.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(p);
-        auto bin=open_bin(p.value()->get(),receipt.original_parent,false); if(!bin.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(bin);
+        if(scope) {auto valid=scope->bind_destination(p.value()->get(),stop);if(!valid.value()||!*valid.value())return forward<std::unique_ptr<NativeTrashTransaction>>(valid);}
+        auto bin=open_bin(p.value()->get(),receipt.original_parent,false,scope,stop); if(!bin.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(bin);
         if(bin.value()->id!=receipt.recycle_parent||bin.value()->sid!=receipt.user_sid) return reject<std::unique_ptr<NativeTrashTransaction>>("restore.bin_identity",ObservationState::Changed);
         const bool directory=receipt.object_kind==ObjectKind::Directory;
+        if(scope) {
+            auto valid=scope->bind_restore_source(owner->object.get(),directory,stop);
+            if(!valid.value())return forward<std::unique_ptr<NativeTrashTransaction>>(valid);
+        }
         auto object=component(bin.value()->user.get(),receipt.data_name,DELETE|FILE_READ_ATTRIBUTES|READ_CONTROL,directory,FILE_OPEN,true);
         if(!object.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(object);
         auto id=native_id(object.value()->get(),directory); if(!id.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(id);
         if(*id.value()!=receipt.object) return reject<std::unique_ptr<NativeTrashTransaction>>("restore.object_identity",ObservationState::Changed);
+        if(scope) {
+            auto valid=scope->bind_mutation_source(object.value()->get(),directory,stop);
+            if(!valid.value())return forward<std::unique_ptr<NativeTrashTransaction>>(valid);
+        }
         auto metadata=component(bin.value()->user.get(),receipt.metadata_name,FILE_READ_DATA|FILE_READ_ATTRIBUTES|READ_CONTROL|DELETE,false,FILE_OPEN,true);
         if(!metadata.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(metadata);
         auto user=current_user();if(!user.value())return forward<std::unique_ptr<NativeTrashTransaction>>(user);
         auto privacy=private_bin(metadata.value()->get(),*user.value(),true);if(!privacy.value())return forward<std::unique_ptr<NativeTrashTransaction>>(privacy);
         auto matches=metadata_matches(metadata.value()->get(),receipt); if(!matches.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(matches);
         auto clear=absent(p.value()->get(),receipt.original_name); if(!clear.value()) return forward<std::unique_ptr<NativeTrashTransaction>>(clear);
-        return R::available(std::make_unique<Transaction>(receipt,std::move(p).take_value(),std::move(object).take_value(),std::move(bin).take_value(),true,std::move(metadata).take_value()));
+        return R::available(std::make_unique<Transaction>(receipt,std::move(p).take_value(),std::move(object).take_value(),std::move(bin).take_value(),true,std::move(metadata).take_value(),scope));
+    }
+    R complete_preparation(R result,const std::shared_ptr<PrivateScope>& scope) const {
+        if(!result.value()) {auto closed=scope->finish_io();if(!closed.value())return forward<std::unique_ptr<NativeTrashTransaction>>(closed);}
+        return result;
+    }
+public:
+    R prepare_trash(HeldChild::Pointer held,std::stop_token stop) const override {
+        return prepare_trash_impl(std::move(held),stop,{});
+    }
+    R prepare_restore(const NativeTrashReceipt& receipt,std::shared_ptr<const DirectoryCursor> original,std::stop_token stop) const override {
+        return prepare_restore_impl(receipt,std::move(original),stop,{});
+    }
+    R prepare_trash_scoped(HeldChild::Pointer held,std::shared_ptr<PreparedJournalRoot> root,std::stop_token stop) const override {
+        if(!root)return reject<std::unique_ptr<NativeTrashTransaction>>("trash.private_root_missing");
+        auto scope=std::make_shared<PrivateScope>(std::move(root));
+        return complete_preparation(prepare_trash_impl(std::move(held),stop,scope),scope);
+    }
+    R prepare_restore_scoped(const NativeTrashReceipt& receipt,std::shared_ptr<const DirectoryCursor> original,
+        std::shared_ptr<PreparedJournalRoot> root,std::stop_token stop) const override {
+        if(!root)return reject<std::unique_ptr<NativeTrashTransaction>>("restore.private_root_missing");
+        auto scope=std::make_shared<PrivateScope>(std::move(root));
+        return complete_preparation(prepare_restore_impl(receipt,std::move(original),stop,scope),scope);
     }
 };
+}
+Observation<std::unique_ptr<NativeTrashDirectoryProjection>> project_windows_trash_directory(WindowsTrashScopeHandle token) {
+    using R=Observation<std::unique_ptr<NativeTrashDirectoryProjection>>;
+    if(!token.root_)return reject<std::unique_ptr<NativeTrashDirectoryProjection>>("trash.scope_projection_root_required");
+    AdapterScope scope;
+    QueryOwner incoming(std::move(token.handle_),token.root_,scope);
+    HANDLE raw=nullptr;
+    // Deliberately reduce the issuer's SAME_ACCESS duplicate. Even a consumer
+    // of the trusted inspection bridge receives query-only native rights.
+    if(!DuplicateHandle(GetCurrentProcess(),incoming.handle(),GetCurrentProcess(),&raw,
+        FILE_READ_ATTRIBUTES|SYNCHRONIZE,FALSE,0))return fail<std::unique_ptr<NativeTrashDirectoryProjection>>(GetLastError(),"trash.scope_reduce_rights");
+    QueryOwner reduced(Handle(raw),token.root_,scope);
+    const auto closed=incoming.finish_io();if(!closed.value())return forward<std::unique_ptr<NativeTrashDirectoryProjection>>(closed);
+    const auto proof=detail::prove_windows_journal_volume(reduced.handle());
+    if(!proof.qualified)return R::unavailable(proof.state,{proof.domain,proof.code,proof.operation});
+    auto metadata=reduced.inspect();if(!metadata.value())return forward<std::unique_ptr<NativeTrashDirectoryProjection>>(metadata);
+    if(!metadata.value()->kind.value()||*metadata.value()->kind.value()!=ObjectKind::Directory)
+        return reject<std::unique_ptr<NativeTrashDirectoryProjection>>("trash.scope_projection_directory_required");
+    auto owner=std::make_shared<QueryOwner>(std::move(reduced));
+    return R::available(std::make_unique<DirectoryProjection>(std::move(owner),*metadata.value()->identity.value()));
+}
+Observation<void*> detail::duplicate_windows_trash_scope_directory(const DirectoryCursor& cursor) {
+    const auto* native=dynamic_cast<const QueryDirectory*>(&cursor);
+    if(!native)return reject<void*>("trash.genuine_scope_projection_required");
+    return native->duplicate();
 }
 std::shared_ptr<const NativeTrashBackend> native_trash_backend() { return std::make_shared<Backend>(); }
 } // namespace ck::files

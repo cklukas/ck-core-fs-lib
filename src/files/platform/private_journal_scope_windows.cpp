@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "private_journal_scope_native.hpp"
+#include "../native_trash.hpp"
 #include "native_journal_directory_bridge.hpp"
 #include "prepared_journal_root_bridge.hpp"
 #define WIN32_LEAN_AND_MEAN
@@ -10,6 +11,8 @@
 namespace ck::files::detail {
 Observation<bool> certify_journal_scope_cursor(PreparedJournalRoot& root,const DirectoryCursor& cursor) {
     auto duplicate=duplicate_windows_journal_directory(cursor);
+    if(!duplicate.value() && duplicate.state()==ObservationState::Unsupported)
+        duplicate=duplicate_windows_trash_scope_directory(cursor);
     if(!duplicate.value()) {const auto& e=*duplicate.unavailable_detail();return Observation<bool>::unavailable(e.state,e.error);}
     // The bridge transfers one genuine native cursor duplicate. Keep only
     // scalars/stack storage until it has been explicitly consumed below.

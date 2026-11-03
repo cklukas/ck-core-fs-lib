@@ -5,9 +5,11 @@
 #endif
 #include "native_filesystem.hpp"
 #include "native_home.hpp"
-#include "native_journal_directory_bridge.hpp"
 #include "metadata_replay.hpp"
+#include "metadata_capture_job.hpp"
+#include "native_metadata_stream_target.hpp"
 #include "linux_anonymous_staging.hpp"
+#include "native_journal_directory_bridge.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -213,13 +215,15 @@ Observation<BasicMetadata> statx_metadata(int descriptor, const char* path, int 
 class OwnedDescriptor final {
 public:
     explicit OwnedDescriptor(int descriptor) : descriptor_(descriptor) {}
-    ~OwnedDescriptor() { if (descriptor_ >= 0) close(descriptor_); }
+    ~OwnedDescriptor() { if (descriptor_ >= 0 && close(descriptor_)!=0) {
+        const int e=errno;detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Posix,e,"metadata_capture.temporary_close"});errno=e;
+    } }
     OwnedDescriptor(const OwnedDescriptor&) = delete;
     OwnedDescriptor& operator=(const OwnedDescriptor&) = delete;
     OwnedDescriptor(OwnedDescriptor&& other) noexcept : descriptor_(std::exchange(other.descriptor_, -1)) {}
     OwnedDescriptor& operator=(OwnedDescriptor&& other) noexcept {
         if (this != &other) {
-            if (descriptor_ >= 0) close(descriptor_);
+            if (descriptor_ >= 0 && close(descriptor_)!=0) {const int e=errno;detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Posix,e,"metadata_capture.temporary_close"});errno=e;}
             descriptor_ = std::exchange(other.descriptor_, -1);
         }
         return *this;
@@ -479,10 +483,48 @@ class PosixOpenedEntry final : public OpenedEntry {
 public:
     PosixOpenedEntry(OwnedDescriptor descriptor, AdapterScope scope, bool layout_access = false,
                      bool content_access = false, bool content_write_access = false,
-                     std::unique_ptr<PosixPublicationContext> publication = {})
+                     std::unique_ptr<PosixPublicationContext> publication = {}, bool directory_metadata_target = false)
         : descriptor_(std::move(descriptor)), scope_(std::move(scope)), layout_access_(layout_access),
           content_access_(content_access), content_write_access_(content_write_access),
-          publication_(std::move(publication)) {}
+          publication_(std::move(publication)), directory_metadata_target_(directory_metadata_target) {}
+    Observation<bool> qualify_progressive_metadata_target(const NativeMetadataProof& proof)const {
+        using R=Observation<bool>;
+        if(auto e=proof.cleanup_error())return R::unavailable(e->state,{e->domain,e->code,e->operation});
+        if(proof.io_finished()||!content_write_access_||finish_started_||(!publication_&&!directory_metadata_target_)||
+           !proof.snapshot().channels.empty()||!proof.snapshot().policy.valid())
+            return R::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::ProviderReviewRequired,"metadata_stream.private_open_target_required"));
+        auto qualified=qualify_metadata_replay(proof.snapshot().policy);if(!qualified.value()||!*qualified.value())return qualified;
+        auto target=inspect_basic();if(!target.value()){const auto&e=*target.unavailable_detail();return R::unavailable(e.state,e.error);}
+        const auto& expected=proof.snapshot().basic;
+        if(!expected.kind.value()||!target.value()->kind.value()||*expected.kind.value()!=*target.value()->kind.value()||
+           (*expected.kind.value()==ObjectKind::RegularFile&&(!expected.logical_size.value()||!target.value()->logical_size.value()||
+            *expected.logical_size.value()!=*target.value()->logical_size.value())))
+            return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,"metadata_stream.target_shape"));
+        return R::available(true);
+    }
+    void finish_capture_reads()noexcept {
+        if(capture_close_started_){if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);return;}
+        capture_close_started_=true;
+        if(content_write_access_){capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_capture.writer_not_read_owner"};}
+        else {finish_started_=true;content_access_=false;layout_access_=false;const int fd=descriptor_.release();
+            // Consume once; POSIX EINTR/ambiguous failures are never retried.
+            if(fd>=0&&close(fd)!=0)capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Posix,errno,"metadata_capture.source_close"};
+        }
+        if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);
+    }
+    Observation<std::shared_ptr<const OpenedEntry>> open_progressive_metadata_source()const {
+        using R=Observation<std::shared_ptr<const OpenedEntry>>;
+        const auto basic=inspect_basic();if(!basic.value()){const auto&e=*basic.unavailable_detail();return R::unavailable(e.state,e.error);}
+        const bool file=basic.value()->kind.value()&&*basic.value()->kind.value()==ObjectKind::RegularFile;
+        const int flags=fcntl(descriptor_.get(),F_GETFL);
+        if(flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_capture.source_flags"});
+        if((flags&O_ACCMODE)!=O_RDONLY||content_write_access_||(file&&!content_access_))
+            return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"metadata_capture.readonly_content_source_required"));
+        OwnedDescriptor fd(fcntl(descriptor_.get(),F_DUPFD_CLOEXEC,0));
+        if(fd.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_capture.source_dup"});
+        return R::available(std::make_shared<PosixOpenedEntry>(std::move(fd),scope_,false,file));
+    }
     Observation<ContentRead> read_content(ContentReadLimits limits = {}, std::uint64_t offset = 0,
                                           std::stop_token stop = {}) const override {
         using Result = Observation<ContentRead>;
@@ -606,7 +648,7 @@ public:
     }
     Observation<bool> apply_current_caller_ownership() override {
         using Result = Observation<bool>;
-        if (!content_write_access_ || !publication_)
+        if (!content_write_access_ || (!publication_&&!directory_metadata_target_))
             return Result::unavailable(ObservationState::Denied,
                 adapter_error(AdapterError::InvalidAccess, "regular_metadata.ownership_staging_only"));
         const auto ownership=qualify_ownership_semantics();
@@ -614,7 +656,8 @@ public:
         struct stat native{};
         if (fstat(descriptor_.get(), &native) != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "regular_metadata.ownership_before"});
-        if (!S_ISREG(native.st_mode) || !metadata_link_count_qualified(native.st_nlink))
+        if ((!S_ISREG(native.st_mode)&&!(directory_metadata_target_&&S_ISDIR(native.st_mode))) ||
+            (directory_metadata_target_?native.st_nlink<1:!metadata_link_count_qualified(native.st_nlink)))
             return Result::unavailable(ObservationState::Unsupported,
                 adapter_error(AdapterError::ProviderReviewRequired, "regular_metadata.ownership_kind_links"));
         const auto uid = geteuid();
@@ -719,6 +762,26 @@ public:
         if (!unchanged.value() || !*unchanged.value()) return refuse("regular_metadata.changed_during_qualification");
         return Result::available(true);
     }
+    Observation<std::unique_ptr<OpenedEntry>> open_directory_metadata_target(const MetadataReplayPolicy& policy) const override {
+        using Result=Observation<std::unique_ptr<OpenedEntry>>;
+        if(!policy.valid())return Result::unavailable(ObservationState::Failed,adapter_error(AdapterError::InvalidIdentifier,"metadata_replay.directory_policy"));
+        const auto ownership=qualify_ownership_semantics();
+        if(!ownership.value()){const auto& e=*ownership.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        const auto before=inspect_basic();
+        if(!before.value()){const auto& e=*before.unavailable_detail();return Result::unavailable(e.state,e.error);}
+        if(!before.value()->kind.value()||*before.value()->kind.value()!=ObjectKind::Directory||!before.value()->identity.value())
+            return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::NotApplicable,"metadata_replay.directory_kind"));
+        // A fresh open description, not dup(): finalization fully closes this
+        // operation's writer while the caller's held directory stays alive.
+        OwnedDescriptor opened(openat(descriptor_.get(),".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
+        if(opened.get()<0)return Result::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.directory_openat"});
+        auto writer=std::make_unique<PosixOpenedEntry>(std::move(opened),scope_,false,false,true,nullptr,true);
+        const auto after=writer->inspect_basic();
+        if(!after.value()||!after.value()->identity.value()||
+           compare_identity(*before.value()->identity.value(),*after.value()->identity.value())!=IdentityComparison::Same)
+            return Result::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,"metadata_replay.directory_writer_identity"));
+        return Result::available(std::move(writer));
+    }
     Observation<bool> qualify_metadata_replay(const MetadataReplayPolicy& policy) const override {
         using Result = Observation<bool>;
         const auto refuse = [](const char* operation) {
@@ -754,9 +817,10 @@ public:
         auto before = inspect_basic();
         if (!before.value()) return refuse("regular_metadata.basic_coverage");
         const auto& basic = *before.value();
-        if (!basic.kind.value() || *basic.kind.value() != ObjectKind::RegularFile ||
+        const bool directory=basic.kind.value()&&*basic.kind.value()==ObjectKind::Directory;
+        if (!basic.kind.value() || (!directory&&*basic.kind.value() != ObjectKind::RegularFile) ||
             !basic.posix_permissions.value() ||
-            !basic.link_count.value() || !metadata_link_count_qualified(*basic.link_count.value()))
+            !basic.link_count.value() || (directory?*basic.link_count.value()<1:!metadata_link_count_qualified(*basic.link_count.value())))
             return refuse("regular_metadata.kind_mode_links");
 #if defined(__linux__)
         if (policy.scope==RegularMetadataScope::CompleteMetadataV1 && basic.created.value())
@@ -783,12 +847,12 @@ public:
         if (readable.get() < 0) return refuse("regular_metadata.held_descriptor_read_access");
         struct stat original{}, reopened{};
         if (fstat(descriptor_.get(), &original) != 0 || fstat(readable.get(), &reopened) != 0 ||
-            original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino || !S_ISREG(reopened.st_mode))
+            original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino || (directory?!S_ISDIR(reopened.st_mode):!S_ISREG(reopened.st_mode)))
             return refuse("regular_metadata.held_handle_identity");
         int flags = 0;
         // Provider-specific representation bits are distinct from policy.
         if (ioctl(readable.get(), FS_IOC_GETFLAGS, &flags) != 0 ||
-            !detail::linux_ordinary_inode_flags(provider,static_cast<std::uint32_t>(flags)))
+            !detail::linux_ordinary_inode_flags(provider,static_cast<std::uint32_t>(flags),directory))
             return refuse("regular_metadata.inode_flags");
         struct fsxattr extended{};
         if (ioctl(readable.get(), FS_IOC_FSGETXATTR, &extended) != 0 ||
@@ -821,6 +885,7 @@ public:
                 return refuse("metadata_replay.linux_unlisted_security_attribute");
         }
 #endif
+        if (!directory) {
         PosixOpenedEntry query(std::move(readable), scope_, true);
         const auto layout = query.inspect_data_layout();
         if (!layout.value() || !basic.logical_size.value() ||
@@ -831,8 +896,22 @@ public:
         if ((size == 0 && !ranges.empty()) || (size != 0 &&
             (ranges.size() != 1 || ranges.front().offset != 0 || ranges.front().length != size)))
             return refuse("regular_metadata.sparse_layout");
+        }
         const auto after = inspect_basic();
         if (!after.value()) return refuse("regular_metadata.final_basic_coverage");
+        if(directory) {
+            const auto& current=*after.value();
+            const auto same=[](const auto& a,const auto& b){return a.value()&&b.value()?*a.value()==*b.value():!a.value()&&!b.value()&&a.state()==b.state();};
+            if(!current.identity.value()||!basic.identity.value()||
+               compare_identity(*basic.identity.value(),*current.identity.value())!=IdentityComparison::Same||
+               !current.kind.value()||*current.kind.value()!=ObjectKind::Directory||
+               !same(basic.link_count,current.link_count)||!same(basic.modified,current.modified)||!same(basic.changed,current.changed)||
+               !same(basic.posix_permissions,current.posix_permissions)||!same(basic.posix_uid,current.posix_uid)||
+               !same(basic.posix_gid,current.posix_gid)||!same(basic.bsd_flags,current.bsd_flags))
+                return Result::unavailable(ObservationState::Changed,
+                    adapter_error(AdapterError::MetadataChanged,"metadata_replay.directory_changed_during_qualification"));
+            return Result::available(true);
+        }
         auto unchanged = detail::data_layout_metadata_unchanged(basic, *after.value());
         if (!unchanged.value() || !*unchanged.value()) return refuse("regular_metadata.changed_during_qualification");
         return Result::available(true);
@@ -951,7 +1030,7 @@ public:
     }
     Observation<bool> apply_replay_ownership(const BasicMetadata& source, const MetadataReplayPolicy& policy) override {
         using Result = Observation<bool>;
-        if (!policy.valid() || !content_write_access_ || !publication_)
+        if (!policy.valid() || !content_write_access_ || (!publication_&&!directory_metadata_target_))
             return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess, "metadata_replay.staging_ownership"));
         const auto ownership=qualify_ownership_semantics();
         if (!ownership.value()) {const auto& e=*ownership.unavailable_detail();return Result::unavailable(e.state,e.error);}
@@ -967,7 +1046,7 @@ public:
     Observation<bool> apply_replay_attribute(const AttributeValue& value, const MetadataReplayPolicy& policy) override {
         using Result = Observation<bool>;
         const auto* name = value.identifier.posix_bytes();
-        if (!policy.valid() || !content_write_access_ || !publication_ || !name || !NativeFeatureIdentifier::from_posix(*name))
+        if (!policy.valid() || !content_write_access_ || (!publication_&&!directory_metadata_target_) || !name || !NativeFeatureIdentifier::from_posix(*name))
             return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess, "metadata_replay.staging_attribute"));
         if (value.bytes.size() > policy.limits.max_native_bytes || !value.owner.value() ||
             compare_identity(*value.owner.value(), *value.owner.value()) != IdentityComparison::Same)
@@ -989,7 +1068,7 @@ public:
     Observation<bool> remove_replay_attribute(const NativeFeatureIdentifier& id, const MetadataReplayPolicy& policy) override {
         using Result = Observation<bool>;
         const auto* name=id.posix_bytes();
-        if (!policy.valid() || !content_write_access_ || !publication_ || !name || !NativeFeatureIdentifier::from_posix(*name))
+        if (!policy.valid() || !content_write_access_ || (!publication_&&!directory_metadata_target_) || !name || !NativeFeatureIdentifier::from_posix(*name))
             return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess,"metadata_replay.staging_remove_attribute"));
         if ((name->starts_with("security.") || *name == "com.apple.macl" || *name == "com.apple.rootless" || name->starts_with("trusted.")) && !policy.allow_privilege_metadata)
             return Result::unavailable(ObservationState::Denied, adapter_error(AdapterError::InvalidAccess,"metadata_replay.remove_attribute_optin"));
@@ -1003,7 +1082,7 @@ public:
     }
     Observation<bool> apply_replay_security(const NativeSecurityValue& value, const MetadataReplayPolicy& policy) override {
         using Result = Observation<bool>;
-        if (!policy.valid() || !content_write_access_ || !publication_ || !value.owner.value() ||
+        if (!policy.valid() || !content_write_access_ || (!publication_&&!directory_metadata_target_) || !value.owner.value() ||
             value.bytes.size() > policy.limits.max_native_bytes ||
             (value.presence != SecurityPresence::Present && value.presence != SecurityPresence::Absent) ||
             (value.presence == SecurityPresence::Absent && !value.bytes.empty()))
@@ -1011,9 +1090,14 @@ public:
         const auto ownership=qualify_ownership_semantics();
         if (!ownership.value()) {const auto& e=*ownership.unavailable_detail();return Result::unavailable(e.state,e.error);}
 #if defined(__linux__)
-        if (value.part != SecurityPart::LinuxAccessAcl || value.encoding != SecurityEncoding::LinuxPosixAclXattrV2)
+        if ((value.part != SecurityPart::LinuxAccessAcl&&value.part!=SecurityPart::LinuxDefaultAcl) || value.encoding != SecurityEncoding::LinuxPosixAclXattrV2)
             return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::NotApplicable,"metadata_replay.acl_model"));
-        const auto id=*NativeFeatureIdentifier::from_posix("system.posix_acl_access");
+        if(value.part==SecurityPart::LinuxDefaultAcl) {
+            const auto basic=inspect_basic();
+            if(!basic.value()||!basic.value()->kind.value()||*basic.value()->kind.value()!=ObjectKind::Directory)
+                return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::NotApplicable,"metadata_replay.default_acl_directory"));
+        }
+        const auto id=*NativeFeatureIdentifier::from_posix(value.part==SecurityPart::LinuxDefaultAcl?"system.posix_acl_default":"system.posix_acl_access");
         if (value.presence == SecurityPresence::Absent) return remove_replay_attribute(id,policy);
         const auto valid=detail::validate_linux_acl(value.bytes,policy.limits);
         if (!valid.value()) {const auto& e=*valid.unavailable_detail();return Result::unavailable(e.state,e.error);}
@@ -1059,14 +1143,14 @@ public:
     }
     Observation<bool> apply_replay_basic(const BasicMetadata& source, const MetadataReplayPolicy& policy) override {
         using Result=Observation<bool>;
-        if (!policy.valid() || !content_write_access_ || !publication_ || !source.posix_permissions.value())
+        if (!policy.valid() || !content_write_access_ || (!publication_&&!directory_metadata_target_) || !source.posix_permissions.value())
             return Result::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"metadata_replay.staging_basic"));
         if ((*source.posix_permissions.value() & 07000U) && !policy.allow_privilege_metadata)
             return Result::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"metadata_replay.mode_optin"));
         const auto target=inspect_basic();
         if (!target.value()) {const auto& e=*target.unavailable_detail();return Result::unavailable(e.state,e.error);}
         if (!source.accessed.value() || !source.modified.value() || !target.value()->posix_permissions.value() ||
-            !target.value()->kind.value() || *target.value()->kind.value()!=ObjectKind::RegularFile)
+            !target.value()->kind.value() || (*target.value()->kind.value()!=ObjectKind::RegularFile&&!(directory_metadata_target_&&*target.value()->kind.value()==ObjectKind::Directory)))
             return Result::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::UnsupportedQuery,"metadata_replay.basic_fields"));
         const auto mode=*source.posix_permissions.value() & 07777U;
         // The initial mode is established before ACL/capability replay. Final
@@ -1410,6 +1494,9 @@ public:
     }
 private:
     bool metadata_link_count_qualified(std::uint64_t count) const noexcept {
+        // Read-only native observations can retain an ordinary multiply-linked
+        // inode. Writable targets retain their single-name/owned-anonymous rule.
+        if (!content_write_access_) return count>=1;
         if (count==1) return true;
 #if defined(__linux__)
         return count==0 && publication_ && publication_->anonymous;
@@ -1497,6 +1584,8 @@ private:
         return Result::available({}); // Darwin uses only the owned fd.
 #endif
     }
+    bool capture_close_started_=false;
+    std::optional<MetadataCaptureCleanupError> capture_close_error_;
     OwnedDescriptor descriptor_;
     bool finish_started_ = false;
     std::optional<Observation<bool>> finish_result_;
@@ -1505,6 +1594,7 @@ private:
     bool content_access_ = false;
     bool content_write_access_ = false;
     std::unique_ptr<PosixPublicationContext> publication_;
+    bool directory_metadata_target_=false;
 #if defined(__linux__)
     bool inode_flags_access_ = false;
 #endif
@@ -1538,12 +1628,19 @@ Observation<std::unique_ptr<OpenedEntry>> open_posix_parent(int descriptor, cons
 Observation<std::unique_ptr<OpenedEntry>> PosixOpenedEntry::open_parent_directory() const { return open_posix_parent(descriptor_.get(), scope_); }
 
 struct DirectoryCloser {
-    void operator()(DIR* directory) const noexcept { closedir(directory); }
+    void operator()(DIR* directory) const noexcept { if(closedir(directory)!=0){const int e=errno;detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Posix,e,"metadata_capture.temporary_closedir"});errno=e;} }
 };
 using OwnedDirectory = std::unique_ptr<DIR, DirectoryCloser>;
 
 class PosixDirectoryCursor final : public DirectoryCursor {
 public:
+    Observation<std::shared_ptr<const OpenedEntry>> open_progressive_directory_source()const {
+        using R=Observation<std::shared_ptr<const OpenedEntry>>;
+        OwnedDescriptor fd(fcntl(dirfd(directory_.get()),F_DUPFD_CLOEXEC,0));
+        if(fd.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_capture.directory_query_dup"});
+        return R::available(std::make_shared<PosixOpenedEntry>(std::move(fd),scope_));
+    }
+
     PosixDirectoryCursor(OwnedDirectory directory, Observation<ObjectIdentity> identity, AdapterScope scope)
         : DirectoryCursor(std::move(identity)), directory_(std::move(directory)), scope_(std::move(scope)) {}
     Observation<AdapterScope> source_scope() const override { return Observation<AdapterScope>::available(scope_); }
@@ -2484,4 +2581,77 @@ Observation<std::unique_ptr<DirectoryCursor>> NativeFileSystem::open_directory(
     fd.release(); // fdopendir now owns the descriptor, including CLOEXEC.
     return Result::available(std::make_unique<PosixDirectoryCursor>(std::move(directory), std::move(identity), scope_));
 }
+
+namespace detail {
+Observation<bool> qualify_native_metadata_target(OpenedEntry& target,const NativeMetadataProof& proof) {
+    auto* native=dynamic_cast<PosixOpenedEntry*>(&target);
+    if(!native)return Observation<bool>::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::ProviderReviewRequired,"metadata_stream.native_target_required"));
+    return native->qualify_progressive_metadata_target(proof);
+}
+Observation<std::shared_ptr<const OpenedEntry>> open_native_main_content_source(
+    std::shared_ptr<const OpenedEntry> source){
+    using R=Observation<std::shared_ptr<const OpenedEntry>>;
+    const auto* native=dynamic_cast<const PosixOpenedEntry*>(source.get());
+    if(!native)return R::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"main_content.native_source_required"});
+    return native->open_progressive_metadata_source();
+}
+Observation<std::shared_ptr<const OpenedEntry>> open_native_metadata_capture_source(
+    std::shared_ptr<const OpenedEntry> source,const MetadataReplayPolicy& policy){
+    using R=Observation<std::shared_ptr<const OpenedEntry>>;
+    const auto* native=dynamic_cast<const PosixOpenedEntry*>(source.get());
+    if(!native||!policy.valid())return R::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::ProviderReviewRequired,"metadata_capture.native_source_required"));
+    return native->open_progressive_metadata_source();
+}
+Observation<std::shared_ptr<const OpenedEntry>> open_native_directory_capture_source(
+    std::shared_ptr<const DirectoryCursor> source,const MetadataReplayPolicy& policy){
+    using R=Observation<std::shared_ptr<const OpenedEntry>>;
+    const auto* native=dynamic_cast<const PosixDirectoryCursor*>(source.get());
+    if(!native||!policy.valid())return R::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::ProviderReviewRequired,"metadata_capture.native_directory_required"));
+    return native->open_progressive_directory_source();
+}
+void finish_native_metadata_capture(const OpenedEntry* source,const MetadataReplaySnapshot&)noexcept {
+    if(!source)return;
+    auto* native=const_cast<PosixOpenedEntry*>(dynamic_cast<const PosixOpenedEntry*>(source));
+    if(native)native->finish_capture_reads();
+    else record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"metadata_capture.native_source_close_required"});
+}
+Observation<bool> seal_native_metadata_capture(MetadataCaptureJob& job){
+    using R=Observation<bool>;
+    if(!job.ready_to_seal()||!dynamic_cast<const PosixOpenedEntry*>(job.sealing_source().get()))
+        return R::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::ProviderReviewRequired,"metadata_capture.native_seal_required"));
+    const auto& snapshot=job.sealing_snapshot();
+    if(snapshot.channel_coverage!=DataChannelCoverage::Unknown||!snapshot.channels.empty()||snapshot.channel_evidence||
+       snapshot.security_coverage||snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1)
+        return R::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::ProviderReviewRequired,"metadata_capture.posix_scope_unqualified"));
+    return job.sealing_source()->qualify_metadata_replay(snapshot.policy);
+}
+} // namespace detail
+
+Observation<std::shared_ptr<const MetadataReplayChannelEvidence>> issue_native_metadata_replay_channels(
+    const OpenedEntry&,const MetadataReplaySnapshot&,std::stop_token) {
+    return Observation<std::shared_ptr<const MetadataReplayChannelEvidence>>::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::NotApplicable,"metadata_channels.native_windows_evidence_required"));
+}
+Observation<bool> verify_native_metadata_replay_channels(const MetadataReplaySnapshot&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::NotApplicable,"metadata_channels.native_windows_evidence_required"));
+}
+Observation<bool> qualify_native_directory_creation(const DirectoryCursor&,const MetadataReplayPolicy&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::ProviderReviewRequired,"directory_creation.posix_creator_identity_unproved"));
+}
+Observation<std::unique_ptr<NativeCreatedDirectory>> create_native_directory(
+    std::shared_ptr<const DirectoryCursor>,NativeName,const MetadataReplayPolicy&) {
+    return Observation<std::unique_ptr<NativeCreatedDirectory>>::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::ProviderReviewRequired,"directory_creation.posix_creator_identity_unproved"));
+}
+Observation<bool> NativeCreatedDirectory::finish_io() {
+    if(!finish_result_)finish_result_=writer_->finish_content_writes();
+    return *finish_result_;
+}
+
 } // namespace ck::files
