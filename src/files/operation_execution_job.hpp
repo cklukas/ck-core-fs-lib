@@ -59,6 +59,10 @@ public:
     Observation<bool> cleanup_unpublished_staging();
 
 private:
+    friend class OperationBatchJob;
+    // Worker-only, no protocol callbacks or native mutation. Consume owners
+    // from prepared but unstarted batch entries as well as terminal entries.
+    void finish_owned_io(bool publish_failure=true) noexcept;
     explicit OperationExecutionJob(OperationExecutionRequest request) noexcept : request_(std::move(request)) {}
     void fail(UnavailableObservation detail, OperationExecutionState state) noexcept;
     OperationExecutionState advance_protocol(std::stop_token stop);

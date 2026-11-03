@@ -303,6 +303,13 @@ if(BUILD_TESTING)
   add_test(NAME c_api_error_oom COMMAND ck_fs_c_api_error_oom_tests)
   set_tests_properties(c_api_error_oom PROPERTIES TIMEOUT 60 LABELS "c-api;allocation-failure"
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  add_executable(ck_fs_operation_batch_finalization_tests tests/operation_batch_finalization_tests.cpp)
+  target_link_libraries(ck_fs_operation_batch_finalization_tests PRIVATE ck_core_fs_engine)
+  foreach(mode cancel cancel-error cancel-exception cancel-oom uncertain uncertain-oom)
+    add_test(NAME operation_batch_finalization_${mode} COMMAND ck_fs_operation_batch_finalization_tests ${mode})
+    set_tests_properties(operation_batch_finalization_${mode} PROPERTIES TIMEOUT 60 LABELS "finalization;allocation-failure"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  endforeach()
   add_executable(ck_fs_operation_execution_oom_tests tests/operation_execution_oom_tests.cpp)
   target_link_libraries(ck_fs_operation_execution_oom_tests PRIVATE ck_core_fs_engine)
   foreach(mode protocol finalizer)

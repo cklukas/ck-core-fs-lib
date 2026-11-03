@@ -271,6 +271,27 @@ wrapper objects retained their hashes. Its explicit C allocation remains
 fallible, with a null diagnostic pointer permitted. This focused result is not
 a final SDK or sanitizer qualification. CTest registers `c_api_error_oom`.
 
+## Prepared-batch terminal drain
+
+Cancellation previously left the native owners of prepared, unstarted entries
+open until batch destruction. A regression with three real native pipe handles
+reproduced the missing finalizers against the prior SDK. The batch now uses a
+private I/O-only finalizer to drain every prepared entry before terminal return,
+without running validation, journal transitions, copy, publication or retirement
+for pending entries. An uncertain/retained-source result stops later mutation;
+clean unstarted rows remain Pending. Terminal advances neither close again nor
+retry diagnostic allocation.
+
+A fresh coherent LLVM 23.1.4 build with the matching corrected Darwin TSan
+runtime passed **10/10 focused CTest entries** in 4.54 seconds. The 128-step
+selected-target build took 277.48 seconds. Six new batch controls cover clean
+cancel, native close error, provider exception, persistent C++ OOM and uncertain
+first-entry outcomes; portable OOM, metadata-review and I/O-finalization
+regressions also passed. Exact source/runtime/output hashes are retained.
+This qualifies the batch composition and its real-handle regression. Native
+multi-item copy/metadata integration and final cross-platform qualification
+remain separate gates.
+
 ## Remaining gates
 
 - Integrate and qualify postorder directory metadata replay and bounded

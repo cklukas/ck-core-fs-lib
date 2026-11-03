@@ -78,7 +78,38 @@ void OperationBatchJob::finish_if_done() {
         cancelled ? OperationBatchState::Cancelled : OperationBatchState::Complete;
 }
 
+void OperationBatchJob::finish_owned_io() noexcept {
+    for(std::size_t index=0;index<request_.jobs.size();++index) {
+        auto& job=*request_.jobs[index];
+        if(job.result_.state<OperationExecutionState::Complete)
+            job.result_.state=started_[index]?OperationExecutionState::NeedsReconciliation:OperationExecutionState::Cancelled;
+        job.finish_owned_io();
+        if(job.state()==OperationExecutionState::NeedsReconciliation) {
+            result_.state=OperationBatchState::NeedsReconciliation;
+            result_.items[index].outcome=OperationItemOutcome::NeedsReconciliation;
+        }
+        // A clean, never-started item remains Pending in the batch result.
+        // Diagnostic allocation is best effort after this item's native drain;
+        // it must never prevent the remaining entries from closing too.
+        if(job.failure()&&!result_.items[index].failure) {
+            try {result_.items[index].failure=job.failure();}catch(...) {
+                result_.state=OperationBatchState::NeedsReconciliation;
+            }
+        }
+    }
+}
+
 OperationBatchState OperationBatchJob::advance(std::stop_token stop) {
+    if(result_.state!=OperationBatchState::Ready&&result_.state!=OperationBatchState::Running)
+        return result_.state; // Terminal polling performs no I/O or diagnostic retry.
+    try {(void)advance_protocol(stop);}
+    catch(...) {result_.state=OperationBatchState::NeedsReconciliation;}
+    if(result_.state!=OperationBatchState::Ready&&result_.state!=OperationBatchState::Running)
+        finish_owned_io();
+    return result_.state;
+}
+
+OperationBatchState OperationBatchJob::advance_protocol(std::stop_token stop) {
     if (result_.state == OperationBatchState::Complete || result_.state == OperationBatchState::Failed ||
         result_.state == OperationBatchState::Cancelled || result_.state == OperationBatchState::RetainedSource ||
         result_.state == OperationBatchState::NeedsReconciliation)
@@ -88,7 +119,13 @@ OperationBatchState OperationBatchJob::advance(std::stop_token stop) {
 
     while (current_ < request_.jobs.size() && terminal(request_.jobs[current_]->state())) {
         record_current();
+        const auto state=request_.jobs[current_]->state();
         ++current_;
+        if(state==OperationExecutionState::NeedsReconciliation||state==OperationExecutionState::RetainedSource) {
+            result_.state=state==OperationExecutionState::NeedsReconciliation?
+                OperationBatchState::NeedsReconciliation:OperationBatchState::RetainedSource;
+            return result_.state;
+        }
     }
     finish_if_done();
     if (result_.state != OperationBatchState::Running)
@@ -119,7 +156,13 @@ OperationBatchState OperationBatchJob::advance(std::stop_token stop) {
     started_[current_] = true;
     request_.jobs[current_]->advance(stop);
     record_current();
-    if (terminal(request_.jobs[current_]->state())) ++current_;
+    const auto state=request_.jobs[current_]->state();
+    if(terminal(state))++current_;
+    if(state==OperationExecutionState::NeedsReconciliation||state==OperationExecutionState::RetainedSource) {
+        result_.state=state==OperationExecutionState::NeedsReconciliation?
+            OperationBatchState::NeedsReconciliation:OperationBatchState::RetainedSource;
+        return result_.state;
+    }
     finish_if_done();
     return result_.state;
 }

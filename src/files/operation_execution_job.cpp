@@ -98,13 +98,15 @@ OperationExecutionState OperationExecutionJob::advance(std::stop_token stop) {
     }
     if (result_.state < OperationExecutionState::Complete)
         return result_.state;
-    if (io_finished_) {
-        // The native owners were consumed by an earlier call. There is no
-        // finalizer left to run, so publishing this call's POD diagnostic is
-        // now safe; never manufacture an empty fallback.
-        protocol_failure.publish(result_.failure);
-        return result_.state;
-    }
+    finish_owned_io(!protocol_failure.recorded);
+    // Native owners are consumed before any protocol diagnostic publication.
+    protocol_failure.publish(result_.failure);
+    if(protocol_failure.recorded)result_.state=OperationExecutionState::NeedsReconciliation;
+    return result_.state;
+}
+
+void OperationExecutionJob::finish_owned_io(bool publish_failure) noexcept {
+    if(io_finished_)return;
     // Consume the finalizer before calling external/native code. A throw can
     // mean a handle was already consumed and must never trigger a close retry.
     io_finished_ = true;
@@ -126,14 +128,8 @@ OperationExecutionState OperationExecutionJob::advance(std::stop_token stop) {
                 "operation_execution.finish_exception");
         }
     }
-    // All native finalizers have now returned or thrown. Only this point may
-    // allocate the public std::string diagnostic. OOM leaves the optional
-    // failure unset but never turns a cleanup failure into success.
-    protocol_failure.publish(result_.failure);
-    finish_failure.publish(result_.failure);
-    if (protocol_failure.recorded || finish_failure.recorded)
-        result_.state = OperationExecutionState::NeedsReconciliation;
-    return result_.state;
+    if(publish_failure)finish_failure.publish(result_.failure);
+    if(finish_failure.recorded)result_.state=OperationExecutionState::NeedsReconciliation;
 }
 
 OperationExecutionState OperationExecutionJob::advance_protocol(std::stop_token stop) {

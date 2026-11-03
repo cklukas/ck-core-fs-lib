@@ -56,6 +56,8 @@ private:
     static bool terminal(OperationExecutionState state) noexcept;
     void record_current();
     void finish_if_done();
+    OperationBatchState advance_protocol(std::stop_token);
+    void finish_owned_io() noexcept;
 
     OperationBatchRequest request_;
     OperationBatchResult result_;
