@@ -371,3 +371,19 @@ multiply linked Trash input and a real junction were refused without mutation
 or journal creation, preserving the target sentinel. The incremental ASan build
 took 26.63 seconds and native tests 1.61 seconds. The record is
 `/Volumes/S8T/tmp/ck-core-fs-dir-asan.m5djf5jd/short-output.log`.
+
+### Committed Windows/Linux checkpoint: b2ca8c8
+
+Revision `b2ca8c8f6bea7a18aa75936a3d090ea0d2c63487` passed the complete hosted
+Windows build/test/install/installed-C-consumer job, both Linux browser
+configurations, Linux ASan/UBSan and Linux TSan. The Mac job was intentionally
+not scheduled: it requires a self-hosted runner with the prescribed temporary
+volumes. See [CI run 41549648439](https://github.com/cklukas/ck-core-fs-lib/actions/runs/41549648439).
+The corresponding [Pages run](https://github.com/cklukas/ck-core-fs-lib/actions/runs/41550633502)
+also completed successfully.
+
+This qualifies that committed checkpoint and resolves the three Windows
+fixture failures described above. It does not qualify the subsequent 0.4
+journal-root/retry/two-way integration or resolve the Mac publication and
+Complete-preservation gates. Those changes have separate source fingerprints
+and validation records.
