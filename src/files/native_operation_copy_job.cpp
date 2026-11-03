@@ -680,6 +680,7 @@ Observation<OperationBatchJob::Pointer> create_native_operation_copy_batch(
         copy_request.verify_metadata_before_publication = [metadata_policy](OpenedEntry& staging, std::stop_token stop) {
             return metadata_policy->verify(staging, stop);
         };
+        copy_request.finish_metadata = [metadata_policy] {return metadata_policy->finish_io();};
         auto created = NativeOperationCopyJob::create(std::move(copy_request));
         if (!created.value())
             return Observation<OperationBatchJob::Pointer>::unavailable(

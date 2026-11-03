@@ -34,6 +34,10 @@ public:
     // the enclosing reviewed executor; target must be null until prepare().
     // This never substitutes a weaker preservation policy or caller digest.
     static Observation<Pointer> create_progressive(HeldChild::Pointer,NativeRegularMetadataRequest);
+    // Worker-only drain for either the legacy or progressive native binding.
+    // Retains immutable result diagnostics but releases operation-owned source
+    // and stream evidence before the enclosing copy exposes a terminal state.
+    Observation<bool> finish_io();
     Observation<bool> finish_progressive_io();
     RegularMetadataScopeReport scope_report() const noexcept {
         return {1, scope_, !allow_loss_ && scope_ == RegularMetadataScope::CompleteMetadataV1 ?

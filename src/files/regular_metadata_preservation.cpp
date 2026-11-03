@@ -151,12 +151,47 @@ Observation<RegularMetadataPreservation::Pointer> RegularMetadataPreservation::c
     return Observation<Pointer>::available(std::move(result));
 }
 
+Observation<bool> RegularMetadataPreservation::finish_io() {
+    if(progressive_||progressive_finished_)return finish_progressive_io();
+    struct LegacyClose final:MetadataCaptureFailureLatch {
+        LegacyClose(std::optional<MetadataCaptureCleanupError>& error,std::array<char,128>& operation,
+            const MetadataCaptureFailureLatch* previous):error(error),operation(operation),previous(previous){}
+        std::optional<MetadataCaptureCleanupError>& error;
+        std::array<char,128>& operation;
+        const MetadataCaptureFailureLatch* previous;
+        void record_first(MetadataCaptureCleanupError value)const noexcept override {
+            if(!error) {
+                const std::string_view tag=value.operation?value.operation:"regular_metadata.legacy_close";
+                const auto count=std::min(tag.size(),operation.size()-1);
+                if(count)std::memcpy(operation.data(),tag.data(),count);operation[count]=0;
+                error=MetadataCaptureCleanupError{value.state,value.domain,value.code,operation.data()};
+            }
+            if(previous)previous->record_first(value);
+        }
+    } latch(progressive_finish_error_,progressive_finish_operation_,detail::current_metadata_capture_cleanup());
+    {
+        detail::MetadataCaptureCleanupScope scope(&latch);
+        // Explicitly invalidate native channel readers even when their shared
+        // immutable snapshot values outlive this preservation operation.
+        if(replay_)detail::finish_native_metadata_capture(nullptr,*replay_);
+        replay_.reset();source_.reset();
+    }
+    progressive_finished_=true;
+    if(progressive_finish_error_) {
+        const auto& error=*progressive_finish_error_;
+        return Observation<bool>::unavailable(error.state,{error.domain,error.code,error.operation});
+    }
+    return Observation<bool>::available(true);
+}
+
 Observation<bool> RegularMetadataPreservation::finish_progressive_io() {
     auto result=[&] {
         if(!progressive_finish_error_)return Observation<bool>::available(true);
         const auto& e=*progressive_finish_error_;
-        try{return Observation<bool>::unavailable(e.state,{e.domain,e.code,e.operation});}
-        catch(const std::bad_alloc&){return Observation<bool>::unavailable(e.state,{e.domain,e.code,{}});}
+        // Native drains precede diagnostic publication. Even an empty string
+        // can allocate in the MSVC Debug runtime, so let OOM propagate without
+        // constructing a second diagnostic; the Root retains its POD error.
+        return Observation<bool>::unavailable(e.state,{e.domain,e.code,e.operation});
     };
     if(progressive_finished_)return result();
     if(!progressive_)return review<bool>("regular_metadata.progressive_binding_missing");

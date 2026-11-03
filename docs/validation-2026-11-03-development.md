@@ -316,6 +316,33 @@ define time observations rather than a distinct event counter. Source observatio
 is not an enforced mutation freeze. Writable target and private-journal alias
 refusals remain required.
 
+## Real legacy metadata and multi-item batch cleanup
+
+Legacy preservation now explicitly drains native channel readers and releases
+its operation-owned held source before terminal completion. Its copy-batch
+binding supplies that drain to the common native finalizer. Cached failure
+reporting retains scalar state and propagates allocation failure after cleanup
+without an allocating empty-string fallback.
+
+A fresh coherent GCC 14 normal build includes the newer Tree/seed request
+layouts, restored cleanup-observer declaration, batch drain, legacy drain and
+C error-view fix. All **28 selected CTest entries passed in 5.87 seconds** after
+a 397.46-second, 162-step build, with assertions enabled and source hashes
+unchanged. Eleven real three-file legacy batch cases include pre-start and
+started cancellation, actual source/journal consumed-close errors, persistent
+C++ OOM, prior Root error precedence, stopping later mutation after an uncertain
+first item, complete copies and binary xattr replay. Pending journals remain
+unchanged; native source/journal/staging handles close before terminal return;
+repeated terminal polling does no native I/O or allocation retry, and reused
+descriptors survive destruction. Caller-held directory cursors are permitted to
+remain; Root is finalized after consumer references are released.
+
+The same coherent run passed portable batch/OOM checks, C error OOM, hard-link
+source capture, metadata review, native resolution and its C/consumed-close
+regressions, Linux mount witnesses and ELF exports/interposition. This is
+focused Linux ext4 normal qualification, not a full integrated Tree, Complete
+security, Windows or matching sanitizer result for the later combined revision.
+
 ## Remaining gates
 
 - Integrate and qualify postorder directory metadata replay and bounded

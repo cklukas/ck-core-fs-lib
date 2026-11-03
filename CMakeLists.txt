@@ -319,6 +319,18 @@ if(BUILD_TESTING)
       ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   endforeach()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ck_fs_native_legacy_batch_drain_linux_tests tests/native_legacy_batch_drain_linux_tests.cpp)
+    target_link_libraries(ck_fs_native_legacy_batch_drain_linux_tests PRIVATE ck_core_fs_native)
+    target_link_options(ck_fs_native_legacy_batch_drain_linux_tests PRIVATE
+      "LINKER:--wrap=close" "LINKER:--wrap=fstat" "LINKER:--wrap=fsync" "LINKER:--wrap=pread"
+      "LINKER:--wrap=pwrite" "LINKER:--wrap=openat" "LINKER:--wrap=statx" "LINKER:--wrap=fgetxattr" "LINKER:--wrap=flistxattr")
+    foreach(mode cancel-before-start cancel-source-eio cancel-source-eio-oom cancel-journal-eio-oom
+        cancel-prior-root-oom cancel-prior-root-source-eio-oom started-cancel started-cancel-source-eio-oom
+        uncertain-first-source-eio complete complete-attrs)
+      add_test(NAME native_legacy_batch_drain_${mode} COMMAND ck_fs_native_legacy_batch_drain_linux_tests ${mode})
+      set_tests_properties(native_legacy_batch_drain_${mode} PROPERTIES TIMEOUT 180 LABELS "linux;native;finalization"
+        ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    endforeach()
     set(CK_CORE_FS_FINALIZATION_TEST_FS "" CACHE STRING "Expected native finalization fixture filesystem (empty probes actual ext4/XFS/Btrfs)")
     set_property(CACHE CK_CORE_FS_FINALIZATION_TEST_FS PROPERTY STRINGS "" ext4 xfs btrfs)
     if(NOT CK_CORE_FS_FINALIZATION_TEST_FS MATCHES "^(|ext4|xfs|btrfs)$")
