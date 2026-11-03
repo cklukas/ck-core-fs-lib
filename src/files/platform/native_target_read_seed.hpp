@@ -32,7 +32,7 @@ public:
 // Target must be the still-open genuine native creator/metadata writer. The
 // OPEN source proof binds exact native stream names/policy and resource limits.
 // Run after streams exist, before restrictive ownership/security/final times.
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 Observation<NativeTargetReadSeed::Pointer> begin_native_target_read_seed(
     OpenedEntry&,std::shared_ptr<const NativeMetadataProof>,MetadataCaptureLimits,
     std::shared_ptr<MetadataCaptureBudget>,std::shared_ptr<const MetadataCaptureFailureLatch>);

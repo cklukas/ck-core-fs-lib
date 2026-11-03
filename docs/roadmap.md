@@ -30,3 +30,15 @@ The project name and install namespace are fixed as `ck-core-fs-lib` so the
 GitHub repository and downstream references remain stable. See
 [native contracts](native-contracts.md) and the revision-specific validation
 record for implemented slices and remaining gates.
+
+## Native chooser browser follow-up
+
+The C boundary currently opens held directories and entries but has no general
+folder-browser enumeration API. Tree plan pages belong to reviewed operations
+and are not a chooser API. A future additive browser worker should expose bounded
+pages, exact POSIX-byte/Windows-UTF-16 names, opaque retained entry identity,
+cancellation and nonblocking drained lifetime, using the existing native listing
+backend. A frontend must retain native selection separately from escaped display
+text; a locale-filtered text widget cannot reconstruct discarded name bytes.
+This capability is recorded independently of the current execution/security
+qualification gate and does not authorize a frontend dependency pin.

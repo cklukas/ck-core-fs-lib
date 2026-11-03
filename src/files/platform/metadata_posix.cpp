@@ -7,12 +7,15 @@
 #include "native_home.hpp"
 #include "metadata_replay.hpp"
 #include "metadata_capture_job.hpp"
+#include "native_target_read_seed.hpp"
+#include "native_target_read_budget.hpp"
 #include "native_metadata_stream_target.hpp"
 #include "linux_anonymous_staging.hpp"
 #include "native_journal_directory_bridge.hpp"
 #include "native_directory_reader.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 #include <set>
 #include <cerrno>
@@ -65,6 +68,22 @@
 
 namespace ck::files {
 namespace {
+
+class PosixTargetReadSeed;
+#if defined(__linux__)
+struct NativeTargetReadCloneState final {
+    std::atomic<std::size_t> active_clones{0};
+};
+struct NativeTargetReadCloneLease final {
+    explicit NativeTargetReadCloneLease(std::shared_ptr<NativeTargetReadCloneState> state)noexcept
+        :state_(std::move(state)) { if(state_)state_->active_clones.fetch_add(1,std::memory_order_relaxed); }
+    ~NativeTargetReadCloneLease() { if(state_)state_->active_clones.fetch_sub(1,std::memory_order_relaxed); }
+    NativeTargetReadCloneLease(const NativeTargetReadCloneLease&)=delete;
+    NativeTargetReadCloneLease& operator=(const NativeTargetReadCloneLease&)=delete;
+private:
+    std::shared_ptr<NativeTargetReadCloneState> state_;
+};
+#endif
 
 NativeError adapter_error(AdapterError code, std::string operation) {
     return {ErrorDomain::Adapter, static_cast<std::int64_t>(code), std::move(operation)};
@@ -218,6 +237,23 @@ Observation<BasicMetadata> statx_metadata(int descriptor, const char* path, int 
     return Observation<BasicMetadata>::available(std::move(result));
 }
 #endif
+
+#if defined(__linux__)
+Observation<bool> compare_capture_bookend(const BasicMetadata& before,const BasicMetadata& after,const char* operation) {
+    using R=Observation<bool>;
+    if(!before.identity.value()||!after.identity.value()||
+       compare_identity(*before.identity.value(),*after.identity.value())!=IdentityComparison::Same||
+       !before.kind.value()||!after.kind.value()||*before.kind.value()!=*after.kind.value()||
+       !before.mount_id.value()||!after.mount_id.value()||*before.mount_id.value()!=*after.mount_id.value()||
+       !before.changed.value()||!after.changed.value()||*before.changed.value()!=*after.changed.value())
+        return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,operation));
+    if(*before.kind.value()==ObjectKind::RegularFile &&
+       (!before.logical_size.value()||!after.logical_size.value()||*before.logical_size.value()!=*after.logical_size.value()))
+        return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,operation));
+    return R::available(true);
+}
+#endif
+
 class OwnedDescriptor final {
 public:
     explicit OwnedDescriptor(int descriptor) : descriptor_(descriptor) {}
@@ -728,6 +764,11 @@ public:
             if(fd>=0&&close(fd)!=0)capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Posix,errno,"metadata_capture.source_close"};
         }
         if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);
+#if defined(__linux__)
+        target_read_clone_lease_.reset();
+        target_read_clone_state_.reset();
+        target_read_budget_.reset();
+#endif
     }
     Observation<std::shared_ptr<const OpenedEntry>> open_progressive_metadata_source()const {
         using R=Observation<std::shared_ptr<const OpenedEntry>>;
@@ -737,9 +778,27 @@ public:
         if(flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_capture.source_flags"});
         if((flags&O_ACCMODE)!=O_RDONLY||content_write_access_||(file&&!content_access_))
             return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"metadata_capture.readonly_content_source_required"));
+#if defined(__linux__)
+        std::shared_ptr<detail::NativeTargetReadBudget> child_budget;
+        if(target_read_budget_){
+            auto lease=detail::NativeTargetReadBudget::acquire_child(target_read_budget_,1,sizeof(PosixOpenedEntry));
+            if(!lease.value())return R::unavailable(lease.unavailable_detail()->state,lease.unavailable_detail()->error);
+            child_budget=std::move(lease).take_value();
+        }
+        auto fresh=open_readonly_capture_description();
+        if(!fresh.value()){const auto&e=*fresh.unavailable_detail();return R::unavailable(e.state,e.error);}
+        OwnedDescriptor fd(std::move(fresh).take_value());
+        auto clone=std::make_shared<PosixOpenedEntry>(std::move(fd),scope_,false,file);
+        clone->target_read_budget_=std::move(child_budget);
+        clone->target_read_clone_state_=target_read_clone_state_;
+        if(clone->target_read_clone_state_)
+            clone->target_read_clone_lease_=std::make_shared<NativeTargetReadCloneLease>(clone->target_read_clone_state_);
+        return R::available(std::move(clone));
+#else
         OwnedDescriptor fd(fcntl(descriptor_.get(),F_DUPFD_CLOEXEC,0));
         if(fd.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_capture.source_dup"});
         return R::available(std::make_shared<PosixOpenedEntry>(std::move(fd),scope_,false,file));
+#endif
     }
     Observation<ContentRead> read_content(ContentReadLimits limits = {}, std::uint64_t offset = 0,
                                           std::stop_token stop = {}) const override {
@@ -1736,6 +1795,7 @@ private:
         return Observation<bool>::available(true);
     }
     friend class PosixDirectoryCursor;
+    friend class PosixTargetReadSeed;
 #if defined(__APPLE__)
     static std::optional<UnavailableObservation> provider_guard(const BasicMetadata& metadata) {
         const auto review = provider_review_required(metadata, StorageModel::DarwinStatFlags);
@@ -1802,6 +1862,46 @@ private:
         return Result::available({}); // Darwin uses only the owned fd.
 #endif
     }
+    Observation<OwnedDescriptor> open_readonly_capture_description() const {
+        using R=Observation<OwnedDescriptor>;
+#if defined(__linux__)
+        OwnedDescriptor proc(open("/proc/self/fd", O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
+        if(proc.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"target_read.proc_open"});
+        struct statfs proc_filesystem{};
+        if(fstatfs(proc.get(),&proc_filesystem)!=0)
+            return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"target_read.proc_statfs"});
+        if(static_cast<unsigned long>(proc_filesystem.f_type)!=static_cast<unsigned long>(PROC_SUPER_MAGIC))
+            return R::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::ProviderReviewRequired,"target_read.proc_namespace"));
+        const auto descriptor_name=std::to_string(descriptor_.get());
+        OwnedDescriptor fresh(openat(proc.get(),descriptor_name.c_str(),O_RDONLY|O_NOATIME|O_CLOEXEC));
+        if(fresh.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"target_read.proc_reopen"});
+        const int flags=fcntl(fresh.get(),F_GETFL);
+        if(flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"target_read.read_flags"});
+        if((flags&O_ACCMODE)!=O_RDONLY||(flags&O_NOATIME)==0)
+            return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"target_read.readonly_noatime"));
+        const int descriptor_flags=fcntl(fresh.get(),F_GETFD);
+        if(descriptor_flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"target_read.fd_flags"});
+        if((descriptor_flags&FD_CLOEXEC)==0)
+            return R::unavailable(ObservationState::Failed,adapter_error(AdapterError::InvalidNativeResult,"target_read.fd_cloexec"));
+        const auto before=inspect_basic();
+        const auto after=statx_metadata(fresh.get(),"",AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW,scope_);
+        if(!before.value()){const auto&e=*before.unavailable_detail();return R::unavailable(e.state,e.error);}
+        if(!after.value()) { const auto&e=*after.unavailable_detail(); return R::unavailable(e.state,e.error); }
+        const auto same=compare_capture_bookend(*before.value(),*after.value(),"target_read.reopen_identity");
+        if(!same.value()) { const auto&e=*same.unavailable_detail(); return R::unavailable(e.state,e.error); }
+        return R::available(std::move(fresh));
+#else
+        return R::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::NotApplicable,"target_read.linux_only"));
+#endif
+    }
+#if defined(__linux__)
+    // Declare reservations before the native owner.  C++ destroys members in
+    // reverse declaration order, so descriptor_ closes before these leases
+    // release their budget/clone reservations.
+    std::shared_ptr<detail::NativeTargetReadBudget> target_read_budget_;
+    std::shared_ptr<NativeTargetReadCloneState> target_read_clone_state_;
+    std::shared_ptr<NativeTargetReadCloneLease> target_read_clone_lease_;
+#endif
     bool capture_close_started_=false;
     std::optional<MetadataCaptureCleanupError> capture_close_error_;
     OwnedDescriptor descriptor_;
@@ -1995,9 +2095,24 @@ public:
     }
     Observation<std::shared_ptr<const OpenedEntry>> open_progressive_directory_source()const {
         using R=Observation<std::shared_ptr<const OpenedEntry>>;
+#if defined(__linux__)
+        std::shared_ptr<detail::NativeTargetReadBudget> child_budget;
+        if(target_read_budget_){
+            auto lease=detail::NativeTargetReadBudget::acquire_child(target_read_budget_,1,sizeof(PosixOpenedEntry));
+            if(!lease.value())return R::unavailable(lease.unavailable_detail()->state,lease.unavailable_detail()->error);
+            child_budget=std::move(lease).take_value();
+        }
+#endif
         OwnedDescriptor fd(fcntl(dirfd(directory_.get()),F_DUPFD_CLOEXEC,0));
         if(fd.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_capture.directory_query_dup"});
-        return R::available(std::make_shared<PosixOpenedEntry>(std::move(fd),scope_));
+        auto clone=std::make_shared<PosixOpenedEntry>(std::move(fd),scope_);
+#if defined(__linux__)
+        clone->target_read_budget_=std::move(child_budget);
+        clone->target_read_clone_state_=target_read_clone_state_;
+        if(clone->target_read_clone_state_)
+            clone->target_read_clone_lease_=std::make_shared<NativeTargetReadCloneLease>(clone->target_read_clone_state_);
+#endif
+        return R::available(std::move(clone));
     }
 
     PosixDirectoryCursor(OwnedDirectory directory, Observation<ObjectIdentity> identity, AdapterScope scope)
@@ -2837,13 +2952,22 @@ public:
 #endif
     }
 private:
+    friend class PosixTargetReadSeed;
     Observation<DirectoryStep> next_step() override {
         using Result = Observation<DirectoryStep>;
         errno = 0;
         const auto* entry = readdir(directory_.get());
         if (!entry) {
             const int code = errno;
-            if (code == 0) return Result::available(DirectoryEnd{});
+            if (code == 0) {
+                // EOF releases only the single-consumer position lease. The
+                // DIR owner and its native-read budget remain held until the
+                // cursor itself is destroyed.
+#if defined(__linux__)
+                target_read_position_lease_.reset();
+#endif
+                return Result::available(DirectoryEnd{});
+            }
             return Result::unavailable(errno_state(code), {ErrorDomain::Posix, code, "readdir"});
         }
         constexpr auto name_offset = offsetof(struct dirent, d_name);
@@ -2863,9 +2987,346 @@ private:
                 adapter_error(AdapterError::InvalidNativeResult, "readdir.name"));
         return Result::available(std::move(*name));
     }
+#if defined(__linux__)
+    // The directory stream must close while its reservation is still held;
+    // leases therefore precede the native owner in declaration order.
+    std::shared_ptr<detail::NativeTargetReadBudget> target_read_budget_;
+    std::shared_ptr<NativeTargetReadCloneState> target_read_clone_state_;
+    std::shared_ptr<NativeTargetReadCloneLease> target_read_clone_lease_;
+    std::shared_ptr<const void> target_read_position_lease_;
+#endif
     OwnedDirectory directory_;
     AdapterScope scope_;
 };
+
+#if defined(__linux__)
+// Linux target observation is deliberately an adapter-private capability.  It
+// never accepts a descriptor/path from the caller: factories below first brand
+// check the genuine POSIX classes, then this worker opens independent
+// descriptions while the creator/held directory is still available.
+class PosixTargetReadSeed final : public detail::NativeTargetReadSeed,
+                                  public MetadataCaptureFailureLatch {
+public:
+    PosixTargetReadSeed(PosixOpenedEntry* target,std::shared_ptr<const PosixDirectoryCursor> directory,
+        std::shared_ptr<const NativeMetadataProof> proof,MetadataCaptureLimits limits,
+        std::shared_ptr<MetadataCaptureBudget> budget,std::shared_ptr<const MetadataCaptureFailureLatch> latch)
+        :target_(target),directory_(std::move(directory)),proof_(std::move(proof)),limits_(limits),
+         budget_(std::move(budget)),latch_(std::move(latch)),
+         clone_state_(std::make_shared<NativeTargetReadCloneState>()) {}
+    ~PosixTargetReadSeed() override { try { (void)finish_io(); } catch (...) {} }
+
+    void record_first(MetadataCaptureCleanupError error) const noexcept override {
+        if(!close_error_) close_error_=error;
+        if(latch_) latch_->record_first(error);
+    }
+
+    Observation<bool> advance(std::stop_token stop = {}) override {
+        if(failed_) return failure_result();
+        if(finished_) return closed<bool>();
+        if(ready_) return Observation<bool>::available(true);
+        detail::MetadataCaptureCleanupScope cleanup(this);
+        try {
+            if(stop.stop_requested()) return fail(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InterruptedRead),"seed.cancelled");
+            if(!proof_ || proof_->io_finished()) return fail(ObservationState::Changed,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidAccess),"seed.closed_proof");
+            if(auto error=proof_->cleanup_error()) return fail(error->state,error->domain,error->code,"seed.proof_close");
+            if(!limits_.valid() || !budget_ || !latch_ || !proof_->snapshot().policy.valid())
+                return fail(ObservationState::Failed,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidLimit),"seed.inputs");
+            const auto& expected=proof_->snapshot().basic;
+            if(!expected.kind.value() || !expected.identity.value())
+                return fail(ObservationState::Unsupported,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"seed.proof_shape");
+            const bool is_directory=*expected.kind.value()==ObjectKind::Directory;
+            if(!is_directory && *expected.kind.value()!=ObjectKind::RegularFile)
+                return fail(ObservationState::Unsupported,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::NotApplicable),"seed.kind");
+            if(directory_ != nullptr && !is_directory)
+                return fail(ObservationState::Changed,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::MetadataChanged),"seed.directory_kind");
+
+            const auto current=directory_ ? directory_->inspect_basic() : target_->inspect_basic();
+            if(!current.value()) return fail(current.unavailable_detail()->state,current.unavailable_detail()->error.domain,
+                current.unavailable_detail()->error.code,"seed.current_basic");
+            if(target_){
+                if(!target_bookend_){
+                    auto bookend=make_target_bookend(*current.value());
+                    if(!bookend.value()) return fail(bookend.unavailable_detail()->state,bookend.unavailable_detail()->error.domain,
+                        bookend.unavailable_detail()->error.code,"seed.target_bookend");
+                    target_bookend_=std::move(bookend).take_value();
+                } else {
+                    // Metadata replay may intentionally change ctime/size on
+                    // the still-held target. This capability proves only
+                    // native continuity; the owning tree layer validates the
+                    // fresh post-replay metadata before effects.
+                    const auto stable=compare_target_identity(*target_bookend_,*current.value(),"seed.target_identity_changed");
+                    if(!stable.value()) return fail(stable.unavailable_detail()->state,stable.unavailable_detail()->error.domain,
+                        stable.unavailable_detail()->error.code,"seed.target_changed");
+                }
+                if(!expected.identity.value()||expected.identity.value()->scope!=current.value()->identity.value()->scope)
+                    return fail(ObservationState::Unsupported,ErrorDomain::Adapter,
+                        static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"seed.source_target_scope");
+                auto qualified=target_->qualify_progressive_metadata_target(*proof_);
+                if(!qualified.value())
+                    return fail(qualified.unavailable_detail()->state,qualified.unavailable_detail()->error.domain,
+                        qualified.unavailable_detail()->error.code,"seed.target_qualification");
+                if(!*qualified.value())
+                    return fail(ObservationState::Unsupported,ErrorDomain::Adapter,
+                        static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"seed.target_qualification");
+            } else {
+                const auto proof_match=compare_capture_bookend(expected,*current.value(),"seed.proof_identity");
+                if(!proof_match.value()) return fail(proof_match.unavailable_detail()->state,proof_match.unavailable_detail()->error.domain,
+                    proof_match.unavailable_detail()->error.code,"seed.proof_identity");
+            }
+            if(!target_ && (!directory_ || !directory_->identity().value() ||
+                compare_identity(*directory_->identity().value(),*expected.identity.value())!=IdentityComparison::Same)) {
+                return fail(ObservationState::Unsupported,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"seed.directory_brand");
+            }
+
+            if(is_directory && source_ && enum_parent_.get()<0){
+                auto fresh_directory=target_?open_fresh_directory_target(target_->descriptor_.get(),*target_bookend_,"seed.enumerator_open"):
+                    open_fresh_directory(dirfd(directory_->directory_.get()),expected,"seed.enumerator_open");
+                if(!fresh_directory.value()) return fail(fresh_directory.unavailable_detail()->state,fresh_directory.unavailable_detail()->error.domain,
+                    fresh_directory.unavailable_detail()->error.code,"seed.enumerator_open");
+                enum_parent_=std::move(fresh_directory).take_value();
+                ready_=true;
+                return Observation<bool>::available(true);
+            }
+
+            if(!base_budget_){
+                const std::size_t handles=is_directory?2U:1U;
+                const std::size_t bytes=sizeof(PosixTargetReadSeed)+sizeof(PosixOpenedEntry)+(is_directory?sizeof(PosixDirectoryCursor):0U);
+                auto lease=detail::NativeTargetReadBudget::acquire(budget_,handles,bytes);
+                if(!lease.value()) return fail(lease.unavailable_detail()->state,lease.unavailable_detail()->error.domain,
+                    lease.unavailable_detail()->error.code,"seed.budget");
+                base_budget_=std::move(lease).take_value();
+            }
+
+            if(!source_ && target_){
+                auto fresh=target_->open_readonly_capture_description();
+                if(!fresh.value()) return fail(fresh.unavailable_detail()->state,fresh.unavailable_detail()->error.domain,
+                    fresh.unavailable_detail()->error.code,"seed.reader_open");
+                auto source=std::make_shared<PosixOpenedEntry>(std::move(fresh).take_value(),target_->scope_,false,!is_directory);
+                source->target_read_budget_=base_budget_;
+                source->target_read_clone_state_=clone_state_;
+                const auto source_basic=source->inspect_basic();
+                if(!source_basic.value()) return fail(source_basic.unavailable_detail()->state,source_basic.unavailable_detail()->error.domain,
+                    source_basic.unavailable_detail()->error.code,"seed.reader_basic");
+                const auto source_match=compare_target_bookend(*target_bookend_,*source_basic.value(),"seed.reader_identity");
+                if(!source_match.value()) return fail(source_match.unavailable_detail()->state,source_match.unavailable_detail()->error.domain,
+                    source_match.unavailable_detail()->error.code,"seed.reader_identity");
+                source_=std::move(source);
+            } else if(!source_) {
+                auto fresh=open_fresh_directory(dirfd(directory_->directory_.get()),expected,"seed.reader_open");
+                if(!fresh.value()) return fail(fresh.unavailable_detail()->state,fresh.unavailable_detail()->error.domain,
+                    fresh.unavailable_detail()->error.code,"seed.reader_open");
+                auto source=std::make_shared<PosixOpenedEntry>(std::move(fresh).take_value(),directory_->scope_,false,false);
+                source->target_read_budget_=base_budget_;
+                source->target_read_clone_state_=clone_state_;
+                source_=std::move(source);
+            }
+            if(is_directory) return Observation<bool>::available(false);
+            ready_=true;
+            return Observation<bool>::available(true);
+        } catch (...) {
+            return fail(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"seed.exception");
+        }
+    }
+
+    Observation<std::shared_ptr<const OpenedEntry>> source() const override {
+        using R=Observation<std::shared_ptr<const OpenedEntry>>;
+        if(!ready_||finished_||failed_||!source_) return closed<std::shared_ptr<const OpenedEntry>>();
+        return R::available(source_);
+    }
+
+    Observation<std::shared_ptr<const DirectoryCursor>> directory_cursor() override {
+        using R=Observation<std::shared_ptr<const DirectoryCursor>>;
+        if(!ready_||finished_||failed_||enum_parent_.get()<0) return closed<std::shared_ptr<const DirectoryCursor>>();
+        if(!active_.expired()) return R::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"seed.enumerator_owned"});
+        detail::MetadataCaptureCleanupScope cleanup(this);
+        try {
+            auto lease=detail::NativeTargetReadBudget::acquire(budget_,1,sizeof(PosixDirectoryCursor));
+            if(!lease.value()) return R::unavailable(lease.unavailable_detail()->state,lease.unavailable_detail()->error);
+            const auto& expected=proof_->snapshot().basic;
+            auto fresh=target_?duplicate_prepared_directory(enum_parent_.get(),*target_bookend_,"seed.enumerator_open"):
+                open_fresh_directory(enum_parent_.get(),expected,"seed.enumerator_open");
+            if(!fresh.value()) return R::unavailable(fresh.unavailable_detail()->state,fresh.unavailable_detail()->error);
+            auto descriptor=std::move(fresh).take_value();
+            DIR* stream=fdopendir(descriptor.get());
+            if(!stream){const int code=errno;return R::unavailable(errno_state(code),{ErrorDomain::Posix,code,"seed.enumerator_fdopendir"});}
+            descriptor.release();
+            if(target_) rewinddir(stream);
+            OwnedDirectory directory(stream);
+            const auto observed=statx_metadata(dirfd(directory.get()),"",AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW,source_->scope_);
+            if(!observed.value()) return R::unavailable(observed.unavailable_detail()->state,observed.unavailable_detail()->error);
+            const auto same=target_?compare_target_identity(*target_bookend_,*observed.value(),"seed.target_enumerator_identity"):
+                compare_capture_bookend(expected,*observed.value(),"seed.enumerator_identity");
+            if(!same.value()) return R::unavailable(same.unavailable_detail()->state,same.unavailable_detail()->error);
+            auto cursor=std::make_shared<PosixDirectoryCursor>(std::move(directory),observed.value()->identity,source_->scope_);
+            cursor->target_read_budget_=std::move(lease).take_value();
+            cursor->target_read_clone_state_=clone_state_;
+            cursor->target_read_position_lease_=std::make_shared<const std::byte>();
+            active_=cursor->target_read_position_lease_;
+            return R::available(std::shared_ptr<const DirectoryCursor>(std::move(cursor)));
+        } catch (...) {
+            return R::unavailable(ObservationState::Unknown,{ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"seed.enumerator_exception"});
+        }
+    }
+
+    Observation<bool> finish_io() override {
+        // A returned source/cursor is an active consumer. Do not close the
+        // seed's native owners underneath it: callers must drain and release
+        // every view before the seed can consume its own descriptions.
+        if(!finished_ && (source_.use_count()>1 || !active_.expired() ||
+            (clone_state_ && clone_state_->active_clones.load(std::memory_order_acquire)!=0)))
+            return Observation<bool>::unavailable(ObservationState::Changed,
+                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"seed.consumers_active"});
+        if(!finished_){
+            detail::MetadataCaptureCleanupScope cleanup(this);
+            finished_=true;
+            if(source_) source_->finish_capture_reads();
+            source_.reset();
+            enum_parent_=OwnedDescriptor(-1);
+            base_budget_.reset();
+            proof_.reset();
+            directory_.reset();
+            target_=nullptr;
+            budget_.reset();
+        }
+        if(close_error_) return Observation<bool>::unavailable(close_error_->state,
+            {close_error_->domain,close_error_->code,close_error_->operation});
+        return Observation<bool>::available(true);
+    }
+
+private:
+    struct TargetBookend final {
+        ObjectIdentity identity;
+        std::uint64_t mount_id=0;
+        ObjectKind kind=ObjectKind::Other;
+        std::optional<std::uint64_t> logical_size;
+        std::optional<FileTimestamp> changed;
+    };
+    static Observation<TargetBookend> make_target_bookend(const BasicMetadata& metadata) {
+        using R=Observation<TargetBookend>;
+        if(!metadata.identity.value()||!metadata.mount_id.value()||!metadata.kind.value()||!metadata.changed.value())
+            return R::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::ProviderReviewRequired,"seed.target_bookend_fields"));
+        TargetBookend result{*metadata.identity.value(),*metadata.mount_id.value(),*metadata.kind.value(),{},*metadata.changed.value()};
+        if(result.kind==ObjectKind::RegularFile){
+            if(!metadata.logical_size.value()) return R::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::ProviderReviewRequired,"seed.target_bookend_size"));
+            result.logical_size=*metadata.logical_size.value();
+        }
+        return R::available(std::move(result));
+    }
+    static Observation<bool> compare_target_bookend(const TargetBookend& expected,const BasicMetadata& actual,const char* operation) {
+        using R=Observation<bool>;
+        if(!actual.identity.value()||compare_identity(expected.identity,*actual.identity.value())!=IdentityComparison::Same||
+           !actual.mount_id.value()||*actual.mount_id.value()!=expected.mount_id||
+           !actual.kind.value()||*actual.kind.value()!=expected.kind||
+           !actual.changed.value()||!expected.changed||*actual.changed.value()!=*expected.changed)
+            return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,operation));
+        if(expected.kind==ObjectKind::RegularFile&&(!actual.logical_size.value()||!expected.logical_size||*actual.logical_size.value()!=*expected.logical_size))
+            return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,operation));
+        return R::available(true);
+    }
+    static Observation<bool> compare_target_identity(const TargetBookend& expected,const BasicMetadata& actual,const char* operation) {
+        using R=Observation<bool>;
+        if(!actual.identity.value()||compare_identity(expected.identity,*actual.identity.value())!=IdentityComparison::Same||
+           !actual.mount_id.value()||*actual.mount_id.value()!=expected.mount_id||
+           !actual.kind.value()||*actual.kind.value()!=expected.kind)
+            return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,operation));
+        return R::available(true);
+    }
+    template<class T> static Observation<T> closed(){return Observation<T>::unavailable(ObservationState::Changed,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"seed.closed"});}
+    Observation<bool> failure_result() const { return Observation<bool>::unavailable(failure_state_,
+        {failure_domain_,failure_code_,failure_operation_}); }
+    Observation<bool> fail(ObservationState state,ErrorDomain domain,std::int64_t code,const char* operation){
+        if(!failed_){failed_=true;failure_state_=state;failure_domain_=domain;failure_code_=code;failure_operation_=operation;}
+        (void)finish_io();
+        return close_error_?Observation<bool>::unavailable(close_error_->state,
+            {close_error_->domain,close_error_->code,close_error_->operation}):failure_result();
+    }
+    static Observation<OwnedDescriptor> open_fresh_directory(int base,const BasicMetadata& expected,const char* operation){
+        using R=Observation<OwnedDescriptor>;
+        OwnedDescriptor fresh(openat(base,".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NOATIME));
+        if(fresh.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,operation});
+        const int flags=fcntl(fresh.get(),F_GETFL);
+        if(flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"seed.directory_flags"});
+        if((flags&O_ACCMODE)!=O_RDONLY||(flags&O_NOATIME)==0)
+            return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"seed.directory_noatime"));
+        const int descriptor_flags=fcntl(fresh.get(),F_GETFD);
+        if(descriptor_flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"seed.directory_fd_flags"});
+        if((descriptor_flags&FD_CLOEXEC)==0)return R::unavailable(ObservationState::Failed,
+            adapter_error(AdapterError::InvalidNativeResult,"seed.directory_cloexec"));
+        const auto after=statx_metadata(fresh.get(),"",AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW,expected.identity.value()->scope);
+        if(!after.value())return R::unavailable(after.unavailable_detail()->state,after.unavailable_detail()->error);
+        const auto same=compare_capture_bookend(expected,*after.value(),"seed.directory_identity");
+        if(!same.value())return R::unavailable(same.unavailable_detail()->state,same.unavailable_detail()->error);
+        return R::available(std::move(fresh));
+    }
+    static Observation<OwnedDescriptor> open_fresh_directory_target(int base,const TargetBookend& expected,const char* operation){
+        using R=Observation<OwnedDescriptor>;
+        OwnedDescriptor fresh(openat(base,".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NOATIME));
+        if(fresh.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,operation});
+        const int flags=fcntl(fresh.get(),F_GETFL);
+        if(flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"seed.directory_flags"});
+        if((flags&O_ACCMODE)!=O_RDONLY||(flags&O_NOATIME)==0)
+            return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"seed.directory_noatime"));
+        const int descriptor_flags=fcntl(fresh.get(),F_GETFD);
+        if(descriptor_flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"seed.directory_fd_flags"});
+        if((descriptor_flags&FD_CLOEXEC)==0)return R::unavailable(ObservationState::Failed,
+            adapter_error(AdapterError::InvalidNativeResult,"seed.directory_cloexec"));
+        const auto after=statx_metadata(fresh.get(),"",AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW,expected.identity.scope);
+        if(!after.value())return R::unavailable(after.unavailable_detail()->state,after.unavailable_detail()->error);
+        const auto same=compare_target_bookend(expected,*after.value(),"seed.target_directory_identity");
+        if(!same.value())return R::unavailable(same.unavailable_detail()->state,same.unavailable_detail()->error);
+        return R::available(std::move(fresh));
+    }
+    static Observation<OwnedDescriptor> duplicate_prepared_directory(int base,const TargetBookend& expected,const char* operation){
+        using R=Observation<OwnedDescriptor>;
+        OwnedDescriptor fresh(fcntl(base,F_DUPFD_CLOEXEC,0));
+        if(fresh.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,operation});
+        const int flags=fcntl(fresh.get(),F_GETFL);
+        if(flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"seed.directory_flags"});
+        if((flags&O_ACCMODE)!=O_RDONLY||(flags&O_NOATIME)==0)
+            return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"seed.directory_noatime"));
+        const int descriptor_flags=fcntl(fresh.get(),F_GETFD);
+        if(descriptor_flags<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"seed.directory_fd_flags"});
+        if((descriptor_flags&FD_CLOEXEC)==0)return R::unavailable(ObservationState::Failed,
+            adapter_error(AdapterError::InvalidNativeResult,"seed.directory_cloexec"));
+        const auto after=statx_metadata(fresh.get(),"",AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW,expected.identity.scope);
+        if(!after.value())return R::unavailable(after.unavailable_detail()->state,after.unavailable_detail()->error);
+        const auto same=compare_target_identity(expected,*after.value(),"seed.prepared_directory_identity");
+        if(!same.value())return R::unavailable(same.unavailable_detail()->state,same.unavailable_detail()->error);
+        return R::available(std::move(fresh));
+    }
+    PosixOpenedEntry* target_;
+    std::shared_ptr<const PosixDirectoryCursor> directory_;
+    std::shared_ptr<const NativeMetadataProof> proof_;
+    MetadataCaptureLimits limits_;
+    std::shared_ptr<MetadataCaptureBudget> budget_;
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch_;
+    std::shared_ptr<PosixOpenedEntry> source_;
+    OwnedDescriptor enum_parent_{-1};
+    std::shared_ptr<detail::NativeTargetReadBudget> base_budget_;
+    std::optional<TargetBookend> target_bookend_;
+    std::shared_ptr<NativeTargetReadCloneState> clone_state_;
+    std::weak_ptr<const void> active_;
+    mutable std::optional<MetadataCaptureCleanupError> close_error_;
+    ObservationState failure_state_=ObservationState::Unknown;
+    ErrorDomain failure_domain_=ErrorDomain::None;
+    std::int64_t failure_code_=0;
+    const char* failure_operation_="seed.failed";
+    bool ready_=false,finished_=false,failed_=false;
+};
+#endif
 
 Observation<bool> PosixOpenedEntry::publish_noreplace(const DirectoryCursor& destination, const NativeName& name) {
     if (!publication_)
@@ -2948,6 +3409,29 @@ Observation<std::unique_ptr<DirectoryCursor>> open_posix_directory_reader(const 
         adapter_error(AdapterError::ProviderReviewRequired,"directory_reader.native_cursor_required"));
     return native->open_current_directory_reader();
 }
+#if defined(__linux__)
+Observation<NativeTargetReadSeed::Pointer> begin_native_target_read_seed(
+    OpenedEntry& target,std::shared_ptr<const NativeMetadataProof> proof,MetadataCaptureLimits limits,
+    std::shared_ptr<MetadataCaptureBudget> budget,std::shared_ptr<const MetadataCaptureFailureLatch> latch) {
+    using R=Observation<NativeTargetReadSeed::Pointer>;
+    auto* native=dynamic_cast<PosixOpenedEntry*>(&target);
+    if(!native||!proof||!limits.valid()||!budget||!latch)
+        return R::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"target_read.native_target_inputs"});
+    return R::available(std::make_unique<PosixTargetReadSeed>(native,nullptr,std::move(proof),limits,std::move(budget),std::move(latch)));
+}
+Observation<NativeTargetReadSeed::Pointer> begin_native_directory_read_seed(
+    std::shared_ptr<const DirectoryCursor> directory,std::shared_ptr<const NativeMetadataProof> proof,
+    MetadataCaptureLimits limits,std::shared_ptr<MetadataCaptureBudget> budget,
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch) {
+    using R=Observation<NativeTargetReadSeed::Pointer>;
+    auto native=std::dynamic_pointer_cast<const PosixDirectoryCursor>(directory);
+    if(!native||!proof||!limits.valid()||!budget||!latch)
+        return R::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"target_read.native_directory_inputs"});
+    return R::available(std::make_unique<PosixTargetReadSeed>(nullptr,std::move(native),std::move(proof),limits,std::move(budget),std::move(latch)));
+}
+#endif
 Observation<bool> qualify_native_metadata_target(OpenedEntry& target,const NativeMetadataProof& proof) {
     auto* native=dynamic_cast<PosixOpenedEntry*>(&target);
     if(!native)return Observation<bool>::unavailable(ObservationState::Unsupported,

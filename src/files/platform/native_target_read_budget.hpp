@@ -21,6 +21,15 @@ public:
         auto lease=std::shared_ptr<NativeTargetReadBudget>(new NativeTargetReadBudget(std::move(budget),handles,bytes));
         return R::available(std::move(lease));
     }
+    // A real native clone owns a separate bounded lease. Copying the parent
+    // lease would undercount its independent descriptor and object lifetime.
+    static Observation<std::shared_ptr<NativeTargetReadBudget>> acquire_child(
+        const std::shared_ptr<NativeTargetReadBudget>& parent,std::size_t handles,std::size_t bytes) {
+        using R=Observation<std::shared_ptr<NativeTargetReadBudget>>;
+        if(!parent)return R::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"target_read.parent_lease_required"});
+        return acquire(parent->budget_,handles,bytes);
+    }
     ~NativeTargetReadBudget(){budget_->handles_-=handles_;budget_->metadata_-=bytes_;}
     NativeTargetReadBudget(const NativeTargetReadBudget&)=delete;
     NativeTargetReadBudget& operator=(const NativeTargetReadBudget&)=delete;

@@ -415,6 +415,23 @@ if(BUILD_TESTING)
   set_tests_properties(native_main_content_job PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ck_fs_native_target_read_seed_linux_tests tests/native_target_read_seed_linux_tests.cpp)
+    target_link_libraries(ck_fs_native_target_read_seed_linux_tests PRIVATE ck_files_platform)
+    target_compile_options(ck_fs_native_target_read_seed_linux_tests PRIVATE -UNDEBUG)
+    add_test(NAME native_target_read_seed_linux COMMAND ck_fs_native_target_read_seed_linux_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    set_tests_properties(native_target_read_seed_linux PROPERTIES TIMEOUT 180
+      LABELS "linux;native;metadata"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    add_executable(ck_fs_native_target_read_seed_fault_linux_tests tests/native_target_read_seed_fault_linux_tests.cpp)
+    target_link_libraries(ck_fs_native_target_read_seed_fault_linux_tests PRIVATE ck_core_fs_native ${CMAKE_DL_LIBS})
+    target_link_options(ck_fs_native_target_read_seed_fault_linux_tests PRIVATE -Wl,--wrap=close -Wl,--wrap=closedir)
+    target_compile_options(ck_fs_native_target_read_seed_fault_linux_tests PRIVATE -UNDEBUG)
+    foreach(seed_case source-eio source-oom source-prior clone-eio clone-oom clone-dtor seed-eio cursor-eio)
+      add_test(NAME native_target_read_seed_${seed_case} COMMAND ck_fs_native_target_read_seed_fault_linux_tests ${seed_case})
+      set_tests_properties(native_target_read_seed_${seed_case} PROPERTIES TIMEOUT 180
+        LABELS "linux;native;metadata"
+        ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    endforeach()
     add_executable(ck_fs_directory_reader_lifecycle_tests tests/directory_reader_lifecycle_tests.cpp)
     target_link_libraries(ck_fs_directory_reader_lifecycle_tests PRIVATE ck_core_fs_native ${CMAKE_DL_LIBS})
     target_compile_options(ck_fs_directory_reader_lifecycle_tests PRIVATE -UNDEBUG)

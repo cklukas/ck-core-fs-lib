@@ -466,6 +466,46 @@ without publication. Windows, Darwin, sanitizers and the final integrated SDK
 remain separate gates. Private Facts/item layouts changed and require coherent
 recompilation of every affected translation unit.
 
+## Linux target-reader lifetime and combined integration checkpoint
+
+The native Linux reader authenticates separate source-proof policy/shape and
+actual target identity, mount, kind, size and version. Existing-directory
+factories still require proof about that genuine held directory. Capture clones
+use independent read-only O_NOATIME descriptions; insufficient owner/FOWNER
+rights return Denied without a timestamp-mutating fallback. Darwin retains its
+original descriptor-clone route.
+
+Each real clone reserves its own native handle and metadata lease before open.
+An explicit private counter tracks clones even after the original reader is
+finished. Native descriptor/DIR members close before their budget and lifetime
+fields are released. Target enumeration uses descriptors prepared before final
+security, with serial native restart: a mode-000 target remains observable.
+EOF releases enumeration position while retaining the exhausted cursor's actual
+native handle and budget until destruction.
+
+The isolated native component passed different-inode regular/directory cases,
+actual capture-clone lifetime, budget exhaustion/recovery, restricted late
+enumeration, pinned exhausted cursors, cancellation and foreign-brand refusals.
+Eight actual close/fault modes passed, including source/clone EIO, persistent
+C++ allocation denial, prior Root error preservation, destructor ordering and
+FD-reuse/no-retry checks. The last affected platform rebuild took 14.37 seconds;
+it is incremental component evidence, not a fresh combined SDK.
+
+A fresh coherent 439-file Main cohort compiled 172 steps in 645.80 seconds.
+The initial selected run passed **37/39** entries. One registration omitted the
+positive reader fixture's required root argument; rerunning the unchanged,
+hash-verified binary with that argument passed, and the registration is fixed.
+The remaining Tree failure is real: generic metadata capture rejects link count
+zero on Linux's genuine anonymous staging target. The provider must authenticate
+that specific read capability before capture may accept zero links. Ordinary
+unlinked sources must remain rejected. The failing run is retained; Linux Tree
+execution is not promoted by these component results.
+
+The current merged POSIX provider, Tree and fresh-observer sources also passed
+Darwin syntax compilation in 8.02 seconds. This is compile-only coverage, not a
+macOS native execution result. Strict ckdocs built all 17 then-current pages;
+newer name-feedback documentation requires the next site validation.
+
 ## Remaining gates
 
 - Qualify the final combined postorder Tree and bounded metadata workers on
