@@ -10,6 +10,7 @@
 #include <string_view>
 
 namespace ck::files {
+namespace detail {class SessionReaderEpoch;class NativeSessionLease;struct SessionReaderFailure;}
 
 // Internal C++ contract. The C facade owns the session and translates exceptions.
 // Calls on one session/backend must be serialized. Native roots/locks remain
@@ -82,6 +83,7 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
 
 class SyncSession final {
 public:
+    ~SyncSession();
     static Observation<std::unique_ptr<SyncSession>> open(std::unique_ptr<SyncSessionBackend>,
         const SyncDigest& policy, SyncBaselineLimits limits = {});
     const SyncSessionIdentity& identity() const noexcept { return identity_; }
@@ -93,6 +95,12 @@ public:
     // owner is retained until destruction, and is NEVER finished here. Adopted
     // root lifecycle owner must subsequently finish/drain the original root.
     Observation<bool> finish_io();
+    // Memory-only first reader failure, usable while all allocations fail.
+    detail::SessionReaderFailure reader_failure()const noexcept;
+    // Allocating diagnostic methods may throw after reader teardown. Owning
+    // callers must attempt finish_io in their catch, swallow any reporting
+    // allocation exception, then rethrow the ORIGINAL exception. Never build
+    // a second Observation/string in that catch; reader_failure is POD.
     // Refresh also completes a valid durable intent, under the held root locks.
     // A failed/uncertain commit requires refresh before further commits.
     Observation<bool> refresh();
@@ -106,6 +114,8 @@ public:
         std::span<const SyncBaselineUpdate>, bool approve_first_run = false,
         std::function<bool()> cancelled = {});
 private:
+    friend class detail::NativeSessionLease;
+    std::shared_ptr<detail::SessionReaderEpoch> reader_epoch_;
     SyncSession(std::unique_ptr<SyncSessionBackend>, SyncSessionIdentity, SyncBaselineLimits);
     std::unique_ptr<SyncSessionBackend> backend_;
     SyncSessionIdentity identity_;

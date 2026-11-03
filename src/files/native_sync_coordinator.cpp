@@ -1,3 +1,4 @@
+#include "native_sync_hierarchy_binding.hpp"
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_sync_coordinator.hpp"
@@ -797,15 +798,22 @@ NativeSyncCoordinatorState NativeSyncCoordinator::advance(std::stop_token token)
         else if(s.result.state==NativeSyncCoordinatorState::Verifying)s.verify(token);
         else if(s.result.state==NativeSyncCoordinatorState::Committing)s.commit(token);
     } catch(const sync_detail::Failure& e) {
-        s.result.failure=e.detail;
+        try{s.result.failure=e.detail;}catch(...){s.close_native();throw;}
         s.result.state=token.stop_requested()&&!s.mutated&&!s.ledger_name?NativeSyncCoordinatorState::Cancelled:NativeSyncCoordinatorState::NeedsReview;
     } catch(...) {
         // No retry after an exception from a partially executed native phase.
         // The C boundary reports OOM/exception; durable journals remain intact.
         s.result.state=NativeSyncCoordinatorState::NeedsReview;
-        s.result.failure=UnavailableObservation{ObservationState::Unknown,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),{}}};
+        s.close_native(); // no allocating error construction while unwinding
         throw;
     }
     return s.result.state;
+}
+Observation<NativeHierarchyContext::Pointer> NativeHierarchyContext::borrow(NativeSyncCoordinator& worker,NativeHierarchyLimits limits,std::stop_token stop) {
+    try {
+    if(!worker.state_||worker.state_->finished||!worker.state_->session)return Observation<Pointer>::unavailable(ObservationState::Changed,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::PlanDecisionStale),"hierarchy.worker_closed"});
+    // Read-only opt-in; no re-lock, rule evaluation, approval or mutation.
+    return borrow(*worker.state_->session,limits,stop);
+    }catch(...){if(worker.state_)worker.state_->close_native();throw;}
 }
 } // namespace ck::files

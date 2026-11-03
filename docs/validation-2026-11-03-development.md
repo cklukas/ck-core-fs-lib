@@ -536,6 +536,37 @@ The regression is now a permanent Windows CMake target. Its misleading inherited
 header comment was corrected; executable test logic matches the frozen
 qualification. Matching ASan and the final combined revision remain pending.
 
+## Read-only hierarchical Session lease prerequisite
+
+Native hierarchy readers may now borrow the existing Session's genuine roots,
+locks and generation-bound epoch. Caller-defined backend subclasses, value IDs
+and handles cannot mint the private native brand. Bindings retain exact native
+components, inspect and revalidate parent/child membership, and return descriptive
+metadata without exposing writable handles or mutation/CAS authority.
+
+Session refresh, recovery, commit, finish and destruction revoke registered
+reader aliases before generation advancement or native lock release. Revocation
+clears the Session pointer before callbacks, drains every registered consumer
+without allocation, and preserves the first scalar close error. Allocating
+diagnostics run after native drainage. The original borrowed journal-root
+lifecycle remains the caller's responsibility.
+
+The qualified prerequisite packet passed **346 MSVC Debug checks each on NTFS
+and ReFS**, plus **706 Linux helper/OOM, 5,102 Session and 368 Resolution checks**.
+Actual persistent allocation denial and consumed native close failures cover the
+selected failure sites; they do not establish all-allocation-site OOM coverage.
+An independent Windows source review found no additional issue. The unsafe older
+675-check packet, its allocating noexcept fallbacks and failed Debug traces are
+retained as superseded evidence rather than counted as success.
+
+The integrating branch preserves the three directed implementation units and
+native tests, removes the fixture's arbitrary UID-1000 restriction while retaining
+its non-root requirement, and makes epoch-ID exhaustion nonwrapping. These small
+derivatives and the new private SyncSession layout are undergoing a fresh
+coherent combined build. This prerequisite does not implement recursive mutation,
+Tree-to-Session completion relay, nested durable ledgers or physical power-loss
+qualification.
+
 ## Remaining gates
 
 - Qualify the final combined postorder Tree and bounded metadata workers on

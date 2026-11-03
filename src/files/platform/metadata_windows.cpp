@@ -1,3 +1,4 @@
+#include "native_sync_session_lease.hpp"
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_filesystem.hpp"
@@ -4143,4 +4144,33 @@ Observation<WindowsTrashHandle> duplicate_windows_trash_parent(const DirectoryCu
     return native->duplicate_trash_parent();
 }
 
+
+Observation<std::unique_ptr<DirectoryCursor>> detail::open_native_session_root(const NativeSessionLease& lease,bool right) {
+    using R=Observation<std::unique_ptr<DirectoryCursor>>;
+    auto source=lease.handle(right);if(!source.value()){const auto& e=*source.unavailable_detail();return R::unavailable(e.state,e.error);}
+    // Independent enumeration state for a genuine sealed Session handle. The
+    // ID is queried here from the still-held original, never accepted as a
+    // caller fact. Holding that object prevents ID reuse during this open.
+    // ReOpenFile requires CreateFile origin; this Session handle is native-created.
+    const auto original=reinterpret_cast<HANDLE>(*source.value());
+    FILE_ID_INFO before{};
+    if(!GetFileInformationByHandleEx(original,FileIdInfo,&before,sizeof(before)))
+        return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"session_lease.held_root_id");
+    FILE_ID_DESCRIPTOR descriptor{};descriptor.dwSize=sizeof(descriptor);descriptor.Type=ExtendedFileIdType;
+    std::memcpy(descriptor.ExtendedFileId.Identifier,before.FileId.Identifier,16);
+    OwnedHandle opened(OpenFileById(original,&descriptor,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|SYNCHRONIZE,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,
+        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+    if(!opened||opened.get()==INVALID_HANDLE_VALUE)return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"session_lease.OpenFileById_root");
+    FILE_ID_INFO after{};
+    if(!GetFileInformationByHandleEx(opened.get(),FileIdInfo,&after,sizeof(after)))
+        return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"session_lease.opened_root_id");
+    if(before.VolumeSerialNumber!=after.VolumeSerialNumber||std::memcmp(before.FileId.Identifier,after.FileId.Identifier,16)!=0)
+        return R::unavailable(ObservationState::Changed,{ErrorDomain::Adapter,19,"session_lease.held_root_identity_changed"});
+    FILE_ATTRIBUTE_TAG_INFO tag{};if(!GetFileInformationByHandleEx(opened.get(),FileAttributeTagInfo,&tag,sizeof(tag)))return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"session_lease.root_tag");
+    constexpr DWORD unsafe=FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_OFFLINE;
+    if(!(tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)||(tag.FileAttributes&unsafe))return R::unavailable(ObservationState::Unsupported,{ErrorDomain::Adapter,18,"session_lease.root_kind"});
+    auto id=identity(opened.get(),lease.scope_);
+    return R::available(std::make_unique<WindowsDirectoryCursor>(std::move(opened),std::move(id),lease.scope_));
+}
 } // namespace ck::files

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "../sync_session.hpp"
+#include "native_sync_session_lease.hpp"
 #include "../sha256.hpp"
 #include "posix_private_storage.hpp"
 #include "prepared_journal_root_bridge.hpp"
@@ -422,4 +423,5 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     checked=b->flush_directory(); if(!checked.value()) return propagate<P>(checked);
     return Observation<P>::available(std::move(b));
 }
+bool detail::certify_native_sync_backend(const SyncSessionBackend& backend)noexcept {return dynamic_cast<const PosixBackend*>(&backend)!=nullptr;}
 } // namespace ck::files

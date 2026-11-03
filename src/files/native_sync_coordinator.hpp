@@ -7,6 +7,7 @@
 #include "conflict_rules.hpp"
 #include <functional>
 namespace ck::files {
+class NativeHierarchyContext;
 enum class NativeSyncCoordinatorEvent { BeforeLedgerClose, BeforeBaselineCommit, AfterBaselineCommit };
 struct NativeSyncCoordinatorRequest final {
     std::optional<NativeAbsolutePath> coordinator;
@@ -119,6 +120,7 @@ public:
     // a committed baseline intent is finished idempotently by SyncSession.
     NativeSyncCoordinatorState advance(std::stop_token={});
 private:
+    friend class NativeHierarchyContext;
     struct State;
     explicit NativeSyncCoordinator(std::unique_ptr<State> s);
     std::unique_ptr<State> state_;

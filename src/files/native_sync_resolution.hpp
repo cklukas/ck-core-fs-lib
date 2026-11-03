@@ -3,6 +3,7 @@
 #pragma once
 #include "native_sync_coordinator.hpp"
 namespace ck::files {
+class NativeHierarchyContext;
 // 0.5 worker-only, root-flat KEEP_BOTH_NAMED. Original objects remain in
 // place and visibly protected/pending; this is not canonical-name convergence.
 // Qualified Linux main DATA and native Windows NTFS/ReFS logical DATA families.
@@ -62,6 +63,7 @@ public:
     NativeSyncCoordinatorState advance(std::stop_token={});
     Observation<bool> finish_io();
 private:
+    friend class NativeHierarchyContext;
     struct State;
     std::unique_ptr<State> state_;
     explicit NativeSyncResolution(std::unique_ptr<State>);

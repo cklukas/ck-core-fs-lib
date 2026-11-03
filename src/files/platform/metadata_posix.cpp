@@ -1,3 +1,4 @@
+#include "native_sync_session_lease.hpp"
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #if defined(__linux__) && !defined(_GNU_SOURCE)
@@ -3517,4 +3518,21 @@ Observation<bool> NativeCreatedDirectory::finish_io() {
     return *finish_result_;
 }
 
+
+Observation<std::unique_ptr<DirectoryCursor>> detail::open_native_session_root(const NativeSessionLease& lease,bool right) {
+    using R=Observation<std::unique_ptr<DirectoryCursor>>;
+    auto source=lease.handle(right);if(!source.value()){const auto& e=*source.unavailable_detail();return R::unavailable(e.state,e.error);}
+    // A fresh open description of the same held directory, never its old path.
+    OwnedDescriptor fd(openat(static_cast<int>(*source.value()),".",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW));
+    if(fd.get()<0){const int e=errno;return R::unavailable(errno_state(e),{ErrorDomain::Posix,e,"session_lease.openat_held_root"});}
+    struct stat info{};if(fstat(fd.get(),&info)!=0){const int e=errno;return R::unavailable(errno_state(e),{ErrorDomain::Posix,e,"session_lease.root_fstat"});}
+    if(!S_ISDIR(info.st_mode))return R::unavailable(ObservationState::Unsupported,{ErrorDomain::Adapter,5,"session_lease.root_kind"});
+    std::optional<std::uint64_t> generation;
+#ifdef __APPLE__
+    generation=info.st_gen;
+#endif
+    auto id=Observation<ObjectIdentity>::available({lease.scope_,IdentityScheme::PosixDeviceInode,NativeIdentifier::from_u64(static_cast<std::uint64_t>(info.st_dev)),NativeIdentifier::from_u64(static_cast<std::uint64_t>(info.st_ino)),generation});
+    OwnedDirectory directory(fdopendir(fd.get()));if(!directory){const int e=errno;return R::unavailable(errno_state(e),{ErrorDomain::Posix,e,"session_lease.fdopendir"});}fd.release();
+    return R::available(std::make_unique<PosixDirectoryCursor>(std::move(directory),std::move(id),lease.scope_));
+}
 } // namespace ck::files

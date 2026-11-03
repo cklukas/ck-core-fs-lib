@@ -100,7 +100,8 @@ target_sources(ck_core_fs_engine PRIVATE
   src/files/metadata_capture_job.cpp
   src/files/native_regular_metadata_job.cpp
   src/files/metadata_ownership_digest.cpp
-  src/files/sync_session.cpp)
+  src/files/sync_session.cpp
+  src/files/sync_session_reader_epoch.cpp)
 target_sources(ck_core_fs_engine PRIVATE src/files/native_trash.cpp)
 target_compile_definitions(ck_core_fs_engine PRIVATE CK_FS_POLICY_STATIC)
 add_library(ck_file_engine ALIAS ck_core_fs_engine)
@@ -140,7 +141,8 @@ endif()
 add_library(ck_files_platform STATIC)
 target_sources(ck_files_platform PRIVATE
   src/files/private_journal_scope.cpp
-  src/files/private_journal_membership.cpp)
+  src/files/private_journal_membership.cpp
+  src/files/platform/native_sync_session_lease.cpp)
 set_target_properties(ck_files_platform PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(WIN32)
   target_sources(ck_files_platform PRIVATE
@@ -191,6 +193,7 @@ add_library(ck_core_fs_native STATIC
   src/files/native_sync_ledger.cpp
   src/files/native_sync_coordinator.cpp
   src/files/native_sync_resolution.cpp
+  src/files/native_sync_hierarchy_binding.cpp
   src/files/verified_copy_retry.cpp)
 set_target_properties(ck_core_fs_native PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ck_core_fs_native PUBLIC ck_files_platform)
@@ -432,6 +435,14 @@ if(BUILD_TESTING)
         LABELS "linux;native;metadata"
         ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
     endforeach()
+    add_executable(ck_fs_native_sync_hierarchy_persistent_oom_tests
+      tests/native_sync_hierarchy_persistent_oom_tests.cpp)
+    target_link_libraries(ck_fs_native_sync_hierarchy_persistent_oom_tests PRIVATE ck_core_fs_native ${CMAKE_DL_LIBS})
+    target_compile_options(ck_fs_native_sync_hierarchy_persistent_oom_tests PRIVATE -UNDEBUG)
+    add_test(NAME native_sync_hierarchy_persistent_oom COMMAND ck_fs_native_sync_hierarchy_persistent_oom_tests)
+    set_tests_properties(native_sync_hierarchy_persistent_oom PROPERTIES TIMEOUT 180
+      LABELS "linux;native;session;memory-failure"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
     add_executable(ck_fs_directory_reader_lifecycle_tests tests/directory_reader_lifecycle_tests.cpp)
     target_link_libraries(ck_fs_directory_reader_lifecycle_tests PRIVATE ck_core_fs_native ${CMAKE_DL_LIBS})
     target_compile_options(ck_fs_directory_reader_lifecycle_tests PRIVATE -UNDEBUG)
@@ -474,6 +485,15 @@ if(BUILD_TESTING)
     if(NOT CK_CORE_FS_METADATA_TARGET_NATIVE_FS MATCHES "^(NTFS|ReFS)$")
       message(FATAL_ERROR "Native metadata stream target fixture must select NTFS or ReFS")
     endif()
+    add_executable(ck_fs_native_sync_hierarchy_windows_oom_tests tests/native_sync_hierarchy_windows_oom_tests.cpp)
+    target_link_libraries(ck_fs_native_sync_hierarchy_windows_oom_tests PRIVATE ck_core_fs_native dbghelp)
+    if(MSVC)
+      target_compile_options(ck_fs_native_sync_hierarchy_windows_oom_tests PRIVATE /UNDEBUG)
+    endif()
+    add_test(NAME native_sync_hierarchy_windows_oom COMMAND ck_fs_native_sync_hierarchy_windows_oom_tests)
+    set_tests_properties(native_sync_hierarchy_windows_oom PROPERTIES TIMEOUT 180
+      LABELS "windows;native;session;memory-failure"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
     add_executable(ck_fs_native_legacy_batch_drain_windows_tests
       tests/native_legacy_batch_drain_windows_tests.cpp)
     target_link_libraries(ck_fs_native_legacy_batch_drain_windows_tests PRIVATE ck_core_fs_native dbghelp)

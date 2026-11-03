@@ -1,3 +1,4 @@
+#include "native_sync_hierarchy_binding.hpp"
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_sync_resolution.hpp"
@@ -562,7 +563,14 @@ const SyncDigest& NativeSyncResolutionReceipt::digest() const noexcept{return st
 Observation<NativeSyncResolutionReceipt::Pointer> NativeSyncResolution::assess(std::span<const NativeSyncNamedResolution> choices,std::stop_token stop){return attempt<NativeSyncResolutionReceipt::Pointer>([&]{detail::MetadataCaptureCleanupScope scope(state_.get());return NativeSyncResolutionReceipt::Pointer(new NativeSyncResolutionReceipt(state_->assess(choices,stop)));});}
 Observation<bool> NativeSyncResolution::approve(const NativeSyncResolutionReceipt& receipt,bool first,std::stop_token stop){return attempt<bool>([&]{detail::MetadataCaptureCleanupScope scope(state_.get());state_->approve(receipt,first,stop);return true;});}
 NativeSyncCoordinatorState NativeSyncResolution::advance(std::stop_token token){auto& s=*state_;detail::MetadataCaptureCleanupScope scope(&s);if(s.finished)return s.result.state;try{switch(s.result.state){case NativeSyncCoordinatorState::Executing:s.require_clean();s.execute(token);break;case NativeSyncCoordinatorState::Verifying:s.verify(token);break;case NativeSyncCoordinatorState::Committing:s.commit(token);break;default:break;}s.require_clean();}
-    catch(const Failure& e){s.result.failure=e.detail;s.result.state=token.stop_requested()&&!s.durable_intent?NativeSyncCoordinatorState::Cancelled:NativeSyncCoordinatorState::NeedsReview;}
-    catch(...){s.result.state=NativeSyncCoordinatorState::NeedsReview;throw;}return s.result.state;}
+    catch(const Failure& e){try{s.result.failure=e.detail;}catch(...){s.close_native();throw;}s.result.state=token.stop_requested()&&!s.durable_intent?NativeSyncCoordinatorState::Cancelled:NativeSyncCoordinatorState::NeedsReview;}
+    catch(...){s.result.state=NativeSyncCoordinatorState::NeedsReview;s.close_native();throw;}return s.result.state;}
 Observation<bool> NativeSyncResolution::finish_io(){detail::MetadataCaptureCleanupScope scope(state_.get());return state_->close();}
+Observation<NativeHierarchyContext::Pointer> NativeHierarchyContext::borrow(NativeSyncResolution& worker,NativeHierarchyLimits limits,std::stop_token stop) {
+    try {
+    if(!worker.state_||worker.state_->finished||!worker.state_->session)return Observation<Pointer>::unavailable(ObservationState::Changed,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::PlanDecisionStale),"hierarchy.worker_closed"});
+    // Read-only opt-in; no re-lock, rule evaluation, approval or mutation.
+    return borrow(*worker.state_->session,limits,stop);
+    }catch(...){if(worker.state_)worker.state_->close_native();throw;}
+}
 } // namespace ck::files

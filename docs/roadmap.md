@@ -42,3 +42,20 @@ backend. A frontend must retain native selection separately from escaped display
 text; a locale-filtered text widget cannot reconstruct discarded name bytes.
 This capability is recorded independently of the current execution/security
 qualification gate and does not authorize a frontend dependency pin.
+
+## Current development gates
+
+The unreleased 0.5 branch is being qualified independently of released frontend
+pins. Detailed frozen-cohort evidence is in the
+[development validation record](validation-2026-11-03-development.md).
+
+| Requested area | Implemented and exercised | Remaining integration |
+| --- | --- | --- |
+| Reviewed native trees | Receipt/row/policy seals; independent target observations; Windows created/merged postorder execution | Corrected Linux anonymous-target and existing-directory path; hierarchical Session relay; final combined qualification |
+| Retention and preservation | Native Windows retained versions; Windows Full Original metadata; narrow Linux Full issuer; bounded ACL/xattr replay | Combined Caller/clone/Full SDK; other provider scopes remain explicit refusals |
+| Durable two-way sessions | Flat coordinator, overlapping-root locks, durable generation recovery; qualified read-only Session leases | Recursive mutation and nested-path durable ledger/CAS binding |
+| Stable C operation APIs | Batch rename, native Trash receipts/restore, verified retry/prefix resume, cached name-side feedback | Final combined installed-consumer and platform checks |
+| Platform qualification | Scoped Linux/Windows normal and sanitizer receipts; corrected Darwin TSan tooling; strict ckdocs | Matching final SDK matrices, macOS native publication limits, and native-host CI admission/provenance |
+
+Typed Unsupported outcomes describe provider limits. They do not count as a
+positive execution qualification or enable a frontend command.

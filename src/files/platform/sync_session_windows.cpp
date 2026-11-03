@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "../sync_session.hpp"
+#include "native_sync_session_lease.hpp"
 #include "../sha256.hpp"
 #include "../windows_name.hpp"
 #include "native_windows_journal_volume.hpp"
@@ -35,11 +36,10 @@ struct CloseFailure {
         if(owner)detail::record_prepared_journal_consumer_failure(*owner,
             ObservationState::Failed,ErrorDomain::Win32,error,tag);
     }
-    template<class T> Observation<T> result() const noexcept {
-        try {return Observation<T>::unavailable(ObservationState::Failed,{ErrorDomain::Win32,code,operation});}
-        catch(const std::bad_alloc&) {
-            return Observation<T>::unavailable(ObservationState::Failed,{ErrorDomain::Win32,code,{}});
-        }
+    template<class T> Observation<T> result() const {
+        // All exact native requests/handles have already drained. The fixed
+        // first failure is in Root; no allocating noexcept fallback or retry.
+        return Observation<T>::unavailable(ObservationState::Failed,{ErrorDomain::Win32,code,operation});
     }
 };
 struct CloseContext;
@@ -69,14 +69,12 @@ struct CloseContext {
         active_close_context=previous;
     }
     template<class T,class F> Observation<T> run(F&& body) {
-        try {
-            auto result=body(); // body locals, including native smart owners, drain here
-            if(failure.operation)return failure.result<T>();
-            return result;
-        } catch(...) {
-            if(failure.operation)return failure.result<T>();
-            throw;
-        }
+        auto result=[&]() -> Observation<T> {
+            try {return body();} // locals and native owners drain before catch
+            catch(...) {if(failure.operation)return failure.result<T>();throw;}
+        }();
+        if(failure.operation)return failure.result<T>();
+        return result;
     }
 };
 PreparedJournalRoot::Pointer close_owner() noexcept {
@@ -117,8 +115,7 @@ template<class T> Observation<T> reject(const char* op,ObservationState s=Observ
 }
 template<class T,class U> Observation<T> propagate(const Observation<U>& r) {
     const auto& error=r.unavailable_detail()->error;
-    try {return Observation<T>::unavailable(r.state(),error);}
-    catch(const std::bad_alloc&) {return Observation<T>::unavailable(r.state(),{error.domain,error.code,{}});}
+    return Observation<T>::unavailable(r.state(),error);
 }
 void put(Sha256& h,std::uint64_t n) {
     std::array<std::byte,8> b; for(unsigned i=0;i<8;++i) b[i]=std::byte((n>>(8*i))&255); h.update(b);
@@ -817,4 +814,5 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     check=b->flush_directory(); if(!check.value()) return propagate<P>(check);
     return Observation<P>::available(std::move(b));
 }
+bool detail::certify_native_sync_backend(const SyncSessionBackend& backend)noexcept {return dynamic_cast<const WindowsBackend*>(&backend)!=nullptr;}
 } // namespace ck::files

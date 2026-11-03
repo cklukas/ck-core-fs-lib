@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "sync_session.hpp"
+#include "sync_session_reader_epoch.hpp"
 #include "sha256.hpp"
 #include "native_filesystem.hpp"
 #include <algorithm>
@@ -13,7 +14,7 @@ template<class T> Observation<T> reject(const char* op, ObservationState s = Obs
         static_cast<std::int64_t>(AdapterError::ProviderReviewRequired), op});
 }
 template<class T, class U> Observation<T> propagate(const Observation<U>& o) {
-    return Observation<T>::unavailable(o.state(), o.unavailable_detail()->error);
+    return Observation<T>::unavailable(o.state(),o.unavailable_detail()->error);
 }
 SyncDigest hash(std::span<const std::byte> b) { Sha256 h; h.update(b); return h.digest(); }
 void append(std::vector<std::byte>& b, const SyncDigest& d) { b.insert(b.end(), d.begin(), d.end()); }
@@ -107,16 +108,27 @@ Observation<std::unique_ptr<SyncSession>> SyncSession::open(std::unique_ptr<Sync
     auto r=s->refresh(); if(!r.value()) return propagate<std::unique_ptr<SyncSession>>(r);
     return R::available(std::move(s));
 }
+detail::SessionReaderFailure SyncSession::reader_failure()const noexcept{return reader_epoch_?reader_epoch_->first_:detail::SessionReaderFailure{};}
+SyncSession::~SyncSession(){if(reader_epoch_)reader_epoch_->revoke();}
 Observation<bool> SyncSession::finish_io() {
-    finished_=true; // Even a throwing result construction revokes all I/O authority.
-    return backend_->finish_io();
+    finished_=true; // revoke before callbacks/destruction/native lock release
+    const auto readers=reader_epoch_?reader_epoch_->revoke():detail::SessionReaderFailure{};
+    // Retain the revoked scalar failure for repeated finish calls.
+    auto result=backend_->finish_io();
+    // Native backend is consumed before any reader diagnostic can allocate.
+    if(readers.failed)return readers.result();
+    return result;
 }
 Observation<bool> SyncSession::revalidate() {
     if(finished_)return reject<bool>("sync_session.finished");
+    if(reader_epoch_&&reader_epoch_->first_.failed)return reader_epoch_->first_.result();
     return backend_->revalidate();
 }
 Observation<bool> SyncSession::refresh() {
     if(finished_)return reject<bool>("sync_session.finished");
+    // commit calls refresh before any intent/publication, so native borrowers
+    // must be consumed here before recovery or generation advancement too.
+    if(reader_epoch_){const auto readers=reader_epoch_->revoke();if(readers.failed)return readers.result();reader_epoch_.reset();}
     uncertain_=true;
     auto valid=backend_->revalidate(); if(!valid.value()) return valid;
     auto read=[&](const char* suffix) { return backend_->read(prefix_+suffix,limits_.max_wire_bytes+88); };
