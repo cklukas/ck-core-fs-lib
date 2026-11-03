@@ -750,3 +750,24 @@ follow-ups and the final combined SDK require fresh runtime qualification.
 The frozen baseline-to-final packet manifest is
 `09718b2c7cb99cf53a9cac51ddf6bb18ffead5c68b3ab462a4033df6da00c98e`.
 No existing SDK or later headers were mixed into that candidate's runtime.
+
+
+### Follow-up: Full anonymous capture on no-birthtime ext4
+
+The separate initial-user-namespace/private-mount-namespace fixture now passes
+with a real ext4 inode-size-128 filesystem, which reports no birthtime, and
+`CK_FS_REQUIRE_FULL_ANONYMOUS_CAPTURE=1`. The genuine anonymous zero-link view
+completed Full metadata capture and explicit drain. The tightened test requires
+both presence and a true drain result; the affected test rebuild/relink took
+eight seconds. Source manifest:
+`f54fc79f53de0c5d6fa33a718aad1a0ecc0470c0a1da85d902e1a17829da0260`;
+executed binary:
+`32022f11f52e7e372d7b2c82b43c1d1e862565eb3f31d71d82659057b9e8ca20`.
+The verified executable was held across execution. The fixture unmounted and
+detached its exact owned loop device, then removed its disposable image after
+retaining hashes and logs. No host/global filesystem configuration changed.
+
+This closes the anonymous-target **capture** gate for that narrow provider
+scope. It does not qualify Full Tree publication, the next combined revision,
+other ext4 inode formats, or another security environment. The existing
+birthtime and unsupported security-class gates remain in force.
