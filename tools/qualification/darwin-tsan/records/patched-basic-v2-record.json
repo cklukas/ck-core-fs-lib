@@ -1,0 +1,52 @@
+{
+  "start": "2026-11-03T07:10:13.368968+00:00",
+  "source_sha256": "4743dcce48a03ec6a3c5fab69a9d3d74fa79796736eb1455836975bc382fc2ac",
+  "runtime": "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/build-patched/lib/darwin/libclang_rt.tsan_osx_dynamic.dylib",
+  "runtime_sha256": "124e6acd2266a0526f9184c852ca6f3270997378bdbcedc22c72765b4d155890",
+  "configuration": "LLVM23.1.4 compiler with matching locally built patched arm64 runtime; exact dyld images retained; basic reproducer only, negative controls pending",
+  "stages": [
+    {
+      "name": "compile",
+      "start": "2026-11-03T07:10:13.375694+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-std=c11",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "-fno-omit-frame-pointer",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-errno-investigation-v1/errno_threads.c",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/patched-errno-v2"
+      ],
+      "end": "2026-11-03T07:10:13.950162+00:00",
+      "seconds": 0.5744974160043057,
+      "result": 0
+    },
+    {
+      "name": "detach",
+      "start": "2026-11-03T07:10:13.951082+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/patched-errno-v2"
+      ],
+      "end": "2026-11-03T07:10:14.817430+00:00",
+      "seconds": 0.8663684999919496,
+      "result": 0
+    },
+    {
+      "name": "join",
+      "start": "2026-11-03T07:10:14.822672+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/patched-errno-v2",
+        "join"
+      ],
+      "end": "2026-11-03T07:10:15.277555+00:00",
+      "seconds": 0.45490820799022913,
+      "result": 0
+    }
+  ],
+  "executable_sha256": "03bacc2eb59732df72c65249d6a967efb1edc9a5ba46ce26d8f153cf179773b8",
+  "end": "2026-11-03T07:10:15.282801+00:00",
+  "status": "Basic detached errno reuse and joined controls pass; negative/shadow controls and complete backend matching-toolchain qualification remain pending"
+}

@@ -1,0 +1,49 @@
+{
+  "start": "2026-11-03T07:37:27.669608+00:00",
+  "reason": "Use normal Mach-O load dependency, same early runtime loading as compiler -fsanitize=thread, so gtest death-test exec retains runtime without dependence on environment preload removed by sanitizer runtime",
+  "source_sha256": "5d30d07e061f5c6926ded987bcf048c21d0c95ab3528854aba5f44d4d34dfe1f",
+  "image_sha256": "90019b635f30dd818aa1e88826fd95c4c296c916cbaa7a74f2ea142bf1c7f117",
+  "stages": [
+    {
+      "name": "compile",
+      "start": "2026-11-03T07:37:27.684820+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang",
+        "-std=c11",
+        "-O1",
+        "-g",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/unit-loader.c",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/NativeTlsUnitRuntime-v2.dylib",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/NativeTlsUnitLoader-v3"
+      ],
+      "end": "2026-11-03T07:37:28.198956+00:00",
+      "seconds": 0.5141583750082646,
+      "result": 0
+    },
+    {
+      "name": "focused",
+      "start": "2026-11-03T07:37:28.199437+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/NativeTlsUnitLoader-v3",
+        "--gtest_filter=NativeTlsShadow.*"
+      ],
+      "end": "2026-11-03T07:37:28.748572+00:00",
+      "seconds": 0.5491585419804323,
+      "result": 0
+    },
+    {
+      "name": "full",
+      "start": "2026-11-03T07:37:28.749308+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/NativeTlsUnitLoader-v3"
+      ],
+      "end": "2026-11-03T07:37:30.748223+00:00",
+      "seconds": 1.9990173330006655,
+      "result": 0
+    }
+  ],
+  "end": "2026-11-03T07:37:30.748835+00:00",
+  "loader_sha256": "3e3958e328256d0068f068de45bacec8381cb5cea266b37af1d46b9eb000d4c4",
+  "status": "Focused4 exactshadowcontrols and complete45unit tests PASS,8upstreamdisabledtestsnotcounted; normalearlydynamicdependency/interceptorverification enabled/no suppressions"
+}

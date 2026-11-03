@@ -1,0 +1,286 @@
+{
+  "start": "2026-11-03T07:22:20.024656+00:00",
+  "runtime": "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/build-patched/lib/darwin/libclang_rt.tsan_osx_dynamic.dylib",
+  "runtime_sha256": "124e6acd2266a0526f9184c852ca6f3270997378bdbcedc22c72765b4d155890",
+  "configuration": "Matching LLVM23.1.4 patched native errno runtime; pinned upstream TLS, detached thread, finished-thread and signal-errno controls; one compiler CPU",
+  "stages": [
+    {
+      "name": "tls_race-compile",
+      "start": "2026-11-03T07:22:20.031100+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang++",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-pthread",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "-fno-omit-frame-pointer",
+        "-I/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/tls_race.cpp",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/tls_race"
+      ],
+      "end": "2026-11-03T07:22:20.750431+00:00",
+      "seconds": 0.7193506250041537,
+      "result": 0
+    },
+    {
+      "name": "tls_race",
+      "start": "2026-11-03T07:22:20.751055+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/tls_race"
+      ],
+      "end": "2026-11-03T07:22:24.324856+00:00",
+      "seconds": 3.573829458007822,
+      "result": 66
+    },
+    {
+      "name": "tls_race2-compile",
+      "start": "2026-11-03T07:22:24.331680+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang++",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-pthread",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "-fno-omit-frame-pointer",
+        "-I/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/tls_race2.cpp",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/tls_race2"
+      ],
+      "end": "2026-11-03T07:22:24.557890+00:00",
+      "seconds": 0.22624554100912064,
+      "result": 0
+    },
+    {
+      "name": "tls_race2",
+      "start": "2026-11-03T07:22:24.558854+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/tls_race2"
+      ],
+      "end": "2026-11-03T07:22:25.206768+00:00",
+      "seconds": 0.6479394170164596,
+      "result": 66
+    },
+    {
+      "name": "race_with_finished_thread-compile",
+      "start": "2026-11-03T07:22:25.214311+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang++",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-pthread",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "-fno-omit-frame-pointer",
+        "-I/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/race_with_finished_thread.cpp",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/race_with_finished_thread"
+      ],
+      "end": "2026-11-03T07:22:25.440253+00:00",
+      "seconds": 0.22596520799561404,
+      "result": 0
+    },
+    {
+      "name": "race_with_finished_thread",
+      "start": "2026-11-03T07:22:25.441371+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/race_with_finished_thread"
+      ],
+      "end": "2026-11-03T07:22:27.081778+00:00",
+      "seconds": 1.640434083994478,
+      "result": 66
+    },
+    {
+      "name": "thread_detach-compile",
+      "start": "2026-11-03T07:22:27.088686+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-pthread",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "-fno-omit-frame-pointer",
+        "-I/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/thread_detach.c",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/thread_detach"
+      ],
+      "end": "2026-11-03T07:22:27.310012+00:00",
+      "seconds": 0.22135112498654053,
+      "result": 0
+    },
+    {
+      "name": "thread_detach",
+      "start": "2026-11-03T07:22:27.311789+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/thread_detach"
+      ],
+      "end": "2026-11-03T07:22:27.762459+00:00",
+      "seconds": 0.4506965409964323,
+      "result": 0
+    },
+    {
+      "name": "signal_errno-compile",
+      "start": "2026-11-03T07:22:27.769668+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang++",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-pthread",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "-fno-omit-frame-pointer",
+        "-I/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/signal_errno.cpp",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/signal_errno"
+      ],
+      "end": "2026-11-03T07:22:28.008899+00:00",
+      "seconds": 0.23925424998742528,
+      "result": 0
+    },
+    {
+      "name": "signal_errno",
+      "start": "2026-11-03T07:22:28.009726+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/signal_errno"
+      ],
+      "end": "2026-11-03T07:22:28.651343+00:00",
+      "seconds": 0.6416382089955732,
+      "result": 66
+    },
+    {
+      "name": "dtls-compile",
+      "start": "2026-11-03T07:22:28.654508+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-pthread",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "-fno-omit-frame-pointer",
+        "-I/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/dtls.c",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/dtls"
+      ],
+      "end": "2026-11-03T07:22:28.878708+00:00",
+      "seconds": 0.22422329199616797,
+      "result": 0
+    },
+    {
+      "name": "dtls-so.so-compile",
+      "start": "2026-11-03T07:22:28.879737+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-pthread",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "-fno-omit-frame-pointer",
+        "-I/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test",
+        "-DBUILD_SO",
+        "-fPIC",
+        "-shared",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/dtls.c",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/dtls-so.so"
+      ],
+      "end": "2026-11-03T07:22:29.094696+00:00",
+      "seconds": 0.2149789170071017,
+      "result": 0
+    },
+    {
+      "name": "dtls",
+      "start": "2026-11-03T07:22:29.095508+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/dtls"
+      ],
+      "end": "2026-11-03T07:22:30.723378+00:00",
+      "seconds": 1.6278970419953112,
+      "result": 0
+    },
+    {
+      "name": "native_errno_tls-compile",
+      "start": "2026-11-03T07:22:30.731029+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang++",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-pthread",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "-fno-omit-frame-pointer",
+        "-I/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test",
+        "-std=c++17",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/native_errno_tls.cpp",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/native_errno_tls"
+      ],
+      "end": "2026-11-03T07:22:31.177533+00:00",
+      "seconds": 0.44652850000420585,
+      "result": 0
+    },
+    {
+      "name": "native_errno_detached",
+      "start": "2026-11-03T07:22:31.178460+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/native_errno_tls",
+        "detached"
+      ],
+      "end": "2026-11-03T07:22:31.675058+00:00",
+      "seconds": 0.49662629098747857,
+      "result": 0
+    },
+    {
+      "name": "native_errno_joined",
+      "start": "2026-11-03T07:22:31.676611+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/native_errno_tls",
+        "joined"
+      ],
+      "end": "2026-11-03T07:22:32.034099+00:00",
+      "seconds": 0.35751566701219417,
+      "result": 0
+    },
+    {
+      "name": "native_errno_shared",
+      "start": "2026-11-03T07:22:32.040115+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/native_errno_tls",
+        "shared"
+      ],
+      "end": "2026-11-03T07:22:32.524790+00:00",
+      "seconds": 0.4847052090044599,
+      "result": 66
+    }
+  ],
+  "inputs": {
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/tls_race.cpp": "505592ec49cfe53ad7766f52ad5176d43beaabf0a4fa2929b84ca809180b5cb1",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/tls_race2.cpp": "72133b30608b6b234848382118485ed9c47bc901c60ed4d75a7058b4c519ca20",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/race_with_finished_thread.cpp": "90381b6fa5cc169feba827f8640196aecf54fae05f564a80d3816fff71ecaf09",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/thread_detach.c": "d114639698cf3d5a305d994093d2ef5a502949c5e781496da43ec072f8fa554f",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/signal_errno.cpp": "2b5da3b69558cddf559abfea6fc35adb8c4aa83116a4de7ad8258f6081190fb9",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/dtls.c": "c906b96a93d3092b8061cf41c6828cf935a9a3deb73b4076ec88dbcce7c3b4e2",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt/test/tsan/native_errno_tls.cpp": "cfc25ac7d8a877c2de75ab642f63e38e68880da22c2ef15ba4c7a9cb88208f87"
+  },
+  "outputs": {
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/tls_race": "0831deb79d9cc6282ac0d1324046ab6b3159ed246fb77a0e62efc5d570dc114c",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/tls_race2": "9237b80ab363f6daaac27e943da15dadbf8bf982ef72b6f0398d9f5c3290af4a",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/race_with_finished_thread": "829542b4f6825527677cc51bfd8a40f59f9fd44c39f767fa5af1b8e0efeb71d4",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/thread_detach": "d1cf46bd33cd2473c213bed58b8c958a4766b3a4e623153cb081c8d6fde832ea",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/signal_errno": "2bd05cb08be6ab7f72f9fac6fa2388c7d500b1565806b8ca74973a041e250c0a",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/dtls": "9e0c6c23cb82d911a8c3af8fbe7813c916dc0f28d78d46e6e6a52349bac96175",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/dtls-so.so": "ce5064767c46322263404ed85aad2070736efd11d1c6f5ac041a065fd61ebbf0",
+    "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/controls-v1/native_errno_tls": "fb4600c358f8b629af20c5f3c079797c74ef0f22e9942c5ab9537d7d235cb4e2"
+  },
+  "end": "2026-11-03T07:22:32.531298+00:00",
+  "status": "Pinned positive TLS controls and intentional TLS/finished-thread/foreign-errno races preserved; exact shadow unit controls and full matching backend still required"
+}

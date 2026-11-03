@@ -1,0 +1,82 @@
+{
+  "start": "2026-11-03T07:07:32.666755+00:00",
+  "source_commit": "7a941dfb2877a0b8cf30323fefa85ad019e0b0f5",
+  "inputs": {
+    "compiler-rt/lib/tsan/rtl/tsan_platform.h": "5ee35976d433e5775bce83ffc77a6325f38219e3b1571a5f55d159351987af84",
+    "compiler-rt/lib/tsan/rtl/tsan_platform_mac.cpp": "7c82a2267431f14fafafb493a7004e4b8a23144cce41502a2111821cf665a52c",
+    "compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cpp": "eaaaf4d5f9ea7ebf70723a8bfa1cd237f83013abe960e693372fb4ce955f093c",
+    "compiler-rt/lib/tsan/rtl/tsan_rtl.h": "f5521b851897f136bd894d36b51c6816df0435db27273e8af9da4ec3d9598734",
+    "compiler-rt/lib/tsan/rtl/tsan_rtl_access.cpp": "b3b305a38061fe45292d9eab283d30fd137fee18798cd64f80c971e21030671e"
+  },
+  "patch_sha256": "4de5d71623aceef76448f8632d232edb1f34b94ca5385991410a21918b9b0fc5",
+  "assets": "none",
+  "baseline": "Stock Release configure41.62s/build52.19s produced universal x86_64/x86_64h/arm64. This build explicitly arm64 only, not directly comparable; inspect all source/object commands and exact output before running.",
+  "configuration": "Fresh LLVM23.1.4 compiler-rt Release arm64-only tsan, one CPU; five exact-shadow/lifecycle production changes, no ignorelist/ABI or clock changes",
+  "stages": [
+    {
+      "name": "configure",
+      "start": "2026-11-03T07:07:32.681652+00:00",
+      "command": [
+        "cmake",
+        "-G",
+        "Ninja",
+        "-S",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/llvm-source/compiler-rt",
+        "-B",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/build-patched",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang",
+        "-DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++",
+        "-DCMAKE_ASM_COMPILER=/opt/homebrew/opt/llvm/bin/clang",
+        "-DCMAKE_C_COMPILER_TARGET=arm64-apple-darwin27.2.0",
+        "-DCMAKE_CXX_COMPILER_TARGET=arm64-apple-darwin27.2.0",
+        "-DCMAKE_OSX_ARCHITECTURES=arm64",
+        "-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0",
+        "-DLLVM_CMAKE_DIR=/opt/homebrew/Cellar/llvm/23.1.4/lib/cmake/llvm",
+        "-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON",
+        "-DCOMPILER_RT_BUILD_BUILTINS=OFF",
+        "-DCOMPILER_RT_BUILD_SANITIZERS=ON",
+        "-DCOMPILER_RT_SANITIZERS_TO_BUILD=tsan",
+        "-DCOMPILER_RT_BUILD_LIBFUZZER=OFF",
+        "-DCOMPILER_RT_BUILD_PROFILE=OFF",
+        "-DCOMPILER_RT_BUILD_CRT=OFF",
+        "-DCOMPILER_RT_BUILD_XRAY=OFF",
+        "-DCOMPILER_RT_BUILD_MEMPROF=OFF",
+        "-DCOMPILER_RT_BUILD_ORC=OFF",
+        "-DCOMPILER_RT_INCLUDE_TESTS=OFF",
+        "-DCOMPILER_RT_ENABLE_IOS=OFF",
+        "-DCOMPILER_RT_ENABLE_WATCHOS=OFF",
+        "-DCOMPILER_RT_ENABLE_TVOS=OFF",
+        "-DCOMPILER_RT_ENABLE_VISIONOS=OFF",
+        "-DCOMPILER_RT_ENABLE_MACCATALYST=OFF",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        "-DCMAKE_INSTALL_PREFIX=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/patched-install",
+        "-DDARWIN_osx_ARCHS=arm64"
+      ],
+      "end": "2026-11-03T07:08:04.814907+00:00",
+      "seconds": 32.133334874990396,
+      "result": 0
+    },
+    {
+      "name": "build",
+      "start": "2026-11-03T07:08:04.815371+00:00",
+      "command": [
+        "cmake",
+        "--build",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/build-patched",
+        "--target",
+        "tsan",
+        "--parallel",
+        "1"
+      ],
+      "end": "2026-11-03T07:08:20.267637+00:00",
+      "seconds": 15.452310499997111,
+      "result": 0
+    }
+  ],
+  "end": "2026-11-03T07:08:20.285692+00:00",
+  "output": "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/build-patched/lib/darwin/libclang_rt.tsan_osx_dynamic.dylib",
+  "output_sha256": "dbb2f39329b02029704fb73e86269d4a958db9543d69b79471705c2982fcf374",
+  "actual_architectures": "arm64",
+  "status": "Runtime built; safety controls and backend qualification still pending"
+}

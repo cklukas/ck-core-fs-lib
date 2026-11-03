@@ -1,0 +1,44 @@
+{
+  "source_commit": "7a941dfb2877a0b8cf30323fefa85ad019e0b0f5",
+  "source_tree": "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/llvm-source/compiler-rt",
+  "start": "2026-11-03T11:25:19Z",
+  "end": "2026-11-03T11:26:15Z",
+  "duration_seconds": 56,
+  "tsan_options": "halt_on_error=1:abort_on_error=0:exitcode=66",
+  "runtime": {
+    "path": "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/build/lib/darwin/libclang_rt.tsan_osx_dynamic.dylib",
+    "before_sha256": "ba79ff2e55b670221abbcd28d5becef30eae9b56b9f77d9a6a9673f4e356eae2",
+    "after_sha256": "ba79ff2e55b670221abbcd28d5becef30eae9b56b9f77d9a6a9673f4e356eae2"
+  },
+  "toolchain": {
+    "clang": "/opt/homebrew/opt/llvm/bin/clang",
+    "clang_sha256": "a3f510aa37c9a3082649435e39e3f7c808b6696bb62f077b141c271b5aa783a2",
+    "clangxx": "/opt/homebrew/opt/llvm/bin/clang++",
+    "clangxx_sha256": "a3f510aa37c9a3082649435e39e3f7c808b6696bb62f077b141c271b5aa783a2"
+  },
+  "control_inputs": {
+    "/Volumes/PRO-BLADE/Development/ck-core-fs-lib/tools/qualification/darwin-tsan/tests/compiler-rt/test/tsan/native_errno_tls.cpp": "cfc25ac7d8a877c2de75ab642f63e38e68880da22c2ef15ba4c7a9cb88208f87",
+    "/Volumes/PRO-BLADE/Development/ck-core-fs-lib/tools/qualification/darwin-tsan/tests/compiler-rt/test/tsan/libdispatch/native_errno_gcd.cpp": "368fe967de37de093dee3309e55211271f306f58e0064d8b8e0d1506fcc61779",
+    "/Volumes/PRO-BLADE/Development/ck-core-fs-lib/tools/qualification/darwin-tsan/tests/compiler-rt/lib/tsan/tests/unit/tsan_native_tls_test.cpp": "8dfb49648e935473b527c6ea4b792b7dba1ad8f0f714e7fc45261960ad74cea3",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/llvm-source/compiler-rt/test/tsan/tls_race.cpp": "505592ec49cfe53ad7766f52ad5176d43beaabf0a4fa2929b84ca809180b5cb1",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/llvm-source/compiler-rt/test/tsan/tls_race2.cpp": "72133b30608b6b234848382118485ed9c47bc901c60ed4d75a7058b4c519ca20",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/llvm-source/compiler-rt/test/tsan/race_with_finished_thread.cpp": "90381b6fa5cc169feba827f8640196aecf54fae05f564a80d3816fff71ecaf09",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/llvm-source/compiler-rt/test/tsan/thread_detach.c": "d114639698cf3d5a305d994093d2ef5a502949c5e781496da43ec072f8fa554f",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/llvm-source/compiler-rt/test/tsan/signal_errno.cpp": "2b5da3b69558cddf559abfea6fc35adb8c4aa83116a4de7ad8258f6081190fb9",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/llvm-source/compiler-rt/test/tsan/dtls.c": "c906b96a93d3092b8061cf41c6828cf935a9a3deb73b4076ec88dbcce7c3b4e2"
+  },
+  "logs": {
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/dtls.log": "f789ca74a87bdcf15a45740737881145b79e95599d059894bab6d6ad978e8fd8",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/finished_thread.log": "fa1a7775b8d8065f49184164f11386a73b1e5269625e90d7ba88da819b346cf3",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/gcd.log": "de1f1b57f32574a01ee1bc947323830892ed9357f317c922187ee0357386ff88",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/main_foreign.log": "f566549c1da041a51150c5f7c4c7a1bdc7d0e697dbba562a98e05bdcf44d3228",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/native_errno_detached.log": "5985d2ef92af995f446c5d10c42c45128792474d3317cf7d891326772461721a",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/native_errno_joined.log": "510d0f5855a3ec06b41d3666af758b390d588339c9ec21d2d6cf0a25acae619e",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/native_errno_shared.log": "700be0c9ed9f11d9f262fb2de1dfc5714f0bc5f00478fa49b352593d0fce2cfa",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/signal_errno.log": "830ff04f779c7f640529dd7a52ef95a4a70d3885471c21685d29e386d6daeb4f",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/thread_detach.log": "77963c18e0d23e1f4d320615409c88682d33e66051ad69556b8d6bae887f62e8",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/tls_race.log": "af04e3971e0d596b34c16fbe278b9a165df340e5e3163d0ad7ebc4681da4a32d",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/controls/tls_race2.log": "5437ffb0e50c57916db71ec9608b1b77327b41b6232caf2021288b035a4374e3"
+  },
+  "result": "expected clean controls passed and intentional races returned exit 66"
+}

@@ -1,0 +1,52 @@
+{
+  "start": "2026-11-03T07:46:31.294410+00:00",
+  "source_sha256": "368fe967de37de093dee3309e55211271f306f58e0064d8b8e0d1506fcc61779",
+  "runtime_sha256": "124e6acd2266a0526f9184c852ca6f3270997378bdbcedc22c72765b4d155890",
+  "configuration": "matchingLLVM23.1.4patched arm64runtime, normaldynamicruntime dependency, GCDworkerstartup+mainerrno foreignpointernegativecontrol",
+  "stages": [
+    {
+      "name": "compile",
+      "start": "2026-11-03T07:46:31.305018+00:00",
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/clang++",
+        "-resource-dir=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/resource-patched-v2",
+        "-std=c++17",
+        "-fblocks",
+        "-O1",
+        "-g",
+        "-fsanitize=thread",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/gcd-control-source.cpp",
+        "-o",
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/native-errno-gcd"
+      ],
+      "end": "2026-11-03T07:46:32.127241+00:00",
+      "seconds": 0.8222540830029175,
+      "result": 0
+    },
+    {
+      "name": "gcd",
+      "start": "2026-11-03T07:46:32.128621+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/native-errno-gcd",
+        "gcd"
+      ],
+      "end": "2026-11-03T07:46:34.925993+00:00",
+      "seconds": 2.797401499992702,
+      "result": 0
+    },
+    {
+      "name": "main-foreign",
+      "start": "2026-11-03T07:46:34.927175+00:00",
+      "command": [
+        "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/tsan-runtime-qualification-v1/native-errno-gcd",
+        "main-foreign"
+      ],
+      "end": "2026-11-03T07:46:38.033028+00:00",
+      "seconds": 3.1058800000173505,
+      "result": 66
+    }
+  ],
+  "end": "2026-11-03T07:46:38.038901+00:00",
+  "executable_sha256": "6bb35b94df99741564201ae003968d46c3834096b3a819116beb69da46aa9643",
+  "status": "GCD startup/reuse PASS; deliberate foreign main errno-pointer race still detected"
+}

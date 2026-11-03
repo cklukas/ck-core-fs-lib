@@ -1,0 +1,4 @@
+# Unified patches contain significant context-marker spaces. Preserve those
+# bytes and the verbatim upstream license's final blank line.
+tools/qualification/darwin-tsan/patches/*.patch -whitespace
+tools/qualification/darwin-tsan/licenses/LLVM-LICENSE.TXT whitespace=-blank-at-eof

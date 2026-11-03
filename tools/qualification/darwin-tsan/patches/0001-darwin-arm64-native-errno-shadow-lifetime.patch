@@ -1,0 +1,322 @@
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_platform.h b/compiler-rt/lib/tsan/rtl/tsan_platform.h
+index 5edec59d..c708231d 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_platform.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_platform.h
+@@ -1101,6 +1101,10 @@ int ExtractResolvFDs(void *state, int *fds, int nfd);
+ int ExtractRecvmsgFDs(void *msg, int *fds, int nfd);
+ uptr ExtractLongJmpSp(uptr *env);
+ void ImitateTlsWrite(ThreadState *thr, uptr tls_addr, uptr tls_size);
++#if SANITIZER_APPLE && defined(__aarch64__) && !SANITIZER_GO
++void NativeErrnoTlsStart(ThreadState *thr);
++void NativeErrnoTlsFinish(ThreadState *thr);
++#endif
+ 
+ int call_pthread_cancel_with_cleanup(int (*fn)(void *arg),
+                                      void (*cleanup)(void *arg), void *arg);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cpp b/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cpp
+index da735fba..0226c642 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cpp
++++ b/compiler-rt/lib/tsan/rtl/tsan_platform_mac.cpp
+@@ -45,6 +45,47 @@
+ 
+ namespace __tsan {
+ 
++#if defined(__aarch64__) && !SANITIZER_GO
++// Darwin's native errno storage is outside the generic TLS interval on arm64.
++// Keep its lifetime separate from the generic TLS/DTLS bookkeeping. A fiber
++// shares the operating-system thread's errno and must not start or retire it.
++struct NativeErrnoLifetime {
++  uptr addr;
++  uptr size;
++  bool active;
++};
++static THREADLOCAL NativeErrnoLifetime native_errno_lifetime;
++extern "C" void __tsan_native_errno_initialization() {}
++extern "C" void __tsan_native_errno_retirement() {}
++
++void NativeErrnoTlsStart(ThreadState *thr) {
++  // The main thread starts during dyld initialization, before Mach-O TLV
++  // bootstrap is available. Its initial memory is synchronized with every
++  // subsequently created thread and its native storage is never reused.
++  if (thr->tid == kMainTid || thr->tctx->thread_type == ThreadType::Fiber)
++    return;
++  CHECK(!native_errno_lifetime.active);
++  int *const storage = __error();
++  CHECK(storage);
++  const uptr pc = StackTrace::GetNextInstructionPc(
++      reinterpret_cast<uptr>(__tsan_native_errno_initialization));
++  const uptr addr = reinterpret_cast<uptr>(storage);
++  CHECK(MemoryImitateNativeTlsWrite(thr, pc, addr, sizeof(*storage)));
++  native_errno_lifetime = {addr, sizeof(*storage), true};
++}
++
++void NativeErrnoTlsFinish(ThreadState *thr) {
++  if (thr->tid == kMainTid || thr->tctx->thread_type == ThreadType::Fiber ||
++      !native_errno_lifetime.active)
++    return;
++  const uptr pc = StackTrace::GetNextInstructionPc(
++      reinterpret_cast<uptr>(__tsan_native_errno_retirement));
++  CHECK(MemoryRetireNativeTls(thr, pc, native_errno_lifetime.addr,
++                             native_errno_lifetime.size));
++  native_errno_lifetime = {};
++}
++#endif
++
+ #if !SANITIZER_GO
+ alignas(SANITIZER_CACHE_LINE_SIZE) static char main_thread_state[sizeof(
+     ThreadState)];
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl.h b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+index 3d1018ac..d3cae3df 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+@@ -560,6 +560,15 @@ void MemoryResetRange(ThreadState *thr, uptr pc, uptr addr, uptr size);
+ void MemoryRangeImitateWrite(ThreadState *thr, uptr pc, uptr addr, uptr size);
+ void MemoryRangeImitateWriteOrResetRange(ThreadState *thr, uptr pc, uptr addr,
+                                          uptr size);
++// Exact shadow lifetime operations for a native TLS object. These operations
++// do not round to kShadowCell and reject known unrepresentable shadow states
++// without overwriting unrelated byte history. A residual shadow mask must be
++// one contiguous byte run; non-contiguous masks are rejected because the
++// Shadow representation cannot report them precisely.
++WARN_UNUSED_RESULT bool MemoryImitateNativeTlsWrite(ThreadState *thr, uptr pc,
++                                                    uptr addr, uptr size);
++WARN_UNUSED_RESULT bool MemoryRetireNativeTls(ThreadState *thr, uptr pc,
++                                              uptr addr, uptr size);
+ 
+ void ThreadIgnoreBegin(ThreadState *thr, uptr pc);
+ void ThreadIgnoreEnd(ThreadState *thr);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl_access.cpp b/compiler-rt/lib/tsan/rtl/tsan_rtl_access.cpp
+index b2e70475..c27bbfd3 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl_access.cpp
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl_access.cpp
+@@ -589,6 +589,206 @@ static void MemoryRangeSet(uptr addr, uptr size, RawShadow val) {
+     DCHECK_EQ(mid2, end);
+ }
+ 
++namespace {
++
++// Shadow::Parts::access_ is private to tsan_shadow.h. Keep the encoding here
++// in lockstep with that class without widening the shadow representation.
++#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++constexpr uptr kNativeTlsAccessShift = 0;
++#else
++constexpr uptr kNativeTlsAccessShift = 24;
++#endif
++constexpr u32 kNativeTlsAccessMask = 0xffu << kNativeTlsAccessShift;
++
++// Shadow::kFreeAccess is intentionally private. A value with this access
++// mask is a FreedInfo marker, not an ordinary byte-mask access.
++constexpr u8 kNativeTlsFreeAccess = 0x81;
++
++// Shadow::GetAccess() reconstructs a range from the first set bit and the
++// population count. Therefore only one contiguous run of access bits is
++// representable without changing tsan_shadow.h. Zero is the empty state.
++bool NativeTlsAccessMaskIsRepresentable(u8 access_mask) {
++  if (access_mask == 0)
++    return true;
++  while (!(access_mask & 1))
++    access_mask >>= 1;
++  return (access_mask & static_cast<u8>(access_mask + 1)) == 0;
++}
++
++bool NativeTlsShadowIsUnsupported(const Shadow &shadow) {
++  // kRodata marks the complete shadow cell, so its covered bytes cannot be
++  // distinguished from unrelated bytes. kFreeSid/FreedInfo have the same
++  // whole-cell semantics and must not be partially erased.
++  if (shadow.raw() == Shadow::kRodata || shadow.sid() == kFreeSid ||
++      shadow.access() == kNativeTlsFreeAccess)
++    return true;
++
++  if (!NativeTlsAccessMaskIsRepresentable(shadow.access()))
++    return true;
++
++  // Any non-empty value without an access mask is another marker or malformed
++  // state that this byte-precise operation cannot represent safely.
++  return shadow.raw() != Shadow::kEmpty && shadow.access() == 0;
++}
++
++RawShadow NativeTlsClearAccess(RawShadow raw, u8 clear_mask) {
++  Shadow old(raw);
++  const u8 remaining = old.access() & static_cast<u8>(~clear_mask);
++  if (remaining == 0)
++    return Shadow::kEmpty;
++  DCHECK(NativeTlsAccessMaskIsRepresentable(remaining));
++
++  u32 value = static_cast<u32>(raw);
++  value &= ~kNativeTlsAccessMask;
++  value |= static_cast<u32>(remaining) << kNativeTlsAccessShift;
++  return static_cast<RawShadow>(value);
++}
++
++bool NativeTlsRangeValid(uptr addr, uptr size) {
++  if (size == 0 || addr + size < addr)
++    return false;
++  return IsAppMem(addr) && IsAppMem(addr + size - 1);
++}
++
++bool NativeTlsCellCanInitialize(RawShadow *shadow_mem, u8 access_mask) {
++  bool has_reusable_slot = false;
++  for (uptr i = 0; i < kShadowCnt; i++) {
++    Shadow old(LoadShadow(&shadow_mem[i]));
++    if (NativeTlsShadowIsUnsupported(old))
++      return false;
++    const u8 remaining = old.access() & static_cast<u8>(~access_mask);
++    if (!NativeTlsAccessMaskIsRepresentable(remaining))
++      return false;
++    if (remaining == 0)
++      has_reusable_slot = true;
++  }
++  return has_reusable_slot;
++}
++
++// Clear only the requested byte mask. The compare/exchange avoids replacing
++// unrelated shadow history if another access updates this slot between the
++// load and the store. It is intentionally not a general shadow reset API.
++bool NativeTlsClearCellMask(RawShadow *shadow_mem, u8 access_mask) {
++  for (uptr i = 0; i < kShadowCnt; i++) {
++    RawShadow *slot = &shadow_mem[i];
++    for (;;) {
++      const RawShadow old_raw = LoadShadow(slot);
++      Shadow old(old_raw);
++      if (NativeTlsShadowIsUnsupported(old))
++        return false;
++      const u8 remaining = old.access() & static_cast<u8>(~access_mask);
++      if (remaining == old.access())
++        break;
++      if (!NativeTlsAccessMaskIsRepresentable(remaining))
++        return false;
++
++      const RawShadow new_raw = NativeTlsClearAccess(old_raw, access_mask);
++      u32 expected = static_cast<u32>(old_raw);
++      if (atomic_compare_exchange_weak(
++              reinterpret_cast<atomic_uint32_t *>(slot), &expected,
++              static_cast<u32>(new_raw), memory_order_relaxed))
++        break;
++    }
++  }
++  return true;
++}
++
++bool NativeTlsInstallCellWrite(RawShadow *shadow_mem, uptr cell_offset,
++                               uptr size, ThreadState *thr) {
++  const Shadow current(thr->fast_state, cell_offset, size, kAccessWrite);
++  const RawShadow current_raw = current.raw();
++
++  for (uptr i = 0; i < kShadowCnt; i++) {
++    RawShadow *slot = &shadow_mem[i];
++    u32 expected = static_cast<u32>(Shadow::kEmpty);
++    if (atomic_compare_exchange_strong(
++            reinterpret_cast<atomic_uint32_t *>(slot), &expected,
++            static_cast<u32>(current_raw), memory_order_relaxed))
++      return true;
++
++    // A concurrent replacement can be a supported ordinary shadow record, but
++    // it cannot be overwritten merely to make room for this lifetime marker.
++    Shadow observed(static_cast<RawShadow>(expected));
++    if (NativeTlsShadowIsUnsupported(observed))
++      return false;
++  }
++  return false;
++}
++
++template <bool initialize>
++bool NativeTlsForEachCell(ThreadState *thr, uptr pc, uptr addr, uptr size) {
++  if (!thr || !thr->slot || thr->slot->thr != thr ||
++      !NativeTlsRangeValid(addr, size))
++    return false;
++
++  // The slot lock keeps this operation coordinated with DoReset and follows
++  // the existing shadow-reset contract. It does not change the thread clock.
++  SlotLocker locker(thr);
++
++  const uptr end = addr + size;
++  uptr cursor = addr;
++  while (cursor < end) {
++    const uptr cell_addr = RoundDown(cursor, kShadowCell);
++    const uptr cell_end = cell_addr + kShadowCell;
++    const uptr chunk = Min(end - cursor, cell_end - cursor);
++    const u8 access_mask = static_cast<u8>(
++        (((1u << chunk) - 1u) << (cursor - cell_addr)) & 0xffu);
++    RawShadow *shadow_mem = MemToShadow(cell_addr);
++
++    if (initialize) {
++      if (!NativeTlsCellCanInitialize(shadow_mem, access_mask))
++        return false;
++    } else {
++      for (uptr i = 0; i < kShadowCnt; i++) {
++        Shadow old(LoadShadow(&shadow_mem[i]));
++        if (NativeTlsShadowIsUnsupported(old) ||
++            !NativeTlsAccessMaskIsRepresentable(
++                old.access() & static_cast<u8>(~access_mask)))
++          return false;
++      }
++    }
++    cursor += chunk;
++  }
++
++  // Match MemoryRangeImitateWrite: record the synthetic access before
++  // changing shadow. The slot lock is held, and TraceSwitchPartImpl uses
++  // SlotLocker(thr, true), so a trace rollover cannot reattach/reset this
++  // thread's slot during the trace point.
++  if (initialize)
++    TraceMemoryAccessRange(thr, pc, addr, size, kAccessWrite);
++
++  cursor = addr;
++  while (cursor < end) {
++    const uptr cell_addr = RoundDown(cursor, kShadowCell);
++    const uptr cell_end = cell_addr + kShadowCell;
++    const uptr chunk = Min(end - cursor, cell_end - cursor);
++    const uptr cell_offset = cursor - cell_addr;
++    const u8 access_mask = static_cast<u8>(
++        (((1u << chunk) - 1u) << cell_offset) & 0xffu);
++    RawShadow *shadow_mem = MemToShadow(cell_addr);
++
++    if (!NativeTlsClearCellMask(shadow_mem, access_mask))
++      return false;
++    if (initialize &&
++        !NativeTlsInstallCellWrite(shadow_mem, cell_offset, chunk, thr))
++      return false;
++    cursor += chunk;
++  }
++
++  return true;
++}
++
++}  // namespace
++
++bool MemoryImitateNativeTlsWrite(ThreadState *thr, uptr pc, uptr addr,
++                                 uptr size) {
++  return NativeTlsForEachCell<true>(thr, pc, addr, size);
++}
++
++bool MemoryRetireNativeTls(ThreadState *thr, uptr pc, uptr addr, uptr size) {
++  return NativeTlsForEachCell<false>(thr, pc, addr, size);
++}
++
+ void MemoryResetRange(ThreadState* thr, uptr pc, uptr addr, uptr size) {
+   uptr addr1 = RoundDown(addr, kShadowCell);
+   uptr size1 = RoundUp(size + addr - addr1, kShadowCell);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cpp b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cpp
+index 978d853b..27280f91 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cpp
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl_thread.cpp
+@@ -225,6 +225,9 @@ void ThreadStart(ThreadState *thr, Tid tid, ThreadID os_id,
+       ImitateTlsWrite(thr, tls_addr, tls_size);
+   }
+ #endif
++#if SANITIZER_APPLE && defined(__aarch64__) && !SANITIZER_GO
++  NativeErrnoTlsStart(thr);
++#endif
+ }
+ 
+ void ThreadContext::OnStarted(void *arg) {
+@@ -238,6 +241,9 @@ void ThreadContext::OnStarted(void *arg) {
+ void ThreadFinish(ThreadState *thr) {
+   DPrintf("#%d: ThreadFinish\n", thr->tid);
+   ThreadCheckIgnore(thr);
++#if SANITIZER_APPLE && defined(__aarch64__) && !SANITIZER_GO
++  NativeErrnoTlsFinish(thr);
++#endif
+   if (thr->stk_addr && thr->stk_size)
+     DontNeedShadowFor(thr->stk_addr, thr->stk_size);
+   if (thr->tls_addr && thr->tls_size)

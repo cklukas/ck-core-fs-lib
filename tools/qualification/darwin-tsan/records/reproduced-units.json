@@ -1,0 +1,39 @@
+{
+  "source_commit": "7a941dfb2877a0b8cf30323fefa85ad019e0b0f5",
+  "source_tree": "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/llvm-source",
+  "unit_v3_record_sha256": "33ee71b6861ac5095ff42f86d54e972cc1b153a477614756d2e4a2c56e2db862",
+  "toolchain": {
+    "clang": "/opt/homebrew/Cellar/llvm/23.1.4/bin/clang-23",
+    "clang_sha256": "a3f510aa37c9a3082649435e39e3f7c808b6696bb62f077b141c271b5aa783a2",
+    "clangxx": "/opt/homebrew/Cellar/llvm/23.1.4/bin/clang-23",
+    "clangxx_sha256": "a3f510aa37c9a3082649435e39e3f7c808b6696bb62f077b141c271b5aa783a2",
+    "resource_dir": "/opt/homebrew/Cellar/llvm/23.1.4/lib/clang/23"
+  },
+  "runtime": {
+    "path": "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/build/lib/darwin/libclang_rt.tsan_osx_dynamic.dylib",
+    "before_sha256": "ba79ff2e55b670221abbcd28d5becef30eae9b56b9f77d9a6a9673f4e356eae2",
+    "after_sha256": "ba79ff2e55b670221abbcd28d5becef30eae9b56b9f77d9a6a9673f4e356eae2"
+  },
+  "unit_image": {
+    "path": "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/NativeTlsUnitRuntime.dylib",
+    "sha256": "cd13750a3b6aa1f7766d8a6f0a1799093cbdfd1c737eec1faf2534505050117a"
+  },
+  "loader": {
+    "path": "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/NativeTlsUnitLoader",
+    "sha256": "39621583ac31f030444eab887c3c360272b5c07216ca56bbffad2bd528c7b520",
+    "lc_load_dylib": "NativeTlsUnitRuntime.dylib"
+  },
+  "control_inputs": {
+    "/Volumes/PRO-BLADE/Development/ck-core-fs-lib/tools/qualification/darwin-tsan/tests/unit-loader.c": "5d30d07e061f5c6926ded987bcf048c21d0c95ab3528854aba5f44d4d34dfe1f",
+    "/Volumes/PRO-BLADE/Development/ck-core-fs-lib/tools/qualification/darwin-tsan/tests/compiler-rt/lib/tsan/tests/unit/tsan_native_tls_test.cpp": "8dfb49648e935473b527c6ea4b792b7dba1ad8f0f714e7fc45261960ad74cea3"
+  },
+  "logs": {
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/unit-focused.log": "88b1d2fa0c40e40ef6c2c412851d94ed0f708f029a5f75aa3e461bbe01925afb",
+    "/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/unit-full.log": "ee0dd47388f5f6d6cdc291451b63aa00ec5dcded5ea4103ceaa7553e3a818bd3"
+  },
+  "tsan_options": "halt_on_error=1:abort_on_error=0:exitcode=66",
+  "start": "2026-11-03T11:19:37.416935+00:00",
+  "end": "2026-11-03T11:19:41.795218+00:00",
+  "duration_seconds": 4.387,
+  "result": "focused and full unit tests passed with normal LC_LOAD_DYLIB"
+}

@@ -44,3 +44,4 @@ nav:
       - docs/validation-2026-11-02.md
       - docs/validation-2026-11-03-terminal-io.md
       - docs/validation-2026-11-03-journal-roots.md
+      - docs/validation-darwin-tsan.md
