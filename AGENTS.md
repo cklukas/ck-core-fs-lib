@@ -16,3 +16,34 @@ reparse/security behavior.
 
 The C ABI is exception-free. Ownership and callback/job lifetimes must be
 explicit in `include/ck_file_engine.h`; never expose C++ or UI types there.
+
+## Development workspaces and qualification
+
+On the Mac, verify `/Volumes/S8T` is mounted and place temporary builds,
+checkouts, caches, generated intermediates and test data in a unique directory
+beneath `/Volumes/S8T/tmp`. `/Volumes/PRO-BLADE/tmp` is the allowed fallback.
+Explicitly set `TMPDIR` before tools that may create temporary files. Never use
+`/tmp` or `/private/tmp`; stop if neither approved volume is mounted. Permanent
+sources do not belong on S8T.
+
+On the Windows workstation, verify `V:` before development tools. Keep permanent
+sources on V: and all temporary work in a unique `V:\tmp` directory. Set `TEMP`,
+`TMP` and applicable `TMPDIR` there. Do not fall back to C: or D:. Other remote
+machines use sensible machine-local temporary directories; Mac volumes are not
+remote prerequisites.
+
+Before builds, identify exact existing output paths and running project PIDs.
+Preserve active work and source/assets; remove owned obsolete outputs after
+retaining concise evidence. Record source/header/asset fingerprints, build
+start/end and elapsed time, target/configuration, toolchain/runtime and exact
+output path. Compare elapsed time with a real comparable baseline; investigate
+unexpected timing rather than assuming freshness. Rebuild all translation units
+affected by C++ class/layout or instrumentation changes; never combine current
+private headers with an older SDK binary. Keep one verified app instance by
+default, launch only its absolute current path, and inspect its actual window
+before claiming a visual fix.
+
+A declaration, skipped fixture, model test, typed Unsupported result or normal
+build does not qualify native success, another filesystem, the final combined
+revision or a sanitizer build. Preserve failures and state each receipt's exact
+source cohort, provider, scope and remaining gates.
