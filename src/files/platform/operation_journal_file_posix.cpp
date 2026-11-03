@@ -155,21 +155,56 @@ public:
             close_handles();finished_=true;return finish_result();
         }
         finish_started_=true;
-        auto flushed=flush();
-        if(!flushed.value()) {
-            const auto& error=*flushed.unavailable_detail();
-            record_failure(error.state,error.error.domain,error.error.code,error.error.operation);
-            finish_failure_=error;
-        } else if(!*flushed.value()) {
-            record_failure(ObservationState::Unknown,ErrorDomain::Adapter,
-                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_file.finish_flush_false");
-            finish_failure_=UnavailableObservation{ObservationState::Unknown,
-                {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_file.finish_flush_false"}};
+        // Diagnostic construction may allocate, including on MSVC Debug. Native
+        // ownership must be consumed even when revalidation cannot report an
+        // already-latched failure under persistent allocation exhaustion.
+        try { finish_flush(); }
+        catch(...) {
+            detail::PreparedJournalConsumerFailure prior{};
+            if(root_ && detail::read_prepared_journal_consumer_failure(*root_,prior) && !prior.pending)
+                remember_finish(prior.state,prior.domain,prior.code,prior.operation.data());
+            else
+                remember_finish(ObservationState::Unknown,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_file.finish_flush_exception");
         }
         close_handles();finished_=true;return finish_result();
     }
+    bool record_consumer_failure(ObservationState observed,ErrorDomain domain,
+        std::int64_t code,std::string_view operation) noexcept {
+        return root_ && detail::record_prepared_journal_consumer_failure(*root_,observed,domain,code,operation);
+    }
 private:
 
+    void remember_finish(ObservationState observed,ErrorDomain domain,std::int64_t code,
+        std::string_view operation) noexcept {
+        finish_failure_.record(observed,domain,code,operation);
+        record_failure(observed,domain,code,operation);
+    }
+    bool finish_check() {
+        const auto checked=revalidate();
+        if(checked.value() && *checked.value())return true;
+        if(const auto* error=checked.unavailable_detail())
+            remember_finish(error->state,error->error.domain,error->error.code,error->error.operation);
+        else
+            remember_finish(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_file.finish_flush_false");
+        return false;
+    }
+    void finish_flush() {
+        if(!finish_check())return;
+        if(fsync(fd_.value())!=0) {
+            const int code=errno;remember_finish(state(code),ErrorDomain::Posix,code,"journal_file.fsync");return;
+        }
+        if(fsync(directory_.value())!=0) {
+            const int code=errno;remember_finish(state(code),ErrorDomain::Posix,code,"journal_file.parent_fsync");return;
+        }
+#ifdef __APPLE__
+        if(fcntl(fd_.value(),F_FULLFSYNC)!=0) {
+            const int code=errno;remember_finish(state(code),ErrorDomain::Posix,code,"journal_file.fullsync");return;
+        }
+#endif
+        (void)finish_check();
+    }
     void record_failure(ObservationState state,ErrorDomain domain,std::int64_t code,std::string_view operation) noexcept {
         if(root_)detail::record_prepared_journal_consumer_failure(*root_,state,domain,code,operation);
     }
@@ -195,7 +230,8 @@ private:
         if(directory>=0&&::close(directory))remember_close(errno,"journal_file.parent_close");
     }
     Observation<bool> finish_result() const {
-        if(finish_failure_)return Observation<bool>::unavailable(finish_failure_->state,finish_failure_->error);
+        detail::PreparedJournalConsumerFailure cached{};
+        if(finish_failure_.read(cached))return finish_failure_.result();
         if(close_operation_)return close_exception_?Observation<bool>::unavailable(ObservationState::Unknown,
             {ErrorDomain::Adapter,close_error_,close_operation_}):failure<bool>(static_cast<int>(close_error_),close_operation_);
         return Observation<bool>::available(true);
@@ -218,7 +254,7 @@ private:
     PreparedJournalRoot::Pointer root_;
     bool finished_=false,finish_started_=false;
     std::int64_t close_error_=0;const char* close_operation_=nullptr;bool close_exception_=false;
-    std::optional<UnavailableObservation> finish_failure_;
+    detail::PreparedJournalFailureLatch finish_failure_;
 };
 }
 
@@ -705,6 +741,11 @@ Observation<std::vector<RootScopeIdentity>> inspect_prepared_journal_scope_ances
     return native->inspect_scope_ancestry();
 }
 #endif
+bool record_prepared_journal_file_consumer_failure(OperationJournalFile& file,ObservationState observed,
+    ErrorDomain domain,std::int64_t code,std::string_view operation) noexcept {
+    auto* native=dynamic_cast<PosixOperationJournalFile*>(&file);
+    return native && native->record_consumer_failure(observed,domain,code,operation);
+}
 bool record_prepared_journal_consumer_failure(PreparedJournalRoot& root,ObservationState state,
     ErrorDomain domain,std::int64_t code,std::string_view operation) noexcept {
     auto* native=dynamic_cast<PosixPreparedJournalRoot*>(&root);if(!native)return false;

@@ -17,6 +17,11 @@ struct PreparedJournalConsumerFailure final {
 };
 bool record_prepared_journal_consumer_failure(PreparedJournalRoot&,ObservationState,
     ErrorDomain,std::int64_t,std::string_view operation) noexcept;
+// Memory-only failure propagation through a genuine native journal's retained
+// Root. No caller observer or path hint is required; foreign/memory providers
+// grant no Root authority and return false. Never allocates or performs I/O.
+bool record_prepared_journal_file_consumer_failure(OperationJournalFile&,ObservationState,
+    ErrorDomain,std::int64_t,std::string_view operation) noexcept;
 // Memory-only readback; true for a pending OR published failure. A pending
 // failure blocks new authority immediately and must not permanently replace
 // the original native error, which becomes available when pending is false.

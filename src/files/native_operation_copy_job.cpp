@@ -3,6 +3,8 @@
 #include "native_operation_copy_job.hpp"
 
 #include "directory_cursor.hpp"
+#include "metadata_capture_job.hpp"
+#include "platform/prepared_journal_root_bridge.hpp"
 #include "native_operation_recovery_evidence.hpp"
 #include "opened_entry.hpp"
 #include "regular_metadata_preservation.hpp"
@@ -30,15 +32,21 @@ Observation<bool> unavailable_bool(const UnavailableObservation& detail) {
 
 // Capturing an error must not allocate before the remaining owners close.
 // Convert to the public observation only after every close was attempted.
-struct NativeCopyFinalFailure final {
+struct NativeCopyFinalFailure final : MetadataCaptureFailureLatch {
     bool recorded=false;
     ObservationState state=ObservationState::Unknown;
     ErrorDomain domain=ErrorDomain::Adapter;
     std::int64_t code=static_cast<std::int64_t>(AdapterError::InvalidNativeResult);
     std::array<char,128> operation{};
+    const MetadataCaptureFailureLatch* previous=nullptr;
+    OperationJournalFile* journal_file=nullptr;
     void record(ObservationState s,ErrorDomain d,std::int64_t c,std::string_view op) noexcept {
         if(recorded)return;
         recorded=true;state=s;domain=d;code=c;
+        // The journal itself retains its genuine Root. Basic C copy workers do
+        // not install an outer metadata observer, so forwarding through TLS
+        // alone would lose this native error under persistent OOM.
+        if(journal_file)detail::record_prepared_journal_file_consumer_failure(*journal_file,s,d,c,op);
         const auto count=std::min(op.size(),operation.size()-1);
         if(count)std::memcpy(operation.data(),op.data(),count);
     }
@@ -48,12 +56,18 @@ struct NativeCopyFinalFailure final {
         else if(!*result.value())record(ObservationState::Unknown,ErrorDomain::Adapter,
             static_cast<std::int64_t>(AdapterError::InvalidNativeResult),fallback);
     }
+    void record_first(MetadataCaptureCleanupError failure) const noexcept override {
+        auto& self=*const_cast<NativeCopyFinalFailure*>(this);
+        self.record(failure.state,failure.domain,failure.code,
+            failure.operation ? std::string_view(failure.operation) : std::string_view("native_operation_copy.close"));
+        if(previous)previous->record_first(failure);
+    }
     Observation<bool> result() const {
         if(!recorded)return Observation<bool>::available(true);
-        try {return Observation<bool>::unavailable(state,{domain,code,operation.data()});}
-        catch(const std::bad_alloc&) {
-            return Observation<bool>::unavailable(state,{domain,code,{}});
-        }
+        // All native owners have already been consumed when this is called.
+        // Do not manufacture a second diagnostic after bad_alloc: even an
+        // empty std::string may allocate in the MSVC debug library.
+        return Observation<bool>::unavailable(state,{domain,code,operation.data()});
     }
 };
 
@@ -106,6 +120,10 @@ OperationJournalId tree_child_journal_id(OperationJournalId base, std::size_t it
 struct NativeOperationCopyJob::State final {
     explicit State(NativeOperationCopyRequest value) : request(std::move(value)) {}
 
+    // Construct this before any native source is acquired. The finalizer must
+    // never create an empty replay snapshot while a read owner is being
+    // consumed or while its close error is being latched.
+    MetadataReplaySnapshot empty_source_close_snapshot;
     NativeOperationCopyRequest request;
     std::unique_ptr<OpenedEntry> source;
     std::unique_ptr<OpenedEntry> staging;
@@ -114,6 +132,17 @@ struct NativeOperationCopyJob::State final {
     std::optional<BasicMetadata> finalized_metadata;
     StagingNamespace staging_namespace = StagingNamespace::Named;
     bool source_exclusion = false;
+
+    void consume_native_read_before_terminal() noexcept {
+        if (!source) return;
+        // The platform helper is the existing one-shot native readonly close
+        // boundary. It releases the POSIX fd/Windows handles before reporting
+        // a close error, and never retries a consumed close.
+        detail::finish_native_metadata_capture(source.get(), empty_source_close_snapshot);
+        // Stream-copy callbacks borrow this object. Keep its closed shell
+        // alive until those callbacks are destroyed; no native read authority
+        // survives the consumed handle.
+    }
 
     Observation<bool> cleanup_unpublished_staging() {
         const auto journal_state = request.journal->state(request.item);
@@ -375,6 +404,9 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
     };
     execution_request.finish_io = [state] {
         NativeCopyFinalFailure failure;
+        failure.journal_file=state->request.journal_file.get();
+        failure.previous=detail::current_metadata_capture_cleanup();
+        detail::MetadataCaptureCleanupScope cleanup(&failure);
         if (state->staging) {
             try {
                 auto closed=state->staging->finish_content_writes();
@@ -388,6 +420,15 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
             try{failure.record(state->request.finish_metadata(),"native_operation_copy.metadata_finish_false");}
             catch(...){failure.record(ObservationState::Unknown,ErrorDomain::Adapter,
                 static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"native_operation_copy.metadata_finish_exception");}
+        }
+        // Keep the source live through Move's source-stability and retirement
+        // callbacks. This terminal finalizer runs only after commit has made
+        // its Complete/RetainedSource/NeedsReconciliation decision.
+        try {
+            state->consume_native_read_before_terminal();
+        } catch (...) {
+            failure.record(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"native_operation_copy.source_read_finish_exception");
         }
         // Attempt the journal close even when the writer failed. Each native
         // owner consumes its handle once; retain the first observed failure.

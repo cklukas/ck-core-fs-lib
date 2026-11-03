@@ -39,6 +39,9 @@ public:
 private:
     const MetadataCaptureFailureLatch* previous_;
 };
+// Borrowed only by a nested worker cleanup scope. The returned observer is
+// valid until the current MetadataCaptureCleanupScope chain is unwound.
+const MetadataCaptureFailureLatch* current_metadata_capture_cleanup() noexcept;
 void record_metadata_capture_close(MetadataCaptureCleanupError)noexcept;
 void finish_native_metadata_capture(const OpenedEntry*,const MetadataReplaySnapshot&)noexcept;
 // Implemented inside the platform adapter; rejects caller-created entries.

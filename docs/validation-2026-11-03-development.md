@@ -219,12 +219,44 @@ This snapshot includes the first terminal-drain fix but predates the subsequent
 journal-owned Root propagation correction and new Tree own-effect integration.
 It is neither a stock-runtime pass nor qualification of those later changes.
 
+## Native copy terminal ownership and persistent OOM
+
+The worker now explicitly consumes its base native source after commit/source
+retirement decisions, retaining only a closed shell until borrowed stream
+callbacks are destroyed. Protocol exceptions and finalization failures use
+fixed scalar diagnostics until native cleanup has run. Both native journal
+adapters close file and parent handles even if validation or diagnostic
+construction throws, and cache the first native failure without allocation.
+
+Qualification first exposed two Linux source-close EIO plus persistent-OOM
+failures: source and writer closed, but the journal remained open at terminal
+return. The journal correction passed all eleven original cases and eleven
+standalone flush/close controls. Review then found that this probe installed an
+outer Root observer absent from the basic C worker. Removing it reproduced four
+missing-Root-error failures. A genuine journal-owner bridge now records the
+native error directly in its retained Root, before any diagnostic allocation.
+
+The corrected Linux normal cohort passed **34/34 controls**: twelve without an
+external observer, plus the twenty-two retained observer/journal controls.
+Source, writer and journal close once at terminal, before destruction; reused
+numeric descriptors survive repeated advance/destruction. Root preserves source
+EIO before the first denied allocation and preserves an earlier ENOSPC when
+present. Root's own final drain is tested after consumer references are released.
+The NativeCopy fixture deliberately supplies a no-op metadata phase to isolate
+base-source finalization; it does not qualify metadata replay or native Move.
+
+The regression fixtures are registered with CTest, including separate portable
+protocol/finalizer OOM tests that consume real native pipe handles. Linux probes
+require an explicit fixture root and inspect its actual ext4/XFS/Btrfs provider;
+unknown or mismatched providers fail. Windows normal, matching sanitizers, and
+subsequent pending-batch/legacy-metadata drainage remain separate gates.
+
 ## Remaining gates
 
 - Integrate and qualify postorder directory metadata replay and bounded
   regular-file metadata execution against the exact reviewed evidence.
-- Explicitly consume the base native copy source before terminal completion;
-  qualify its close faults while preserving Move's source-retirement ordering.
+- Qualify integrated base-source, legacy metadata and pending-batch drainage on
+  Windows and with matching sanitizers, preserving Move retirement ordering.
 - Qualify Windows named conflict resolution and all-stream admission.
 - Qualify the final integrated revision and matching sanitizers across the
   recorded ext4, XFS and Btrfs layouts.
