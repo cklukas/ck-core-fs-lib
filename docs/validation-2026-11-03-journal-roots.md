@@ -21,15 +21,23 @@ ancestry correction. Existing 0.3 Actions remain unchanged in this increment.
 | macOS full normal suite | 25/30 PASS; five publication gates remain open |
 | macOS full ASan/UBSan suite | 25/30 PASS; same five gates, no sanitizer finding |
 | Final private hard-link fixture, macOS normal/ASan/UBSan/TSan | PASS, 109 checks per variant |
-| Complete matching Root11 Linux sanitizer qualification | Pending final review |
-| Complete matching Root11 Windows ASan qualification | Pending corrected harness rebuild |
-| Complete matching Root11 macOS TSan qualification | Pending qualified runtime and full rebuild |
+| Complete matching Root11 Linux ASan/UBSan qualification | 34/34 PASS on uconsole; byte-identical rpi4 binaries and matching runtime |
+| Required committed Linux normal/ASan/UBSan/TSan CI | PASS at `e05a8fc` |
+| Complete matching Root11 Windows ASan qualification | 30/30 PASS after complete corrected rebuild |
+| Complete matching Root11 macOS TSan qualification | 25/30 PASS with qualified corrected runtime; same five publication gates |
 | Actual Linux XFS/Btrfs runtime qualification | Pending |
 
-The Windows ASan attempt failed during compilation. Its flags omitted C++
-exception-unwind support; that attempt is invalid qualification evidence and
-must be replaced by a complete matching rebuild. It is not counted as a
-product sanitizer finding or a passing run.
+The initial Windows ASan attempt omitted C++ exception-unwind support. It was
+replaced by a complete matching rebuild with `/EHsc`, `/GR` and `/MD`. Both
+normal and corrected ASan runs passed 30/30 suites, installed consumers,
+long/exact UTF-16 paths, NTFS/ReFS and the UNC refusal checks. The invalid
+initial attempt is retained as evidence and is not counted as a pass.
+
+The complete Linux ASan build contains 141 instrumented translation units.
+Its rpi4 runtime failed before `main` while reserving allocator memory. The
+byte-identical binaries and matching runtime then passed 34/34 suites on
+uconsole, including both namespace bootstrap modes. This establishes the
+uconsole result; it does not establish a successful rpi4 sanitizer run.
 
 The macOS failures are `regular_metadata`, `job_lifecycle`, `tree_c_copy`,
 `tree_c_keepboth`, and `reviewed_tree_plan`. Strong descriptor-bound staging
@@ -37,11 +45,19 @@ publication remains unsupported. These mandatory positive tests are retained;
 they are not suppressed, skipped, or relabeled as passes.
 
 The stock macOS TSan runtimes report a race in a standalone detached-thread
-test that writes only native thread-local `errno`. A pinned runtime correction
-is being qualified separately, including deliberate races and byte-precise
-shadow tests. A corrected-runtime result will be identified by its exact
-compiler/runtime source and binary hashes; it cannot establish a stock-runtime
-pass.
+test that writes only native thread-local `errno`. A correction based on LLVM
+23.1.4, commit `7a941dfb2877a0b8cf30323fefa85ad019e0b0f5`, records the exact
+four-byte native TLS lifetime. Positive detached/joined and GCD tests passed;
+deliberate foreign-thread races remained detectable. All 45 enabled upstream
+unit tests and four focused shadow tests passed; eight pre-existing disabled
+unit tests are not counted. No sanitizer exclusions or product serialization
+were introduced.
+
+The corrected arm64 runtime SHA-256 is
+`124e6acd2266a0526f9184c852ca6f3270997378bdbcedc22c72765b4d155890`.
+A fresh matching LLVM 23.1.4 build of all 122 Root11 translation units passed
+the race gate, with only the same five mandatory publication tests failing.
+This result cannot establish a stock-runtime pass.
 
 ## Source and artifact identity
 
@@ -80,4 +96,25 @@ Both complete native mount matrices passed against the frozen Root11 GCC 14
 implementation on Linux. Invalid modes, host-root execution and zero-host-UID
 mapping were rejected. Caller-exit cancellation also terminated the isolated
 payload. GitHub CI selects the explicit bootstrap and checks its prerequisites
-before compiling; its subsequent full qualification results remain required.
+before compiling. A subsequent ASan run exposed a test reference into a
+temporary progress snapshot. The fixture now owns that snapshot before
+accessing its failure; the complete instrumented rerun passed.
+
+The committed checkpoint passed all required jobs in
+[CI run 41614017099](https://github.com/cklukas/ck-core-fs-lib/actions/runs/41614017099).
+The matching compiler's shared Linux TSan runtime is selected explicitly;
+allocator failure, actual runtime image and deliberate heap-race controls also
+pass. Documentation publication passed in
+[Pages run 41615124078](https://github.com/cklukas/ck-core-fs-lib/actions/runs/41615124078).
+
+## ELF packaging gate
+
+An independent interposition test confirmed that an executable could replace
+an internal C session opener and pass a foreign opaque handle to the verified
+wrapper. The baseline changed 12 bytes in a foreign buffer. The candidate
+SDK binds internal calls locally and hides private C++ symbols. Its actual
+GCC 14 build passed 35/35 suites and the installed C consumer; the same probe
+reported zero intercepted calls and zero foreign writes. The strict export
+audit still found five weak standard-library helpers containing private type
+arguments. That remaining packaging correction is under qualification. No
+final dependency pin or release is authorized by the candidate result.
