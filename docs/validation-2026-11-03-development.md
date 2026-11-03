@@ -628,6 +628,29 @@ capture changes require a coherent combined SDK rebuild. These receipts are
 normal Windows results, not matching ASan qualification. The integrating CMake
 adds explicit privileged Caller and different-owner test entries.
 
+## Combined Session and library-layer checkpoint
+
+The coherent 455-file Session prerequisite cohort compiled 183 steps in
+736.21 seconds and passed **43/43 selected tests in 22.93 seconds**. It includes
+the new private Session layout, nonwrapping epoch IDs, ordinary-user portable
+fixture, native persistent-OOM lease regression, existing Session/Resolution
+checks, name feedback and target-reader cases. Linux strict Tree activation and
+the anonymous-target correction were separate unqualified candidates.
+
+A controlled owner-managed layer derivative retained its baseline source/archive,
+output hashes and test results before overlaying nineteen changed/new files.
+No public or private headers changed during that layer overlay. All moved native
+worker units rebuilt in 92.62 seconds and **45/45 tests passed in 32.00 seconds**,
+including real native staging and the archive dependency audit. A fresh install
+then passed **4/4 independent Core/Platform/Native/C API consumers**; the C facade
+resolved to the exact installed runtime. Runtime SHA-256:
+`0c90c7602ebe63d9f156247408f8361b817a49bdf878942deaa40d701abd172b`.
+
+Darwin compile-only checking passed for eleven coherent Session/lease/layer units
+in 16.04 seconds. No native Darwin success is inferred. The later Windows Caller
+and anonymous-target packets still require their own combined rebuilds; these
+results do not qualify hierarchical mutation or the next SDK revision.
+
 ## Remaining gates
 
 - Qualify the final combined postorder Tree and bounded metadata workers on
