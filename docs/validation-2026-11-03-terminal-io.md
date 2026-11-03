@@ -19,7 +19,14 @@ error state, domain and code.
 | macOS fully instrumented TSan implementation and finalizer tests | PASS |
 | Linux ext4 actual anonymous writer `EIO`, legacy and externally owned journal roots | PASS |
 | Linux clean/error controls: source bytes unchanged, no publication, cached terminal results, external Root drain | PASS |
-| Windows full native/install consumer qualification | CI required for this commit |
+| Windows 2025 full native suite, install and installed C consumer | PASS |
+| Linux browser ON/OFF, full native suite, install and installed C consumer | PASS |
+| Linux fully instrumented ASan/UBSan/LeakSanitizer and TSan CI | PASS |
+
+These CI results apply to committed implementation `5ff252180154ede3f2c5d5848e8b8c70a52f0ed3`:
+[workflow run 41569977680](https://github.com/cklukas/ck-core-fs-lib/actions/runs/41569977680).
+The hosted Mac job was not scheduled because the required mounted temporary
+volumes are unavailable there; the separate local Mac results above apply.
 
 The Linux native test checks 47 assertions; independent clean/error controls
 check 98. The final protocol-exception change additionally passed the 15-case
