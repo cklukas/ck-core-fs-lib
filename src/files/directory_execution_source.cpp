@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "directory_execution_source.hpp"
 #include "metadata_semantic_digest.hpp"
+#include "metadata_ownership_digest.hpp"
 #include "native_sync_observation.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
 #include "sha256.hpp"
@@ -55,12 +56,11 @@ Observation<DirectoryExecutionSourceJob::Pointer> DirectoryExecutionSourceJob::c
         {ErrorDomain::Adapter,static_cast<std::int64_t>(code),operation});};
     if(!request.source||!request.journal_root||!request.verify_review||!request.policy.valid()||!request.limits.valid())
         return invalid("directory_source.request",ObservationState::Failed,AdapterError::InvalidIdentifier);
-    if(request.policy.ownership!=MetadataOwnership::Original)
-        return invalid("directory_source.current_caller_unqualified",ObservationState::Unsupported,AdapterError::ProviderReviewRequired);
     const auto& reviewed=request.reviewed;
     if(reviewed.state!=ComparisonDigestState::CompleteStable||reviewed.algorithm!=ComparisonDigestAlgorithm::Sha256||
        reviewed.schema!=schema()||reviewed.policy_binding!=binding(request.policy)||
-       reviewed.ownership!=ComparisonMetadataOwnership::Original)
+       reviewed.ownership!=(request.policy.ownership==MetadataOwnership::Original?ComparisonMetadataOwnership::Original:ComparisonMetadataOwnership::CurrentCaller)||
+       (request.policy.ownership==MetadataOwnership::CurrentCaller&&!reviewed.canonical_owner_digest))
         return invalid("directory_source.review_schema_policy",ObservationState::Changed,AdapterError::PlanDecisionStale);
     if(!request.source->metadata().kind.value()||*request.source->metadata().kind.value()!=ObjectKind::Directory)
         return invalid("directory_source.kind",ObservationState::Unsupported,AdapterError::NotApplicable);
@@ -114,6 +114,10 @@ Observation<bool> DirectoryExecutionSourceJob::compare(const NativeMetadataProof
     if(!digest.value())return propagate(digest);
     if(binding(snapshot.policy)!=request_.reviewed.policy_binding||*digest.value()!=request_.reviewed.bytes)
         return refuse("directory_source.review_metadata_changed");
+    if(snapshot.policy.ownership==MetadataOwnership::CurrentCaller){auto owner=metadata_ownership_digest(snapshot);
+        if(!owner.value())return propagate(owner);
+        if(!request_.reviewed.canonical_owner_digest||*owner.value()!=*request_.reviewed.canonical_owner_digest)
+            return refuse("directory_source.review_canonical_owner_changed");}
     return Observation<bool>::available(true);
 }
 void DirectoryExecutionSourceJob::close_capture(std::unique_ptr<MetadataCaptureJob>& capture)noexcept {

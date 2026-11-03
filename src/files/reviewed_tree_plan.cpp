@@ -438,7 +438,8 @@ private:
             if(!payload.value()){capture_unavailable(*payload.unavailable_detail(),stop);return;}
             n.directory_payload=*payload.value();
             auto qualified=qualify_directory_metadata_source(proof);
-            if(qualified.value()&&*qualified.value())n.entry.directory_metadata_contract=ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1;
+            if(qualified.value()&&*qualified.value())n.entry.directory_metadata_contract=proof.snapshot().policy.ownership==MetadataOwnership::Original?
+                ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1:ComparisonDirectoryMetadataContract::NativeCurrentCallerPostorderV1;
             else if(!qualified.value())n.directory_failure=*qualified.unavailable_detail();
         }
         if(*n.metadata.kind.value()==ObjectKind::RegularFile){if(!proof.main_digest()){fail(AdapterError::InvalidNativeResult,"reviewed_tree.capture_main_missing");close_capture();return;}
@@ -598,6 +599,7 @@ struct ReviewedTreePlanJob::Impl {
         std::size_t item=0;
         DirectoryExecutionSourceJob::Pointer source_proof,destination_proof;
         NativeDirectoryReplayJob::Pointer operation;
+        std::unique_ptr<MetadataCaptureJob> target_capture;
         bool cursor_recorded=false,children_bound=false;
         std::vector<std::size_t> children;
         std::size_t checked_children=0;
@@ -618,7 +620,8 @@ struct ReviewedTreePlanJob::Impl {
     };
     std::map<std::string,NamespaceEffect> namespace_changes;
     bool execution_done()const noexcept{return current>=(order.empty()?items.size():order.size());}
-    bool directory_mode()const noexcept{return request.comparison.directory_metadata_contract==ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1;}
+    bool directory_mode()const noexcept{return request.comparison.directory_metadata_contract==ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1||
+        request.comparison.directory_metadata_contract==ComparisonDirectoryMetadataContract::NativeCurrentCallerPostorderV1;}
     std::size_t index() const { return order.empty() ? current : (current < order.size() ? order[current] : items.size()); }
     struct Deletion {
         Node node;
@@ -752,6 +755,8 @@ struct ReviewedTreePlanJob::Impl {
         if(file_source){try{returned(file_source->finish_io(),"reviewed_tree.file_source_finish_false");}
             catch(...){record_finish(owner,ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"reviewed_tree.file_source_finish_exception");}file_source.reset();}
         for(auto& [row,frame]:directories){
+            if(frame->target_capture){try{returned(frame->target_capture->finish_io(),"reviewed_tree.directory_target_capture_finish_false");}
+                catch(...){record_finish(owner,ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"reviewed_tree.directory_target_capture_finish_exception");}frame->target_capture.reset();}
             if(frame->operation){try{std::stop_source stopping;stopping.request_stop();const auto before=frame->operation->progress();const auto done=frame->operation->advance(stopping.get_token());
                 progress.recovery_required=progress.recovery_required||done.recovery_required;
                 if(done.finish_failure.present){const auto&e=done.finish_failure;record_finish(owner,e.state,e.domain,e.code,e.operation.data());}
@@ -1035,9 +1040,9 @@ struct ReviewedTreePlanJob::Impl {
         }
         auto s = entries(source), d = entries(target);
         request.comparison.topology = ComparisonTopology::Disjoint;
-        if(!request.copy_policy.allow_unhandled_metadata_loss&&capture_policy(request).ownership==MetadataOwnership::Original&&
-           request.comparison.profile!=ComparisonProfile::Compare)
-            request.comparison.directory_metadata_contract=ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1;
+        if(!request.copy_policy.allow_unhandled_metadata_loss&&request.comparison.profile!=ComparisonProfile::Compare)
+            request.comparison.directory_metadata_contract=capture_policy(request).ownership==MetadataOwnership::Original?
+                ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1:ComparisonDirectoryMetadataContract::NativeCurrentCallerPostorderV1;
         auto created = ComparisonPlan::create(request.comparison,
             {ComparisonInventoryState::CompleteStable, *source.root_metadata.identity.value(), s},
             {ComparisonInventoryState::CompleteStable, *target.root_metadata.identity.value(), d}, {}, request.limits);
@@ -1540,8 +1545,8 @@ struct ReviewedTreePlanJob::Impl {
             out.allowed_choices |= choice_bit(ConflictChoice::KeepBothIncoming) | choice_bit(ConflictChoice::Rename);
         if ((request.copy_policy.allow_unhandled_metadata_loss ||
              (directory_mode()&&s!=source.nodes.end()&&d!=target.nodes.end()&&
-              s->second.entry.directory_metadata_contract==ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1&&
-              d->second.entry.directory_metadata_contract==ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1)) &&
+              s->second.entry.directory_metadata_contract==request.comparison.directory_metadata_contract&&
+              d->second.entry.directory_metadata_contract==request.comparison.directory_metadata_contract)) &&
             out.source_kind == ObjectKind::Directory && out.destination_kind == ObjectKind::Directory)
             out.allowed_choices |= choice_bit(ConflictChoice::MergeFolders);
     }
@@ -1784,17 +1789,17 @@ struct ReviewedTreePlanJob::Impl {
         return directory_mode()&&(item.action==ReviewedTreeAction::CreateDirectory||item.action==ReviewedTreeAction::MergeDirectory);
     }
     Observation<bool> directory_available(const ReviewedTreeItem& item)const {
-        if(!directory_row(item)||!request.prepared_journal_root||capture_policy(request).ownership!=MetadataOwnership::Original)
+        if(!directory_row(item)||!request.prepared_journal_root)
             return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.directory_contract_unbound",ObservationState::Unsupported));
 #ifndef _WIN32
         return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.directory_atime_observer_unqualified",ObservationState::Unsupported));
 #endif
         const auto found=source.nodes.find(item.row.relative_path);
-        if(found==source.nodes.end()||found->second.entry.directory_metadata_contract!=ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1)
+        if(found==source.nodes.end()||found->second.entry.directory_metadata_contract!=request.comparison.directory_metadata_contract)
             return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.directory_source_unqualified",ObservationState::Unsupported));
         if(item.action==ReviewedTreeAction::MergeDirectory){
             const auto target_node=target.nodes.find(item.row.relative_path);
-            if(target_node==target.nodes.end()||target_node->second.entry.directory_metadata_contract!=ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1)
+            if(target_node==target.nodes.end()||target_node->second.entry.directory_metadata_contract!=request.comparison.directory_metadata_contract)
                 return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.directory_target_unqualified",ObservationState::Unsupported));
             return Observation<bool>::available(true);
         }
@@ -1904,6 +1909,21 @@ struct ReviewedTreePlanJob::Impl {
                 auto prepared=observer->advance(token);if(!prepared.value())return unavailable<OperationMetadataStep>(*prepared.unavailable_detail());
                 return Observation<OperationMetadataStep>::available(*prepared.value()?OperationMetadataStep::Complete:OperationMetadataStep::Pending);
             };
+            if(capture_policy(request).ownership==MetadataOwnership::CurrentCaller)input.observe_verified_target=[this,row,key=incoming.entry.relative_path](std::stop_token token){
+                using R=Observation<NativeDirectoryTargetObservation>;
+                if(!same_review(row))return unavailable<NativeDirectoryTargetObservation>(error(AdapterError::PlanDecisionStale,"reviewed_tree.directory_target_proof_receipt",ObservationState::Changed));
+                auto& capture=directories.at(row)->target_capture;
+                if(!capture){auto observer=target_seeds.find(key);if(observer==target_seeds.end())return invalid<NativeDirectoryTargetObservation>("reviewed_tree.directory_target_seed_missing");
+                    auto native=observer->second->source();if(!native.value())return unavailable<NativeDirectoryTargetObservation>(*native.unavailable_detail());
+                    auto limits=request.metadata_limits;limits.read={request.digest_chunk_bytes};auto opened=MetadataCaptureJob::begin(*native.value(),capture_policy(request),limits,execution_budget,
+                        std::make_shared<TreeCaptureLatch>(request.prepared_journal_root));if(!opened.value())return unavailable<NativeDirectoryTargetObservation>(*opened.unavailable_detail());
+                    capture=std::move(opened).take_value();return R::available({});}
+                const auto before=capture->progress();auto step=capture->advance(token);if(!step.value())return unavailable<NativeDirectoryTargetObservation>(*step.unavailable_detail());
+                NativeDirectoryTargetObservation result;result.content_reads=capture->progress().read_calls-before.read_calls;result.content_bytes=capture->progress().read_bytes-before.read_bytes;
+                if(capture->progress().phase==MetadataCapturePhase::Complete){auto proof=capture->result();if(!proof.value())return unavailable<NativeDirectoryTargetObservation>(*proof.unavailable_detail());
+                    result.proof=*proof.value();result.step=OperationMetadataStep::Complete;}
+                return R::available(std::move(result));
+            };
             input.verify_plan=[this,row](std::stop_token token){return directory_guard(row,token);};
             input.verify_children=[this,row](std::stop_token token){if(!same_review(row))return invalid<bool>("reviewed_tree.directory_children_receipt");
                 auto found=directories.find(row);if(found==directories.end()||!found->second->children_bound)return Observation<bool>::available(false);
@@ -1951,15 +1971,18 @@ struct ReviewedTreePlanJob::Impl {
             auto payload=directory_metadata_payload_digest_values(*observed);
             if(!digest.value()||!payload.value()){fail(!digest.value()?*digest.unavailable_detail():*payload.unavailable_detail(),true);return;}
             ComparisonMetadataDigest fact;fact.state=ComparisonDigestState::CompleteStable;fact.algorithm=ComparisonDigestAlgorithm::Sha256;
-            fact.schema=metadata_schema();fact.policy_binding=metadata_binding(observed->policy);fact.ownership=ComparisonMetadataOwnership::Original;
+            fact.schema=metadata_schema();fact.policy_binding=metadata_binding(observed->policy);fact.ownership=observed->policy.ownership==MetadataOwnership::Original?
+                ComparisonMetadataOwnership::Original:ComparisonMetadataOwnership::CurrentCaller;
+            if(fact.ownership==ComparisonMetadataOwnership::CurrentCaller){auto owner=metadata_ownership_digest(*observed);if(!owner.value()){fail(*owner.unavailable_detail(),true);return;}fact.canonical_owner_digest=*owner.value();}
             fact.bytes=*digest.value();fact.before=fact.after=node.entry.object;node.entry.metadata_digest=std::move(fact);
-            node.entry.directory_metadata_contract=ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1;node.directory_payload=*payload.value();
+            node.entry.directory_metadata_contract=request.comparison.directory_metadata_contract;node.directory_payload=*payload.value();
             node.all_stream_bytes=0;for(const auto& channel:observed->channels){
                 if(channel.logical_size>std::numeric_limits<std::uint64_t>::max()-*node.all_stream_bytes){fail(error(AdapterError::InvalidNativeResult,"reviewed_tree.directory_verified_byte_overflow"),true);return;}
                 *node.all_stream_bytes+=channel.logical_size;
             }
             namespace_changes.erase(incoming.entry.relative_path);
             item.recovery_required=false;
+            if(frame.target_capture){auto closed=frame.target_capture->finish_io();if(!closed.value()){fail(*closed.unavailable_detail(),true);return;}frame.target_capture.reset();}
             auto close_source=frame.source_proof->finish_io();if(!close_source.value()){fail(*close_source.unavailable_detail(),true);return;}
             if(frame.destination_proof){auto closed=frame.destination_proof->finish_io();if(!closed.value()){fail(*closed.unavailable_detail(),true);return;}}
             directories.erase(row);finish_item();return;

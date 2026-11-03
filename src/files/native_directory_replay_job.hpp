@@ -34,6 +34,11 @@ struct DirectoryReplayProgress final {
     // partial bytes; read_calls records attempts. Legacy mode has no bound.
     std::uint64_t content_reads=0,content_bytes=0,write_calls=0,write_bytes=0;
 };
+struct NativeDirectoryTargetObservation final {
+    OperationMetadataStep step=OperationMetadataStep::Pending;
+    std::shared_ptr<const NativeMetadataProof> proof;
+    std::uint64_t content_reads=0,content_bytes=0;
+};
 struct NativeDirectoryReplayRequest final {
     HeldChild::Pointer source;
     MetadataReplaySnapshot reviewed_metadata;
@@ -64,6 +69,11 @@ struct NativeDirectoryReplayRequest final {
     // metadata. No frontend callback or native-handle exposure. The enclosing
     // Tree owns/drains the resulting independent target observer.
     std::function<Observation<OperationMetadataStep>(OpenedEntry&,std::stop_token)> prepare_target_observation{};
+    // CurrentCaller requires this native-proof route BEFORE effects. An
+    // immutable proof can only come from the core native capture issuer;
+    // counters/step DTOs alone never establish target identity or success.
+    // Uses readers prepared before restrictive metadata, <=1 bounded read.
+    std::function<Observation<NativeDirectoryTargetObservation>(std::stop_token)> observe_verified_target{};
 };
 // One native worker owns this cooperative job. Every advance performs one
 // phase; the enclosing Tree worker supplies threading and cancellation.

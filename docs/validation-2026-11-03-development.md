@@ -590,6 +590,44 @@ and rebuilt before qualification. Failed attempts are retained.
 The integrating branch merges these ownership hunks with its newer Session epoch
 changes. Windows, Darwin, sanitizers and the final combined cohort remain pending.
 
+## Windows Caller ownership and prepared-reader consumers
+
+The frozen 13-file Windows packet adds a native effective-token ownership
+observation before target effects, genuine independent target capture for
+CurrentCaller directory replay, and policy/ownership-normalized postorder
+comparison. Standalone Caller replay without that native observation route is
+refused. TokenOwner and TokenPrimaryGroup are queried independently of the
+source and destination's old owner; the library does not adopt target-before
+ownership as caller identity.
+
+Native ordinary/Full reader cases passed **5,903 / 5,812 checks per filesystem**
+on NTFS and ReFS. Real duplicated base/stream/cursor handles each reserve their
+own budget and private consumer lifetime. Explicitly finishing the original
+source cannot hide a live clone. Finish refuses until consumers drain, while
+exhausted enumeration position can release independently of actual handle
+ownership. Destruction consumes native owners before releasing leases and
+forwards cached first close errors.
+
+Full Tree Original passed **8,975 NTFS / 9,083 ReFS checks** and Full CurrentCaller
+passed **9,079 / 9,187**. A focused different-native-owner control passed
+**2,409 / 2,445**: source and merged target-before owners differed from TokenOwner,
+final target owner/group matched independent token queries, and source security
+bytes/main content remained unchanged. Different-primary-group remapping was
+not independently established. Resource/scope/trust/access-filter classes were
+queried empty rather than claimed as populated roundtrips.
+
+The regular metadata worker also passed persistent C++ allocation failure
+**after native closes**, preserving its POD terminal state, exact close error,
+zero handle reservations and no-I/O cached failure. No MSVC proxy allocation was
+skipped. Whole-Tree persistent OOM remains unqualified. The three updated legacy
+CLI forms passed on both filesystems.
+
+All component implementation bytes were frozen with guarded source hashes.
+The final Tree/name-feedback rebase and Main's newer Session/layer/anonymous
+capture changes require a coherent combined SDK rebuild. These receipts are
+normal Windows results, not matching ASan qualification. The integrating CMake
+adds explicit privileged Caller and different-owner test entries.
+
 ## Remaining gates
 
 - Qualify the final combined postorder Tree and bounded metadata workers on

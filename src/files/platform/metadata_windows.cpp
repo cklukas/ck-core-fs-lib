@@ -9,6 +9,8 @@
 #include "native_metadata_stream_target.hpp"
 #include "native_target_read_seed.hpp"
 #include "native_target_read_budget.hpp"
+#include "native_caller_ownership.hpp"
+#include "metadata_ownership_digest.hpp"
 #include "native_windows_native_fsd.hpp"
 #include "sha256.hpp"
 #include "windows_name.hpp"
@@ -545,8 +547,28 @@ Observation<bool> require_enabled_security_privilege() {
     return failure<bool>(ERROR_PRIVILEGE_NOT_HELD,"metadata_replay.coverage_security_privilege_disabled");
 }
 
+// Worker-local resource/lifetime accounting, never native identity authority.
+// Each actual duplicated owner has one lease, released AFTER consuming HANDLE.
+struct WindowsTargetReadConsumers final { std::size_t active=0; };
+class WindowsTargetReadConsumer final {
+public:
+    WindowsTargetReadConsumer(std::shared_ptr<WindowsTargetReadConsumers> owners,
+        std::shared_ptr<detail::NativeTargetReadBudget> budget,
+        std::shared_ptr<const MetadataCaptureFailureLatch> latch)
+        :owners_(std::move(owners)),budget_(std::move(budget)),latch_(std::move(latch)){++owners_->active;}
+    ~WindowsTargetReadConsumer(){--owners_->active;}
+    const MetadataCaptureFailureLatch* latch()const noexcept{return latch_.get();}
+private:
+    std::shared_ptr<WindowsTargetReadConsumers> owners_;
+    std::shared_ptr<detail::NativeTargetReadBudget> budget_;
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch_;
+};
 class WindowsMetadataChannel final:public MetadataReplayChannelSource {
 public:
+    ~WindowsMetadataChannel()override {
+        if(target_read_consumer_){detail::MetadataCaptureCleanupScope scope(target_read_consumer_->latch());finish_capture_reads();}
+    }
+    void retain_target_read_consumer(std::shared_ptr<WindowsTargetReadConsumer> owner){target_read_consumer_=std::move(owner);}
     void retain_capture_lease(std::shared_ptr<const void> lease)const{capture_lease_=std::move(lease);}
 
     WindowsMetadataChannel(OwnedHandle handle,AdapterScope scope,NativeFeatureIdentifier identifier,ObjectIdentity owner,bool writable)
@@ -641,11 +663,14 @@ public:
         return Result::available(true);
     }
     void finish_capture_reads()noexcept {
+        auto kept_consumer=target_read_consumer_;
+        detail::MetadataCaptureCleanupScope owned_scope(kept_consumer?kept_consumer->latch():detail::current_metadata_capture_cleanup());
         if(capture_close_started_){if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);return;}
         capture_close_started_=true;
         if(writable_){capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_capture.writer_not_read_owner"};}
         else {finished_=true;const HANDLE h=handle_.release();if(h&&h!=INVALID_HANDLE_VALUE&&!CloseHandle(h)){const auto e=GetLastError();capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,e,"metadata_capture.channel_CloseHandle"};report_capture_close(e,"metadata_capture.channel_CloseHandle");}}
         if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);
+        target_read_consumer_.reset();
     }
     Observation<std::unique_ptr<WindowsMetadataChannel>> duplicate_capture_reader()const {
         using R=Observation<std::unique_ptr<WindowsMetadataChannel>>;
@@ -666,6 +691,7 @@ private:
     bool capture_close_started_=false;
     std::optional<MetadataCaptureCleanupError> capture_close_error_;
     mutable std::shared_ptr<const void> capture_lease_;
+    std::shared_ptr<WindowsTargetReadConsumer> target_read_consumer_;
 
     OwnedHandle handle_;
     AdapterScope scope_;
@@ -677,12 +703,28 @@ private:
 
 struct WindowsTargetReadManifest final {
     MetadataReplayPolicy policy;
-    std::vector<std::shared_ptr<WindowsMetadataChannel>> readers;
+    // Declared before actual owners so budget outlives native destruction.
     std::shared_ptr<detail::NativeTargetReadBudget> budget;
+    std::shared_ptr<WindowsTargetReadConsumers> consumers=std::make_shared<WindowsTargetReadConsumers>();
+    std::shared_ptr<const MetadataCaptureFailureLatch> latch;
+    std::vector<std::shared_ptr<WindowsMetadataChannel>> readers;
+    ~WindowsTargetReadManifest(){
+        detail::MetadataCaptureCleanupScope scope(latch.get());
+        for(const auto& reader:readers)reader->finish_capture_reads();
+    }
+    Observation<std::shared_ptr<WindowsTargetReadConsumer>> acquire(std::size_t bytes)const {
+        using R=Observation<std::shared_ptr<WindowsTargetReadConsumer>>;
+        auto lease=detail::NativeTargetReadBudget::acquire_child(budget,1,bytes+sizeof(WindowsTargetReadConsumer));
+        if(!lease.value()){const auto&e=*lease.unavailable_detail();return R::unavailable(e.state,e.error);}
+        return R::available(std::make_shared<WindowsTargetReadConsumer>(consumers,std::move(lease).take_value(),latch));
+    }
 };
 class WindowsTargetReadSeed;
 class WindowsOpenedEntry final : public OpenedEntry {
 public:
+    ~WindowsOpenedEntry()override {
+        if(target_read_consumer_||target_read_manifest_)finish_capture_reads();
+    }
     WindowsOpenedEntry(OwnedHandle handle, AdapterScope scope, bool layout_access = false,
                        bool content_access = false, bool content_write_access = false,
                        std::unique_ptr<WindowsPublicationContext> publication = {}, bool rename_access = false, bool directory_metadata_target = false)
@@ -816,6 +858,10 @@ public:
         return *finish_result_;
     }
     void finish_capture_reads()noexcept {
+        auto kept_consumer=target_read_consumer_;
+        auto kept_manifest=target_read_manifest_;
+        detail::MetadataCaptureCleanupScope owned_scope(kept_consumer?kept_consumer->latch():
+            kept_manifest?kept_manifest->latch.get():detail::current_metadata_capture_cleanup());
         if(capture_close_started_){if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);return;}
         capture_close_started_=true;
         if(content_write_access_){capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_capture.writer_not_read_owner"};}
@@ -828,6 +874,7 @@ public:
             }
         }
         target_read_manifest_.reset();
+        target_read_consumer_.reset();
         if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);
     }
     // Content-only observation: no security/EA rights or metadata qualification.
@@ -848,11 +895,14 @@ public:
                policy.allow_privilege_metadata!=bound.allow_privilege_metadata||policy.limits.max_records!=bound.limits.max_records||
                policy.limits.max_native_bytes!=bound.limits.max_native_bytes)
                 return failure<std::shared_ptr<const OpenedEntry>>(ERROR_INVALID_PARAMETER,"target_read.closed_or_policy_changed");
+            auto lease=target_read_manifest_->acquire(sizeof(WindowsOpenedEntry));
+            if(!lease.value()){const auto&e=*lease.unavailable_detail();return Result::unavailable(e.state,e.error);}
             HANDLE raw=nullptr;
             if(!DuplicateHandle(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
                 return failure<std::shared_ptr<const OpenedEntry>>(GetLastError(),"target_read.source_duplicate");
             OwnedHandle owned(raw);auto clone=std::make_shared<WindowsOpenedEntry>(std::move(owned),scope_,false,content_access_);
             clone->target_read_manifest_=target_read_manifest_;
+            clone->target_read_consumer_=std::move(lease).take_value();
             return Result::available(std::move(clone));
         }
         if(content_write_access_)return failure<std::shared_ptr<const OpenedEntry>>(ERROR_ACCESS_DENIED,"metadata_capture.readonly_source_required");
@@ -1256,8 +1306,11 @@ public:
         for(const auto& owned:channel_writers_)if(owned->identifier()==identifier)return Result::available(owned);
         if(target_read_manifest_) {
             for(const auto& prepared:target_read_manifest_->readers)if(prepared->identifier()==identifier) {
+                auto lease=target_read_manifest_->acquire(sizeof(WindowsMetadataChannel));
+                if(!lease.value()){const auto&e=*lease.unavailable_detail();return Result::unavailable(e.state,e.error);}
                 auto clone=prepared->duplicate_capture_reader();
                 if(!clone.value()){const auto&e=*clone.unavailable_detail();return Result::unavailable(e.state,e.error);}
+                (*clone.value())->retain_target_read_consumer(std::move(lease).take_value());
                 return Result::available(std::shared_ptr<const MetadataReplayChannelSource>(std::move(clone).take_value()));
             }
             return Result::unavailable(ObservationState::Changed,{ErrorDomain::Adapter,
@@ -1912,6 +1965,9 @@ private:
     }
     bool capture_close_started_=false;
     std::optional<MetadataCaptureCleanupError> capture_close_error_;
+    // Both manifest budget and per-clone ownership must outlive BOTH handles.
+    std::shared_ptr<const WindowsTargetReadManifest> target_read_manifest_;
+    std::shared_ptr<WindowsTargetReadConsumer> target_read_consumer_;
     DWORD security_access_=0;
     OwnedHandle security_handle_;
     bool finish_started_ = false;
@@ -1925,7 +1981,6 @@ private:
     bool rename_access_ = false;
     std::unique_ptr<WindowsPublicationContext> publication_;
     bool directory_metadata_target_=false;
-    std::shared_ptr<const WindowsTargetReadManifest> target_read_manifest_;
     mutable std::unique_ptr<WindowsContentLease> content_lease_;
     std::vector<std::shared_ptr<WindowsMetadataChannel>> channel_writers_;
 };
@@ -2282,6 +2337,9 @@ public:
     }
 
 
+    ~WindowsDirectoryCursor()override {
+        if(target_read_consumer_){detail::MetadataCaptureCleanupScope scope(target_read_consumer_->latch());handle_.reset();target_read_consumer_.reset();}
+    }
     WindowsDirectoryCursor(OwnedHandle handle, Observation<ObjectIdentity> native_identity, AdapterScope scope)
         : DirectoryCursor(std::move(native_identity)), handle_(std::move(handle)), scope_(std::move(scope)) {}
     Observation<AdapterScope> source_scope() const override { return Observation<AdapterScope>::available(scope_); }
@@ -3371,7 +3429,7 @@ private:
         if (!record.name) return Result::available(DirectorySkip{});
         return Result::available(std::move(*record.name));
     }
-    std::shared_ptr<const void> target_read_budget_;
+    std::shared_ptr<WindowsTargetReadConsumer> target_read_consumer_;
     std::shared_ptr<const void> target_read_enumeration_lease_;
     bool target_read_enumeration_finished_=false;
     OwnedHandle handle_;
@@ -3393,7 +3451,13 @@ public:
         std::shared_ptr<const MetadataCaptureFailureLatch> latch,
         std::shared_ptr<const WindowsDirectoryCursor> container={})
         :target_(target),proof_(std::move(proof)),limits_(limits),budget_(std::move(budget)),latch_(std::move(latch)),container_(std::move(container)){}
-    ~WindowsTargetReadSeed()override{try{(void)finish_io();}catch(...){}}
+    ~WindowsTargetReadSeed()override{
+        detail::MetadataCaptureCleanupScope scope(this);
+        try{(void)finish_io();}catch(...){}
+        // If consumers outlive us, consume only our owners. Their independently
+        // duplicated handles keep their private resource leases/close latch.
+        enumeration_.reset();source_.reset();manifest_.reset();proof_.reset();container_.reset();
+    }
     void record_first(MetadataCaptureCleanupError e)const noexcept override {
         if(!close_error_)close_error_=e;
         if(latch_)latch_->record_first(e);
@@ -3462,7 +3526,7 @@ public:
         if(!active_enumerator_.expired())return Observation<std::shared_ptr<const DirectoryCursor>>::unavailable(
             ObservationState::Unsupported,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"target_read.enumerator_still_owned"});
         detail::MetadataCaptureCleanupScope scope(this);
-        auto lease=detail::NativeTargetReadBudget::acquire(budget_,1,sizeof(WindowsDirectoryCursor));
+        auto lease=manifest_->acquire(sizeof(WindowsDirectoryCursor));
         if(!lease.value()){const auto&e=*lease.unavailable_detail();return R::unavailable(e.state,e.error);}
         HANDLE raw=nullptr;
         if(!DuplicateHandle(GetCurrentProcess(),enumeration_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
@@ -3470,12 +3534,19 @@ public:
         OwnedHandle owned(raw);auto current=identity(owned.get(),source_->scope_);
         if(!current.value()){const auto&e=*current.unavailable_detail();return R::unavailable(e.state,e.error);}
         auto cursor=std::make_shared<WindowsDirectoryCursor>(std::move(owned),std::move(current),source_->scope_);
-        cursor->target_read_budget_=std::move(lease).take_value();
+        cursor->target_read_consumer_=std::move(lease).take_value();
         cursor->target_read_enumeration_lease_=std::make_shared<const std::byte>();
         active_enumerator_=cursor->target_read_enumeration_lease_;
         return R::available(std::move(cursor));
     }
     Observation<bool> finish_io()override {
+        // Refusal leaves ALL prepared native owners usable for an ordered retry.
+        // Original source may have been explicitly closed while real clones live;
+        // use a private actual-owner counter, not a fixed manifest use_count.
+        if(!finished_&&manifest_&&(manifest_->consumers->active||
+            (source_&&!source_->capture_close_started_&&source_.use_count()>1)))
+            return Observation<bool>::unavailable(ObservationState::Unsupported,{ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidAccess),"target_read.consumers_still_owned"});
         if(!finished_){detail::MetadataCaptureCleanupScope scope(this);
             if(manifest_)for(const auto& reader:manifest_->readers)reader->finish_capture_reads();
             if(source_)source_->finish_capture_reads();
@@ -3534,7 +3605,7 @@ private:
         auto lease=detail::NativeTargetReadBudget::acquire(budget_,snapshot.channels.size()+4,metadata);
         if(!lease.value()){const auto&e=*lease.unavailable_detail();return Observation<bool>::unavailable(e.state,e.error);}
         auto manifest=std::make_shared<WindowsTargetReadManifest>();manifest->policy=snapshot.policy;
-        manifest->budget=std::move(lease).take_value();manifest->readers.reserve(snapshot.channels.size());
+        manifest->budget=std::move(lease).take_value();manifest->latch=latch_;manifest->readers.reserve(snapshot.channels.size());
         const DWORD read=FILE_READ_DATA|FILE_READ_ATTRIBUTES|FILE_READ_EA|READ_CONTROL|SYNCHRONIZE|
             (snapshot.policy.scope==RegularMetadataScope::CompleteMetadataV1?ACCESS_SYSTEM_SECURITY:0);
         auto opened=target_->metadata_security_handle(read|FILE_WRITE_ATTRIBUTES);
@@ -3773,6 +3844,46 @@ template<class T>Observation<std::unique_ptr<T>> stream_factory_error(const char
         {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),operation});
 }
 }
+Observation<std::array<std::byte,32>> native_metadata_caller_ownership(const DirectoryCursor& parent){
+ using R=Observation<std::array<std::byte,32>>;
+ const auto* native=dynamic_cast<const WindowsDirectoryCursor*>(&parent);
+ if(!native||!native->identity().value())return R::unavailable(ObservationState::Unsupported,
+  {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"caller_owner.genuine_native_parent_required"});
+ struct Latch final:MetadataCaptureFailureLatch {
+  const MetadataCaptureFailureLatch* outer;
+  mutable std::optional<MetadataCaptureCleanupError> error;
+  explicit Latch(const MetadataCaptureFailureLatch* p):outer(p){}
+  void record_first(MetadataCaptureCleanupError e)const noexcept override {if(!error)error=e;if(outer)outer->record_first(e);}
+ } latch(current_metadata_capture_cleanup());
+ MetadataCaptureCleanupScope scope(&latch);
+ HANDLE raw=nullptr;if(!OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,TRUE,&raw)){
+  if(GetLastError()!=ERROR_NO_TOKEN||!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw))
+   return failure<std::array<std::byte,32>>(GetLastError(),"caller_owner.effective_token");}
+ OwnedHandle token(raw);
+ const auto query=[&](TOKEN_INFORMATION_CLASS kind)->Observation<NativeBytes>{DWORD count=0;GetTokenInformation(token.get(),kind,nullptr,0,&count);
+  if(GetLastError()!=ERROR_INSUFFICIENT_BUFFER||!count||count>65536)return failure<NativeBytes>(GetLastError(),"caller_owner.token_size");
+  NativeBytes bytes(count);if(!GetTokenInformation(token.get(),kind,bytes.data(),count,&count))return failure<NativeBytes>(GetLastError(),"caller_owner.token_query");
+  return Observation<NativeBytes>::available(std::move(bytes));};
+ auto owner=query(TokenOwner),group=query(TokenPrimaryGroup);
+ if(!owner.value()||!group.value()){const auto& e=*(owner.value()?group:owner).unavailable_detail();return R::unavailable(e.state,e.error);}
+ SECURITY_DESCRIPTOR descriptor{};
+ if(!InitializeSecurityDescriptor(&descriptor,SECURITY_DESCRIPTOR_REVISION)||
+    !SetSecurityDescriptorOwner(&descriptor,reinterpret_cast<const TOKEN_OWNER*>(owner.value()->data())->Owner,FALSE)||
+    !SetSecurityDescriptorGroup(&descriptor,reinterpret_cast<const TOKEN_PRIMARY_GROUP*>(group.value()->data())->PrimaryGroup,FALSE))
+  return failure<std::array<std::byte,32>>(GetLastError(),"caller_owner.native_descriptor");
+ DWORD count=0;MakeSelfRelativeSD(&descriptor,nullptr,&count);
+ if(GetLastError()!=ERROR_INSUFFICIENT_BUFFER||count<20||count>65536)return failure<std::array<std::byte,32>>(GetLastError(),"caller_owner.descriptor_size");
+ NativeBytes bytes(count);if(!MakeSelfRelativeSD(&descriptor,reinterpret_cast<PSECURITY_DESCRIPTOR>(bytes.data()),&count))
+  return failure<std::array<std::byte,32>>(GetLastError(),"caller_owner.descriptor");
+ MetadataReplaySnapshot values;values.basic.windows_attributes=Observation<std::uint32_t>::available(FILE_ATTRIBUTE_DIRECTORY);
+ NativeSecurityValue security;security.part=SecurityPart::WindowsAccess;security.presence=SecurityPresence::Present;
+ security.encoding=SecurityEncoding::WindowsRelativeDescriptor;security.native_query_mask=OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION;
+ security.bytes=std::move(bytes);values.security.push_back(std::move(security));
+ auto digest=metadata_ownership_digest(values);token.reset();
+ if(latch.error){const auto& e=*latch.error;return R::unavailable(e.state,{e.domain,e.code,e.operation});}
+ return digest;
+}
+
 Observation<NativeTargetReadSeed::Pointer> begin_native_target_read_seed(OpenedEntry& target,
     std::shared_ptr<const NativeMetadataProof> proof,MetadataCaptureLimits limits,std::shared_ptr<MetadataCaptureBudget> budget,
     std::shared_ptr<const MetadataCaptureFailureLatch> latch) {

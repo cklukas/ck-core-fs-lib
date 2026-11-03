@@ -105,7 +105,7 @@ Observation<bool> remove_stream(const DirectoryCursor&,const NativeFeatureIdenti
 #endif
 }
 Observation<bool> qualify_directory_metadata_source(const NativeMetadataProof& proof){if(proof.io_finished())return reject("directory_apply.closed_source",ObservationState::Changed,AdapterError::InvalidAccess);
- const auto& snapshot=proof.snapshot();if(!snapshot.policy.valid()||snapshot.policy.ownership!=MetadataOwnership::Original||!snapshot.basic.identity.value()||
+ const auto& snapshot=proof.snapshot();if(!snapshot.policy.valid()||!snapshot.basic.identity.value()||
  !snapshot.basic.kind.value()||*snapshot.basic.kind.value()!=ObjectKind::Directory)return reject("directory_apply.source_policy_kind");
  if(snapshot.basic.posix_permissions.value()&&(*snapshot.basic.posix_permissions.value()&07000U)&&!snapshot.policy.allow_privilege_metadata)return reject("directory_apply.source_privilege_mode");
  for(std::size_t i=0;i<snapshot.attributes.size();++i){const auto& attribute=snapshot.attributes[i];if(!same(attribute.owner,snapshot.basic.identity))return reject("directory_apply.source_attribute_owner",ObservationState::Changed,AdapterError::UnqualifiedIdentity);

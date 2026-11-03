@@ -34,8 +34,9 @@ void remember(detail::PreparedJournalConsumerFailure& first,bool& present,const 
     if(n)std::memcpy(first.operation.data(),e.error.operation.data(),n);first.operation[n]=0;
 }
 Observation<bool> failure_result(const detail::PreparedJournalConsumerFailure& e) {
-    try{return Observation<bool>::unavailable(e.state,{e.domain,e.code,e.operation.data()});}
-    catch(const std::bad_alloc&){return Observation<bool>::unavailable(e.state,{e.domain,e.code,{}});}
+    // Diagnostic allocation may throw. Callers finish native owners first;
+    // an allocating empty-string fallback cannot safely recover from OOM.
+    return Observation<bool>::unavailable(e.state,{e.domain,e.code,e.operation.data()});
 }
 enum class Phase { SourceBefore,Preflight,OpenStream,ReadStream,WriteStream,CloseStream,OpenReader,
     PrepareTargetObservation,AttributeCatalog,RemoveAttributes,OrdinaryAttributes,Ownership,InitialBasic,Security,PrivilegedAttributes,
@@ -283,7 +284,7 @@ const NativeRegularMetadataProgress& NativeRegularMetadataJob::progress()const n
 Observation<Step> NativeRegularMetadataJob::advance(State state,std::stop_token stop) {
     auto& p=*impl_;
     if(p.progress.cancelled&&!p.has_close_failure)return Observation<Step>::available(Step::Cancelled);
-    if(p.failed){auto failure=p.has_close_failure?failure_result(p.close_failure):failure_result(p.failure);return propagate<Step>(failure);}
+    if(p.failed){if(!p.progress.worker_drained)(void)finish_io();auto failure=p.has_close_failure?failure_result(p.close_failure):failure_result(p.failure);return propagate<Step>(failure);}
     if(p.progress.complete)return complete();
     if(p.progress.worker_drained)return reject<Step>("regular_metadata_job.finished",ObservationState::Changed,AdapterError::InvalidAccess);
     try {
@@ -294,7 +295,7 @@ Observation<Step> NativeRegularMetadataJob::advance(State state,std::stop_token 
             p.root_failure();if(result.value()&&!p.has_close_failure&&!stop.stop_requested())return result;
             if(!result.value())remember(p.failure,p.has_failure,*result.unavailable_detail());}
     }catch(...){p.root_failure();if(!p.has_failure){p.failure.state=ObservationState::Unknown;p.failure.domain=ErrorDomain::Adapter;
-        p.failure.code=static_cast<std::int64_t>(AdapterError::InvalidNativeResult);std::strcpy(p.failure.operation.data(),"regular_metadata_job.exception");p.has_failure=true;}}
+        p.failure.code=static_cast<std::int64_t>(AdapterError::InvalidNativeResult);std::memcpy(p.failure.operation.data(),"regular_metadata_job.exception",sizeof("regular_metadata_job.exception"));p.has_failure=true;}}
     const bool clean_cancel=stop.stop_requested()&&!p.has_close_failure&&(!p.has_failure||
         (p.failure.domain==ErrorDomain::Adapter&&p.failure.code==static_cast<std::int64_t>(AdapterError::InterruptedRead)));
     p.failed=true;try{(void)finish_io();}catch(...){}
@@ -319,12 +320,12 @@ Observation<bool> NativeRegularMetadataJob::finish_io() {
         if(p.request.finish_source)p.close([&]{return p.request.finish_source();});
         if(p.request.source)p.close([&]{return p.request.source->finish_io();});
         p.request.source.reset();p.pending_bytes.clear();p.attributes.reset();
-        p.request.verify_membership={};p.request.revalidate_source={};p.request.finish_source={};
+        p.request.verify_membership={};p.request.revalidate_source={};p.request.finish_source={};p.request.prepare_target_observation={};
         p.root_failure();p.request.target=nullptr;p.stream_latch.reset();p.request.journal_root.reset();p.progress.worker_drained=true;
         if(p.has_close_failure){p.progress.complete=false;p.progress.cancelled=false;p.failed=true;}
         else if(!p.progress.complete&&!p.failed){p.failed=true;p.has_failure=true;p.failure.state=ObservationState::Changed;
             p.failure.domain=ErrorDomain::Adapter;p.failure.code=static_cast<std::int64_t>(AdapterError::InvalidAccess);
-            std::strcpy(p.failure.operation.data(),"regular_metadata_job.finished");}
+            std::memcpy(p.failure.operation.data(),"regular_metadata_job.finished",sizeof("regular_metadata_job.finished"));}
     }
     return p.has_close_failure?failure_result(p.close_failure):Observation<bool>::available(true);
 }

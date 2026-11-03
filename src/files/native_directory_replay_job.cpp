@@ -3,6 +3,8 @@
 #include "directory_metadata_apply.hpp"
 #include "directory_metadata_verify.hpp"
 #include "metadata_semantic_digest.hpp"
+#include "metadata_ownership_digest.hpp"
+#include "platform/native_caller_ownership.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
 #include <algorithm>
 #include <limits>
@@ -107,6 +109,17 @@ void identity(std::vector<std::byte>& out,const BasicMetadata& metadata) {
     }
 }
 }
+namespace {
+class ClosedDirectoryCoverage final:public MetadataSecurityCoverageEvidence {
+public:
+    explicit ClosedDirectoryCoverage(MetadataSecurityCoverage family):family_(family){}
+    MetadataSecurityCoverage family()const noexcept override{return family_;}
+    Observation<bool> recheck(const MetadataReplaySnapshot&)const override{return reject("directory_replay.closed_values_not_authority");}
+private:MetadataSecurityCoverage family_;
+};
+template<class T>bool exact(const Observation<T>& a,const Observation<T>& b){return a.value()&&b.value()?*a.value()==*b.value():
+    !a.value()&&!b.value()&&a.state()==b.state()&&a.unavailable_detail()->error==b.unavailable_detail()->error;}
+}
 struct NativeDirectoryReplayJob::Bounded {
     class Latch final:public MetadataCaptureFailureLatch {
     public:
@@ -127,6 +140,9 @@ struct NativeDirectoryReplayJob::Bounded {
     DirectoryMetadataApplyJob::Pointer apply;
     DirectoryMetadataVerifyJob::Pointer verify;
     bool target_observation_prepared=false;
+    std::optional<std::array<std::byte,32>> caller_owner;
+    std::shared_ptr<const NativeMetadataProof> native_target_proof;
+    std::optional<MetadataReplaySnapshot> caller_values;
 };
 NativeDirectoryReplayJob::NativeDirectoryReplayJob(NativeDirectoryReplayRequest request):request_(std::move(request)) {
     if(request_.source_proof){bounded_=std::make_unique<Bounded>(request_.journal_root);
@@ -140,6 +156,10 @@ Observation<NativeDirectoryReplayJob::Pointer> NativeDirectoryReplayJob::create(
         (!request.existing_destination&&(!request.destination_parent||!request.destination_name||!request.destination_name->is_valid())))
         return R::unavailable(ObservationState::Failed,{ErrorDomain::Adapter,
             static_cast<std::int64_t>(AdapterError::InvalidIdentifier),"directory_replay.request"});
+    if(request.reviewed_metadata.policy.ownership==MetadataOwnership::CurrentCaller&&
+       (!request.source_proof||!request.prepare_target_observation||!request.observe_verified_target))
+        return R::unavailable(ObservationState::Unsupported,{ErrorDomain::Adapter,
+            static_cast<std::int64_t>(AdapterError::ProviderReviewRequired),"directory_replay.native_caller_observer_required"});
     if(request.existing_destination) {
         request.destination_parent=request.existing_destination->parent();request.destination_name=request.existing_destination->name();
     }
@@ -197,6 +217,11 @@ Observation<bool> NativeDirectoryReplayJob::revalidate(std::stop_token stop,bool
     return Observation<bool>::available(true);
 }
 Observation<bool> NativeDirectoryReplayJob::prepare(std::stop_token stop) {
+    if(bounded_&&request_.reviewed_metadata.policy.ownership==MetadataOwnership::CurrentCaller&&!bounded_->caller_owner){
+        auto owner=detail::native_metadata_caller_ownership(*request_.destination_parent);
+        if(!owner.value())return propagate(owner);bounded_->caller_owner=*owner.value();
+    }
+
     auto valid=request_.journal_root->revalidate();if(!valid.value()||!*valid.value())return valid;
     auto source=JournalScopeGuard::create_for_entry(request_.journal_root,*request_.source,stop);
     if(!source.value())return propagate(source);source_scope_=std::move(source).take_value();
@@ -224,10 +249,10 @@ Observation<bool> NativeDirectoryReplayJob::prepare(std::stop_token stop) {
     // Independent read-only verifiers cannot impersonate the native writer's
     // CurrentCaller security context. Original-owner ADS has a native reader
     // factory below; no caller-created source/evidence is accepted by it.
-    if(!request_.reviewed_metadata.channels.empty()&&request_.reviewed_metadata.policy.ownership!=MetadataOwnership::Original)
+    if(!request_.reviewed_metadata.channels.empty()&&request_.reviewed_metadata.policy.ownership!=MetadataOwnership::Original&&!request_.observe_verified_target)
         return reject("directory_replay.ads_caller_context_unqualified");
     if(destination_) {
-        if(request_.reviewed_metadata.policy.ownership==MetadataOwnership::CurrentCaller)
+        if(request_.reviewed_metadata.policy.ownership==MetadataOwnership::CurrentCaller&&!request_.observe_verified_target)
             return reject("directory_replay.existing_caller_verifier_unqualified");
         const auto access=request_.reviewed_metadata.policy.scope==RegularMetadataScope::CompleteMetadataV1?
             EntryAccess::MetadataAndFullSecurity|EntryAccess::MetadataAndAttributes:EntryAccess::MetadataAndAttributes|EntryAccess::MetadataAndSecurity;
@@ -290,7 +315,7 @@ void NativeDirectoryReplayJob::finish_bounded()noexcept {
             else if(!*finished.value())remember_raw(ObservationState::Unknown,ErrorDomain::Adapter,2,"directory_replay.capture_finish_false",true);}
         catch(...){finish_exception("directory_replay.capture_finish_exception");}capture.reset();};
     close(bounded_->source_check);close(bounded_->target_after_children);close(bounded_->target_initial);
-    for(const auto& proof:{bounded_->target_before,request_.source_proof,request_.destination_review_proof})if(proof)try{
+    for(const auto& proof:{bounded_->target_before,bounded_->native_target_proof,request_.source_proof,request_.destination_review_proof})if(proof)try{
         auto finished=proof->finish_io();if(!finished.value())remember(*finished.unavailable_detail(),true);
         else if(!*finished.value())remember_raw(ObservationState::Unknown,ErrorDomain::Adapter,2,"directory_replay.proof_finish_false",true);
     }catch(...){finish_exception("directory_replay.proof_finish_exception");}
@@ -330,7 +355,8 @@ Observation<bool> NativeDirectoryReplayJob::bounded_step(std::stop_token stop) {
         }
         if(!same(state.target_before->snapshot().basic,destination_->metadata()))return reject("directory_replay.initial_target_identity",ObservationState::Changed,AdapterError::MetadataChanged);
         auto payload=directory_metadata_payload_digest(*state.target_before);if(!payload.value())return propagate(payload);
-        state.target_payload=*payload.value();progress_.phase=DirectoryReplayPhase::AwaitingChildren;return Observation<bool>::available(true);
+        state.target_payload=*payload.value();
+        progress_.phase=DirectoryReplayPhase::AwaitingChildren;return Observation<bool>::available(true);
     }
     case DirectoryReplayPhase::RecheckingSource:case DirectoryReplayPhase::RecheckingFinalSource:{
         const auto final=progress_.phase==DirectoryReplayPhase::RecheckingFinalSource;
@@ -367,9 +393,9 @@ Observation<bool> NativeDirectoryReplayJob::bounded_step(std::stop_token stop) {
             if(!state.target_observation_prepared){
                 if(request_.prepare_target_observation){
                     auto prepared=request_.prepare_target_observation(creator_?creator_->metadata_writer():*writer_,stop);
-                    detail::PreparedJournalConsumerFailure close;
-                    if(detail::read_prepared_journal_consumer_failure(*request_.journal_root,close))return Observation<bool>::unavailable(
-                        close.state,{close.domain,close.code,close.operation.data()});
+                    detail::PreparedJournalConsumerFailure consumer_close;
+                    if(detail::read_prepared_journal_consumer_failure(*request_.journal_root,consumer_close))return Observation<bool>::unavailable(
+                        consumer_close.state,{consumer_close.domain,consumer_close.code,consumer_close.operation.data()});
                     if(!prepared.value())return propagate(prepared);
                     if(*prepared.value()==OperationMetadataStep::Pending)return Observation<bool>::available(true);
                     if(*prepared.value()==OperationMetadataStep::Cancelled&&stop.stop_requested())return reject(
@@ -378,7 +404,7 @@ Observation<bool> NativeDirectoryReplayJob::bounded_step(std::stop_token stop) {
                 }
                 state.target_observation_prepared=true;return Observation<bool>::available(true);
             }
-            if(!request_.reviewed_metadata.channels.empty()){
+            if(!request_.reviewed_metadata.channels.empty()&&request_.reviewed_metadata.policy.ownership==MetadataOwnership::Original){
                 auto independent=create_directory_replay_verifier(destination_,cursor_,std::move(verifier_),request_.reviewed_metadata,request_.journal_root,stop);
                 if(!independent.value())return propagate(independent);stream_verifier_=std::move(independent).take_value();}
             return state.apply->continue_metadata();
@@ -387,6 +413,35 @@ Observation<bool> NativeDirectoryReplayJob::bounded_step(std::stop_token stop) {
         return Observation<bool>::available(true);
     }
     case DirectoryReplayPhase::VerifyingBoundedMetadata:{
+        if(request_.reviewed_metadata.policy.ownership==MetadataOwnership::CurrentCaller){
+            auto observed=request_.observe_verified_target(stop);
+            detail::PreparedJournalConsumerFailure consumer_close;
+            if(detail::read_prepared_journal_consumer_failure(*request_.journal_root,consumer_close))return Observation<bool>::unavailable(consumer_close.state,{consumer_close.domain,consumer_close.code,consumer_close.operation.data()});
+            if(!observed.value())return propagate(observed);
+            const auto& step=*observed.value();
+            if(step.content_reads>1||step.content_bytes>request_.metadata_limits.read.max_bytes)
+                return reject("directory_replay.target_observer_read_bound",ObservationState::Failed,AdapterError::InvalidLimit);
+            progress_.content_reads+=step.content_reads;progress_.content_bytes+=step.content_bytes;
+            if(step.step==OperationMetadataStep::Pending){if(step.proof)return reject("directory_replay.pending_target_proof",ObservationState::Failed,AdapterError::InvalidNativeResult);return Observation<bool>::available(true);}
+            if(step.step==OperationMetadataStep::Cancelled&&stop.stop_requested())return reject("directory_replay.target_capture_cancelled",ObservationState::Unknown,AdapterError::InterruptedRead);
+            if(step.step!=OperationMetadataStep::Complete||!step.proof||step.proof->io_finished())return reject("directory_replay.open_native_target_proof_required",ObservationState::Changed,AdapterError::InvalidAccess);
+            const auto& values=step.proof->snapshot();const auto& source=request_.source_proof->snapshot();
+            if(values.policy.version!=source.policy.version||values.policy.scope!=source.policy.scope||values.policy.ownership!=source.policy.ownership||
+               values.policy.allow_privilege_metadata!=source.policy.allow_privilege_metadata||values.policy.limits.max_records!=source.policy.limits.max_records||
+               values.policy.limits.max_native_bytes!=source.policy.limits.max_native_bytes||!same(values.basic,applied_)||
+               !exact(values.basic.changed,applied_.changed)||!exact(values.basic.accessed,source.basic.accessed)||!exact(values.basic.modified,source.basic.modified)||
+               (source.policy.scope==RegularMetadataScope::CompleteMetadataV1&&!exact(values.basic.created,source.basic.created)))
+                return reject("directory_replay.native_target_policy_or_version",ObservationState::Changed,AdapterError::MetadataChanged);
+            auto actual=native_metadata_proof_digest(*step.proof,stop),desired=native_metadata_proof_digest(*request_.source_proof,stop);
+            auto owner=metadata_ownership_digest(values);
+            if(!actual.value())return propagate(actual);if(!desired.value())return propagate(desired);if(!owner.value())return propagate(owner);
+            if(*actual.value()!=*desired.value()||!state.caller_owner||*owner.value()!=*state.caller_owner)
+                return reject("directory_replay.native_target_metadata_or_caller_owner",ObservationState::Changed,AdapterError::MetadataChanged);
+            state.native_target_proof=step.proof;state.caller_values=values;
+            state.caller_values->channel_evidence.reset();for(auto& channel:state.caller_values->channels)channel.source.reset();
+            if(state.caller_values->security_coverage)state.caller_values->security_coverage=std::make_shared<ClosedDirectoryCoverage>(state.caller_values->security_coverage->family());
+            progress_.phase=DirectoryReplayPhase::ClosingVerifier;return Observation<bool>::available(true);
+        }
         if(!state.verify){
             const OpenedEntry* target=stream_verifier_?&stream_verifier_->entry():verifier_.get();
             // Created directories with no ADS already retain an independent
@@ -439,7 +494,7 @@ void NativeDirectoryReplayJob::release_inputs() noexcept {
     stream_verifier_.reset();creator_.reset();writer_.reset();verifier_.reset();cursor_.reset();destination_.reset();
     journal_file_.reset();journal_.reset();source_scope_.reset();target_scope_.reset();
     request_.source.reset();request_.existing_destination.reset();request_.destination_parent.reset();
-    request_.verify_children={};request_.verify_plan={};
+    request_.verify_children={};request_.verify_plan={};request_.prepare_target_observation={};request_.observe_verified_target={};
     // Emergency release must not default-construct a fresh BasicMetadata (its
     // diagnostic strings can allocate). Scalar review values may stay cached.
     request_.reviewed_metadata.channels.clear();request_.reviewed_metadata.channel_evidence.reset();
@@ -527,6 +582,9 @@ DirectoryReplayProgress NativeDirectoryReplayJob::advance(std::stop_token stop) 
             if(!result.value()||!*result.value())break;
             progress_.phase=DirectoryReplayPhase::ClosingVerifier;break;
         case DirectoryReplayPhase::ClosingVerifier:
+            if(bounded_&&bounded_->native_target_proof){auto closed=bounded_->native_target_proof->finish_io();
+                if(!closed.value()){remember(*closed.unavailable_detail(),true);result=closed;break;}
+                if(!*closed.value()){result=reject("directory_replay.target_proof_finish_false",ObservationState::Failed,AdapterError::InvalidNativeResult);break;}}
             if(stream_verifier_) {
                 result=stream_verifier_->finish_io();if(!result.value()){remember(*result.unavailable_detail(),true);break;}
                 if(!*result.value())break;
@@ -539,7 +597,7 @@ DirectoryReplayProgress NativeDirectoryReplayJob::advance(std::stop_token stop) 
                  result=reject("directory_replay.after_verifier_close",ObservationState::Changed,AdapterError::MetadataChanged);break;
              }
              if(bounded_){
-                 const auto* values=bounded_->verify?bounded_->verify->observed_values():nullptr;
+                 const auto* values=bounded_->caller_values?&*bounded_->caller_values:bounded_->verify?bounded_->verify->observed_values():nullptr;
                  if(!values){result=reject("directory_replay.target_values_missing",ObservationState::Failed,AdapterError::InvalidNativeResult);break;}
                  verified_values_=*values;verified_values_->basic=basic;
              }}

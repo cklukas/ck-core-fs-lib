@@ -547,6 +547,11 @@ if(BUILD_TESTING)
         LABELS "windows;native;metadata;privileged"
         ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
       add_test(NAME native_tree_complete COMMAND ck_fs_native_tree_complete_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+      add_test(NAME native_tree_complete_caller COMMAND ck_fs_native_tree_complete_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}" --caller)
+      add_test(NAME native_tree_caller_distinct_owner COMMAND ck_fs_native_tree_complete_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}" --caller-owner-only)
+      set_tests_properties(native_tree_complete_caller native_tree_caller_distinct_owner PROPERTIES TIMEOUT 1200
+        LABELS "windows;native;metadata;privileged"
+        ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
       set_tests_properties(native_tree_complete PROPERTIES TIMEOUT 1200
         LABELS "windows;native;metadata;privileged"
         ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")

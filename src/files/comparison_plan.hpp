@@ -75,7 +75,7 @@ struct ComparisonMetadataDigest final {
 // Version1 requires an executor that performs fresh review-bound capture,
 // native creation/held-target binding and journaled postorder verification.
 // The generic planner and every legacy C adapter default to Unknown.
-enum class ComparisonDirectoryMetadataContract { Unknown, NativeOriginalPostorderV1 };
+enum class ComparisonDirectoryMetadataContract { Unknown, NativeOriginalPostorderV1, NativeCurrentCallerPostorderV1 };
 struct ComparisonEntry final {
     // Exact, lossless adapter comparison key, '/' separated relative components.
     // No empty, '.', '..', NUL or backslash components, absolute/drive paths.

@@ -104,7 +104,7 @@ bool object_fields_valid(const ComparisonObject& o) noexcept {
 }
 
 bool entry_fields_valid(const ComparisonEntry& e) noexcept {
-    return in_range(e.directory_metadata_contract,ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1) && object_fields_valid(e.object) && (!e.digest ||
+    return in_range(e.directory_metadata_contract,ComparisonDirectoryMetadataContract::NativeCurrentCallerPostorderV1) && object_fields_valid(e.object) && (!e.digest ||
         (in_range(e.digest->state, ComparisonDigestState::Failed) &&
          in_range(e.digest->algorithm, ComparisonDigestAlgorithm::Sha256) &&
          object_fields_valid(e.digest->before) && object_fields_valid(e.digest->after))) &&
@@ -117,7 +117,7 @@ bool entry_fields_valid(const ComparisonEntry& e) noexcept {
 
 bool options_valid(const ComparisonOptions& o) noexcept {
     const auto& f = o.filters;
-    return in_range(o.directory_metadata_contract,ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1) &&
+    return in_range(o.directory_metadata_contract,ComparisonDirectoryMetadataContract::NativeCurrentCallerPostorderV1) &&
         in_range(o.profile, ComparisonProfile::Compare) && in_range(o.mode, ComparisonMode::CompleteDigest) &&
         in_range(o.topology, ComparisonTopology::Overlap) && quantum_valid(o.timestamp_quantum_ns) &&
         !(f.allowed_kind_mask >> 10) && f.maximum_depth <= maximum_key_depth &&
@@ -285,9 +285,10 @@ void classify(ComparisonRow& row, const ComparisonEntry* s, const ComparisonEntr
     if (o.compare_preserved_metadata) {
         for (const auto* entry : {s, d}) if (entry) {
             if (entry->object.kind == ObjectKind::Directory &&
-                (o.directory_metadata_contract!=ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1 ||
+                (o.directory_metadata_contract==ComparisonDirectoryMetadataContract::Unknown ||
                  entry->directory_metadata_contract!=o.directory_metadata_contract || !entry->metadata_digest ||
-                 entry->metadata_digest->ownership!=ComparisonMetadataOwnership::Original)) {
+                 entry->metadata_digest->ownership!=(o.directory_metadata_contract==ComparisonDirectoryMetadataContract::NativeOriginalPostorderV1?
+                     ComparisonMetadataOwnership::Original:ComparisonMetadataOwnership::CurrentCaller))) {
                 unknown(row, ComparisonReason::DirectoryMetadataUnsupported); return;
             }
             if (auto problem = metadata_digest_problem(*entry)) { unknown(row, *problem); return; }

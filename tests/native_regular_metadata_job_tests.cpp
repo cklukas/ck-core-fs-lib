@@ -6,9 +6,14 @@
 #undef main
 #include "native_regular_metadata_job.hpp"
 #include "staging_file.hpp"
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #include "platform/prepared_journal_root_bridge.hpp"
 
 namespace {
+thread_local bool persistent_final_diagnostic_failure=false;
+thread_local unsigned persistent_diagnostic_attempts=0;
 NativeName regular_name(const char* text) {
 #ifdef _WIN32
     return *NativeName::from_windows(std::u16string(text,text+std::strlen(text)));
@@ -112,7 +117,12 @@ void regular_case(MetadataOwnership ownership,unsigned outcome) {
     NativeRegularMetadataRequest request;request.target=target.file.entry.get();request.source=source->proof;
     request.journal_root=state.root;request.read_limits={4096};request.verify_membership=[root=state.root](std::stop_token){return root->revalidate();};
     request.revalidate_source=[source](bool begin,std::stop_token stop){return source->revalidate(begin,stop);};
-    request.finish_source=[source]{return source->finish();};auto job=take(NativeRegularMetadataJob::create(std::move(request)));
+    request.finish_source=[source,outcome]{
+        auto closed=source->finish();
+        if(outcome==3){check(source->budget->retained_handle_reservations()==0,"persistent injection before source closes");
+            persistent_final_diagnostic_failure=true;}
+        return closed;
+    };auto job=take(NativeRegularMetadataJob::create(std::move(request)));
     if(outcome==1){std::stop_source stop;stop.request_stop();
         check(regular_step(*job,OperationMetadataState::ApplyingTraversal,stop.get_token())==OperationMetadataStep::Cancelled,"clean cancellation lost");
         check(job->progress().cancelled&&job->progress().worker_drained&&!job->progress().metadata_effects,"cancel did metadata work or retained consumers");
@@ -127,7 +137,7 @@ void regular_case(MetadataOwnership ownership,unsigned outcome) {
         check(take(job->verify(*target.file.entry)),"native regular guard failed");frame=false;
         check(native_reads==reads,"prepublication guard hid a bulk content read");
         check(take(target.file.entry->finish_content_writes()),"base staging writer close failed");
-        if(outcome==2) {
+        if(outcome>=2) {
 #ifdef _WIN32
             close_target.VolumeSerialNumber=0;std::memcpy(close_target.FileId.Identifier,target.identity.object.bytes.data(),16);
             std::memcpy(&close_target.VolumeSerialNumber,target.identity.volume.bytes.data(),sizeof(close_target.VolumeSerialNumber));
@@ -138,6 +148,23 @@ void regular_case(MetadataOwnership ownership,unsigned outcome) {
             close_hits=0;selected_closes=0;close_watch=true;close_armed=true;
         }
     }
+#ifdef _WIN32
+    if(outcome==3){
+        bool threw=false;try{(void)job->finish_io();}catch(const std::bad_alloc&){threw=true;}
+        persistent_final_diagnostic_failure=false;close_watch=false;close_armed=false;
+        check(threw&&persistent_diagnostic_attempts>0&&close_hits==1,"persistent diagnostic allocation was not exercised");
+        check(job->progress().worker_drained&&!job->progress().complete,"persistent diagnostic OOM lost POD drain state");
+        check(source->budget->retained_handle_reservations()==0,"persistent diagnostic OOM leaked native owners");
+        const auto native_closed=selected_closes.load();const auto reads=native_reads.load();
+        persistent_final_diagnostic_failure=true;threw=false;
+        try{(void)job->finish_io();}catch(const std::bad_alloc&){threw=true;}
+        persistent_final_diagnostic_failure=false;
+        check(threw&&selected_closes==native_closed&&native_reads==reads,"persistent cached failure performed native I/O");
+        const auto root_closed=state.root->finish_io();check(!root_closed.value()&&root_closed.unavailable_detail()->error.code==ERROR_READ_FAULT,
+            "persistent diagnostic OOM lost exact consumed native close error");
+        std::cout<<"native regular worker persistent all-allocation failure AFTER native closes; no MSVC proxy skipping PASS\n";return;
+    }
+#endif
     const auto closed=job->finish_io();close_watch=false;close_armed=false;
     if(outcome==2){check(!closed.value()&&close_hits==1,"consumed close error was lost");
         const auto reads=native_reads.load();check(!job->advance(OperationMetadataState::Flushing).value()&&native_reads==reads,"late failure became cached success or did I/O");
@@ -149,6 +176,30 @@ void regular_case(MetadataOwnership ownership,unsigned outcome) {
     std::cout<<"native regular metadata ownership="<<unsigned(ownership)<<" outcome="<<outcome<<" PASS\n";
 }
 }
+void* operator new(std::size_t size){
+    if(persistent_final_diagnostic_failure){++persistent_diagnostic_attempts;throw std::bad_alloc();}
+    if(auto* value=std::malloc(size?size:1))return value;throw std::bad_alloc();
+}
+void* operator new[](std::size_t size){return ::operator new(size);}
+void operator delete(void* value)noexcept{std::free(value);}
+void operator delete[](void* value)noexcept{std::free(value);}
+void operator delete(void* value,std::size_t)noexcept{std::free(value);}
+void operator delete[](void* value,std::size_t)noexcept{std::free(value);}
+#ifdef _WIN32
+void* operator new(std::size_t size,std::align_val_t alignment){
+    if(persistent_final_diagnostic_failure){++persistent_diagnostic_attempts;throw std::bad_alloc();}
+    if(auto* value=_aligned_malloc(size?size:1,static_cast<std::size_t>(alignment)))return value;throw std::bad_alloc();
+}
+void* operator new[](std::size_t size,std::align_val_t alignment){return ::operator new(size,alignment);}
+void operator delete(void* value,std::align_val_t)noexcept{_aligned_free(value);}
+void operator delete[](void* value,std::align_val_t)noexcept{_aligned_free(value);}
+void operator delete(void* value,std::size_t,std::align_val_t)noexcept{_aligned_free(value);}
+void operator delete[](void* value,std::size_t,std::align_val_t)noexcept{_aligned_free(value);}
+#endif
 int main(){try{regular_case(MetadataOwnership::Original,0);regular_case(MetadataOwnership::CurrentCaller,0);
-    regular_case(MetadataOwnership::Original,1);regular_case(MetadataOwnership::Original,2);return 0;
-}catch(const std::exception& e){frame=false;close_watch=false;close_armed=false;std::fprintf(stderr,"native_regular_metadata_job: %s\n",e.what());return 1;}}
+    regular_case(MetadataOwnership::Original,1);regular_case(MetadataOwnership::Original,2);
+#ifdef _WIN32
+    regular_case(MetadataOwnership::Original,3);
+#endif
+    return 0;
+}catch(const std::exception& e){persistent_final_diagnostic_failure=false;frame=false;close_watch=false;close_armed=false;std::fprintf(stderr,"native_regular_metadata_job: %s\n",e.what());return 1;}}
