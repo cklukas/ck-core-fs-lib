@@ -4,6 +4,7 @@
 #define CK_FS_TREE_H
 #include "ck_file_engine.h"
 #include "ck_fs_plan.h"
+#include "ck_fs_journal_root.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -133,6 +134,16 @@ typedef struct ckfet_page_v1 {
 CK_FILE_ENGINE_API void ckfet_options_init_v1(ckfet_options_v1 *options);
 CK_FILE_ENGINE_API ckfe_api_status ckfet_start_v1(const ckfe_entry *source_root,
     const ckfe_entry *destination_root, const ckfet_options_v1 *options, ckfet_job **out_job, ckfe_error *error);
+/* Retains a READY provider-owned journal-root capability before returning.
+ * Every journal open and replacement-retention preflight uses that held owner;
+ * options.journal_root is only a native navigation/encoding hint, never reopened.
+ * An empty hint uses the capability's cached hint when available. Mutation still
+ * requires a nonzero operation_id. A finishing/unready root returns NOT_READY;
+ * inspect ckfjr_poll_v1 for its preparation/finalization outcome. Compare ignores
+ * the mutation root and its namespace fields. No existing v1 layout changes. */
+CK_FILE_ENGINE_API ckfe_api_status ckfet_start_with_journal_root_v1(const ckfe_entry *source_root,
+    const ckfe_entry *destination_root, const ckfet_options_v1 *options, const ckfjr_root *journal_root,
+    ckfet_job **out_job, ckfe_error *error);
 CK_FILE_ENGINE_API ckfe_api_status ckfet_poll_v1(const ckfet_job *job, ckfet_snapshot_v1 *out_snapshot);
 /* Nonblocking shutdown completion. A terminal snapshot records the operation
  * outcome, including all required writes/flushes and any retained recovery

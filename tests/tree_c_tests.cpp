@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <thread>
 
@@ -53,6 +54,17 @@ void pause_ack(ckfet_job* job, std::uint32_t desired) {
     } while(std::chrono::steady_clock::now()<until);
     std::abort();
 }
+ckfjr_snapshot_v1 root_wait(ckfjr_root* root,bool final) {
+    const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+    do {
+        ckfjr_snapshot_v1 out;ckfjr_snapshot_init_v1(&out);
+        assert(ckfjr_poll_v1(root,&out)==CKFE_API_OK);
+        if(final?out.worker_drained:(out.state==CKFJR_READY||out.worker_drained))return out;
+        const auto status=ckfjr_wait_v1(root,50);
+        assert(status==CKFE_API_OK||status==CKFE_API_NOT_READY);
+    } while(std::chrono::steady_clock::now()<until);
+    std::abort();
+}
 }
 int main(int argc, char** argv) {
     assert(argc == 4);
@@ -64,10 +76,46 @@ int main(int argc, char** argv) {
     assert(ckfe_directory_open_utf8(engine, root.c_str(), 0, &parent, &e) == CKFE_API_OK);
     assert(ckfe_entry_open_utf8(parent, "source", &source, &e) == CKFE_API_OK);
     assert(ckfe_entry_open_utf8(parent, "target", &target, &e) == CKFE_API_OK);
+    const bool prepared=mode=="prepared_stale";
+    const bool compare=mode=="compare";
+    bool provision=prepared;
+#ifdef _WIN32
+    // Legacy pathname tests adopt a directory already privately provisioned
+    // by the real worker. The tree operation never secures a scanned folder.
+    provision=!compare;
+#endif
+    ckfjr_root* journal_owner=nullptr;
+    if(provision) {
+        ckfjr_options_v1 setup;ckfjr_options_init_v1(&setup);
+        setup.parent=parent;setup.disposition=CKFJR_PROVISION_CHILD;
+#ifdef _WIN32
+        const char16_t component[]=u"journals";
+        setup.child.encoding=CKFJR_UTF16;setup.child.data=component;setup.child.byte_count=sizeof(component)-sizeof(char16_t);
+#else
+        setup.child.data="journals";setup.child.byte_count=8;
+#endif
+        assert(ckfjr_start_v1(&setup,&journal_owner)==CKFE_API_OK&&journal_owner);
+        const auto ready=root_wait(journal_owner,false);
+        if(ready.state!=CKFJR_READY)std::fprintf(stderr,"root prepare failed %u/%u/%lld %s\n",ready.failure_state,ready.failure_domain,(long long)ready.failure_code,ready.failure_operation);
+        assert(ready.state==CKFJR_READY&&!ready.worker_drained);
+        assert(ready.directory_creates==1&&ready.flushed_directories>0);
+        if(prepared) {
+            ckfjr_root* alias=nullptr;assert(ckfjr_retain_v1(journal_owner,&alias)==CKFE_API_OK&&alias);
+            ckfjr_release(journal_owner);journal_owner=alias;
+        } else {
+            // Release every provision-worker handle before the legacy tree
+            // worker adopts the same existing private directory independently.
+            assert(ckfjr_finish_v1(journal_owner)==CKFE_API_OK);
+            const auto final=root_wait(journal_owner,true);
+            if(final.state!=CKFJR_COMPLETE)std::fprintf(stderr,"fixture root finish failed %u/%u/%lld %s\n",final.failure_state,final.failure_domain,(long long)final.failure_code,final.failure_operation);
+            assert(final.state==CKFJR_COMPLETE&&final.worker_drained&&!final.recovery_required);
+            ckfjr_release(journal_owner);journal_owner=nullptr;
+            std::fprintf(stderr,"fixture private journal provisioned and worker drained\n");
+        }
+    }
     ckfet_options_v1 o{}; ckfet_options_init_v1(&o);
     assert(o.version == CKFET_VERSION && o.struct_size == sizeof(o));
     o.profile = CKFSP_COPY; o.allow_metadata_loss = 1; o.operation_id[0] = 37;
-    const bool compare=mode=="compare";
     if(compare) {o.profile=CKFSP_COMPARE;o.allow_metadata_loss=0;o.metadata_scope=CKFE_METADATA_COMPLETE_V1;}
 #ifdef _WIN32
     // Fixture arguments are UTF-8 from Python. Convert at the test boundary,
@@ -89,10 +137,26 @@ int main(int argc, char** argv) {
             assert(ckfet_start_v1(source,target,&mutating,&refused,&e)==CKFE_API_INVALID_ARGUMENT&&!refused);
         }
     }
+    // This validly encoded but nonexistent hint must never be opened. Native
+    // authority is the prepared root acquired independently through its owner.
+#ifdef _WIN32
+    const auto unused_hint=root+"\\not-the-journal-root";
+    const std::u16string unused_hint_wide(unused_hint.begin(),unused_hint.end());
+#else
+    const auto unused_hint=root+"/not-the-journal-root";
+#endif
+    if(prepared) {
+#ifdef _WIN32
+        o.journal_root={unused_hint_wide.data(),unused_hint_wide.size(),CKFET_UTF16,0};
+#else
+        o.journal_root={unused_hint.data(),unused_hint.size(),CKFET_POSIX_BYTES,0};
+#endif
+    }
     ckfet_job* job = reinterpret_cast<ckfet_job*>(1);
     auto invalid = o; invalid.reserved = 1;
     assert(ckfet_start_v1(source, target, &invalid, &job, &e) == CKFE_API_INVALID_ARGUMENT && job == nullptr);
-    assert(ckfet_start_v1(source, target, &o, &job, &e) == CKFE_API_OK && job);
+    assert((prepared?ckfet_start_with_journal_root_v1(source,target,&o,journal_owner,&job,&e):
+        ckfet_start_v1(source,target,&o,&job,&e))==CKFE_API_OK&&job);
     // A running job owns both roots after these public owners are destroyed.
     ckfe_entry_destroy(source); ckfe_entry_destroy(target);
     ckfe_directory_destroy(parent); ckfe_engine_destroy(engine);
@@ -182,7 +246,7 @@ int main(int argc, char** argv) {
     s = wait(job, true); assert(s.command_state == CKFET_COMMAND_ACCEPTED && s.receipt_id != old_receipt);
     assert(ckfet_acknowledge_command_v1(job,s.command_id) == CKFE_API_OK);
     assert(ckfet_execute_v1(job, s.plan_generation, old_receipt, &command) == CKFE_API_STALE_PLAN && !command);
-    if (mode == "stale") { std::puts("REVIEWED"); std::fflush(stdout); assert(std::getchar() == 'x'); }
+    if (mode == "stale"||prepared) { std::puts("REVIEWED"); std::fflush(stdout); assert(std::getchar() == 'x'); }
     assert(ckfet_execute_v1(job, s.plan_generation, s.receipt_id, &command) == CKFE_API_OK);
     s = wait(job, true); show(s);
     if (s.command_state == CKFET_COMMAND_ACCEPTED) {
@@ -193,7 +257,7 @@ int main(int argc, char** argv) {
         }
     }
     show(s);
-    if (mode == "stale") assert(s.state != CKFET_COMPLETE && s.state >= CKFET_COMPLETE);
+    if (mode == "stale"||prepared) assert(s.state != CKFET_COMPLETE && s.state >= CKFET_COMPLETE);
     else assert(s.state == CKFET_COMPLETE && !s.recovery_required && !s.failed_items);
     if (keep_both) {
         std::uint32_t encoding = 0;
@@ -204,5 +268,14 @@ int main(int argc, char** argv) {
     assert(ckfet_drain_v1(job, events, 64, &count, &coalesced) == CKFE_API_OK && count);
     for (std::uint64_t i = 1; i < count; ++i) assert(events[i].sequence > events[i-1].sequence);
     assert(ckfet_poll_v1(job, &s) == CKFE_API_OK && s.state >= CKFET_COMPLETE);
-    drained(job); ckfet_release(job); ckfe_error_free(&e);
+    drained(job);
+    if(journal_owner) {
+        assert(ckfjr_finish_v1(journal_owner)==CKFE_API_OK);
+        const auto final=root_wait(journal_owner,true);assert(final.state==CKFJR_COMPLETE&&final.worker_drained);
+        // Keep the terminal tree handle while the root closes. Cached result
+        // paging must neither retain native authority nor perform native I/O.
+        assert(ckfet_page_v1_get(job,s.plan_generation,0,rows,32,&p)==CKFE_API_OK&&p.row_count);
+        ckfjr_release(journal_owner);
+    }
+    ckfet_release(job); ckfe_error_free(&e);
 }

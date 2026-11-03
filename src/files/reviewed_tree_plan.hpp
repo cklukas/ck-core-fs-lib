@@ -23,6 +23,8 @@ struct ReviewedTreePlanRequest final {
     std::function<Observation<std::unique_ptr<OperationJournalFile>>(
         const NativeAbsolutePath&, const NativeName&, bool)> open_journal;
     std::size_t digest_chunk_bytes = 64 * 1024;
+    // Typed native authority; journal_root remains a navigation/encoding hint.
+    std::shared_ptr<PreparedJournalRoot> prepared_journal_root = {};
 };
 
 enum class ReviewedTreeState {

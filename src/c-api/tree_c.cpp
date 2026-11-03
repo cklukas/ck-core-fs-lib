@@ -3,6 +3,8 @@
 #include "ck_fs_tree.h"
 #include "native_handles.hpp"
 #include "reviewed_tree_plan.hpp"
+#include "prepared_journal_root.hpp"
+#include "journal_root_handles.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -254,13 +256,9 @@ void progress(Shared& s, const ReviewedTreePlanJob& job) {
 }
 void worker_body(std::shared_ptr<Shared> s, ReviewedTreePlanRequest request) noexcept {
     try {
-        if(request.comparison.profile!=ComparisonProfile::Compare) {
-            auto prepared = prepare_native_operation_journal_root(*request.journal_root);
-            if (!prepared.value()) {
-                std::lock_guard lock(s->mutex); s->set_failure(*prepared.unavailable_detail());
-                s->snapshot.state = CKFET_FAILED; s->terminal = true; s->publish(); return;
-            }
-        }
+        // Core adoption/scope checks run on this worker before inventory. A
+        // separate pathname preflight could chmod an overlapping user folder
+        // and reopen a different object; it cannot precede that native check.
         auto made = ReviewedTreePlanJob::create(std::move(request));
         if (!made.value()) {
             std::lock_guard lock(s->mutex); s->set_failure(*made.unavailable_detail());
@@ -391,8 +389,11 @@ void ckfet_options_init_v1(ckfet_options_v1* o) {
     o->limits = {l.max_entries, l.max_path_bytes, l.max_total_path_bytes, l.max_exclusions, l.max_page_rows, l.max_aggregate_bytes};
     o->filters.allowed_kind_mask = CKFSP_ALL_KINDS; o->filters.maximum_depth = 1024;
 }
-ckfe_api_status ckfet_start_v1(const ckfe_entry* src, const ckfe_entry* dst,
-    const ckfet_options_v1* o, ckfet_job** out, ckfe_error* e) {
+}
+namespace {
+ckfe_api_status start_tree(const ckfe_entry* src, const ckfe_entry* dst,
+    const ckfet_options_v1* o, std::shared_ptr<PreparedJournalRoot> root,
+    ckfet_job** out, ckfe_error* e) {
     if (out) *out = nullptr; clear(e);
     return boundary([&] {
         require(out && src && src->child && dst && dst->child && o && o->version == CKFET_VERSION &&
@@ -415,9 +416,17 @@ ckfe_api_status ckfet_start_v1(const ckfe_entry* src, const ckfe_entry* dst,
         metadata.allow_privilege_metadata = o->allow_privilege_metadata;
         r.copy_policy.metadata_policy = metadata;
         if(!reporting) {
-            r.journal_root = path(o->journal_root);
+            if(root && !o->journal_root.data && !o->journal_root.units && root->navigation_address())
+                r.journal_root=*root->navigation_address();
+            else r.journal_root = path(o->journal_root);
             std::memcpy(r.journal_id.bytes.data(), o->operation_id, sizeof(o->operation_id));
-            r.open_journal = open_native_operation_journal_file;
+            if(root) {
+                require(root->encoding()==r.journal_root->encoding());
+                r.prepared_journal_root=root;
+                r.open_journal=[root=std::move(root)](const NativeAbsolutePath&,const NativeName& name,bool create){
+                    return open_prepared_operation_journal_file(*root,name,create);
+                };
+            } else r.open_journal = open_native_operation_journal_file;
         }
         auto result = std::make_unique<ckfet_job>(); result->state = std::make_shared<Shared>();
         result->state->page_limit = r.limits.max_page_rows;
@@ -426,6 +435,25 @@ ckfe_api_status ckfet_start_v1(const ckfe_entry* src, const ckfe_entry* dst,
         std::thread t(worker, result->state, std::move(r),std::move(slot));
         try { t.detach(); } catch (...) { result->state->stop.request_stop(); result->state->cv.notify_all(); t.join(); throw; }
         *out = result.release(); return CKFE_API_OK;
+    });
+}
+}
+extern "C" {
+ckfe_api_status ckfet_start_v1(const ckfe_entry* src,const ckfe_entry* dst,
+    const ckfet_options_v1* o,ckfet_job** out,ckfe_error* e) {
+    return start_tree(src,dst,o,{},out,e);
+}
+ckfe_api_status ckfet_start_with_journal_root_v1(const ckfe_entry* src,const ckfe_entry* dst,
+    const ckfet_options_v1* o,const ckfjr_root* root,ckfet_job** out,ckfe_error* e) {
+    if(out)*out=nullptr;clear(e);
+    return boundary([&] {
+        // Compare has no mutation-root dependency, including through this
+        // additive entry point. Validate its ordinary options in start_tree.
+        if(o && o->profile==CKFSP_COMPARE)return start_tree(src,dst,o,{},out,e);
+        require(out && root);
+        auto retained=retain_prepared_journal_root(root);
+        if(!retained.value())return CKFE_API_NOT_READY;
+        return start_tree(src,dst,o,std::move(retained).take_value(),out,e);
     });
 }
 ckfe_api_status ckfet_poll_v1(const ckfet_job* j, ckfet_snapshot_v1* out) {

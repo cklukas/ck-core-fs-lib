@@ -285,11 +285,11 @@ ckfe_api_status start_job(Start &&start, ckfe_job **out, ckfe_error *error,
 
 extern "C" {
 
-const char *ckfe_version(void) { return "0.3.0"; }
+const char *ckfe_version(void) { return "0.4.0"; }
 
 uint32_t ckfe_abi_version_major(void) { return 0; }
 
-uint32_t ckfe_abi_version_minor(void) { return 3; }
+uint32_t ckfe_abi_version_minor(void) { return 4; }
 
 const char *ckfe_api_status_name(ckfe_api_status status) {
     switch (status) {

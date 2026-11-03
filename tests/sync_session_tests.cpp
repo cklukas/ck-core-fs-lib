@@ -426,11 +426,23 @@ struct Fixture {
         const auto temp_length=GetEnvironmentVariableW(L"TEMP",temp,32768);
         const auto tmp_length=GetEnvironmentVariableW(L"TMP",tmp,32768);
         CHECK(temp_length>0 && temp_length<32768 && tmp_length>0 && tmp_length<32768);
-        CHECK(std::wstring_view(temp)==tmp && windows_extended_path(temp).has_value());
-        if(const auto* require_v=std::getenv("CK_FS_REQUIRE_V_DEV_DRIVE"); require_v && std::string_view(require_v)=="1")
-            CHECK(std::wstring_view(temp).starts_with(L"V:\\tmp\\"));
+        const auto normalized=[](std::wstring path) {
+            std::replace(path.begin(),path.end(),L'/',L'\\');
+            const auto letter=[](wchar_t c){return (c>=L'A'&&c<=L'Z')||(c>=L'a'&&c<=L'z');};
+            // Strip only an extended DOS prefix, never UNC/device namespaces.
+            if(path.size()>=7&&path.starts_with(L"\\\\?\\")&&letter(path[4])&&path[5]==L':'&&path[6]==L'\\')path.erase(0,4);
+            if(path.size()>=3&&path[1]==L':'&&path[2]==L'\\'&&path[0]>=L'a'&&path[0]<=L'z')path[0]-=L'a'-L'A';
+            return path;
+        };
+        const auto temp_path=normalized(std::wstring(temp,temp_length)),tmp_path=normalized(std::wstring(tmp,tmp_length));
+        CHECK(temp_path==tmp_path && windows_extended_path(temp_path).has_value());
+        if(const auto* require_v=std::getenv("CK_FS_REQUIRE_V_DEV_DRIVE"); require_v && std::string_view(require_v)=="1") {
+            const auto drive=GetFileAttributesW(L"V:\\");
+            CHECK(drive!=INVALID_FILE_ATTRIBUTES && (drive&FILE_ATTRIBUTE_DIRECTORY));
+            CHECK(std::wstring_view(temp_path).starts_with(L"V:\\tmp\\"));
+        }
         static unsigned serial=0;
-        base=std::wstring(temp)+L"\\native-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(++serial)+L"-"+std::to_wstring(GetTickCount64());
+        base=temp_path+L"\\native-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(++serial)+L"-"+std::to_wstring(GetTickCount64());
         add(base); store=base+L"\\store"; left=base+L"\\left"; right=base+L"\\right"; other=base+L"\\other";
         add(left); add(right); add(other);
         HANDLE raw=nullptr; CHECK(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw));

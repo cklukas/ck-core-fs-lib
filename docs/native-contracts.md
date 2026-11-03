@@ -1,6 +1,6 @@
 # Native execution contracts
 
-The 0.3 API separates caller-fact previews from native execution. A
+The 0.4 API separates caller-fact previews from native execution. A
 `ckfsp_plan` remains a preview only. It cannot be converted into mutation
 authority. Native workers retain roots, enumerate exact components, hash
 content, freeze their observations, and obtain their own reviewed receipts.
@@ -111,6 +111,21 @@ metadata convergence, links, and other unsupported kinds require their own
 native contracts. Do not infer complete two-way tree execution from the durable
 store or regular-path receipt APIs.
 
+## Owned journal-root lifecycle
+
+The 0.4 root factory adopts or provisions a private native directory, retains
+its native ancestry and performs required durability barriers on its worker.
+Only a Ready capability may be shared with operations. The root's displayed
+address is a navigation hint; tree operation journals and their consumers
+use the same held native owner. A per-journal duplicate is closed independently.
+
+Finishing a root stops new consumer acquisition and waits for existing shared
+consumers. Drain consumers first, then finish and drain the root. Poll the
+final root outcome for delayed flush/close errors before exit. Cached terminal
+tree pages can outlive the tree worker without retaining native root authority.
+Provisioning cancellation preserves created evidence rather than attempting
+name-based cleanup. See the [C lifecycle contract](c-api.md#owned-journal-roots).
+
 ## Action jobs and qualification
 
 `ck_fs_actions.h` defines worker-owned batch rename, native Trash/restore, and
@@ -135,10 +150,20 @@ require reconciliation and never turn into successful completion. Descriptors
 are consumed before close and never retried after EINTR or another ambiguous
 close result.
 
+Failure and cancellation also finalize the private data writer and journal
+before a terminal execution result is exposed. A child already at a completed
+phase is advanced through its stopped parent transitions before its native
+owners are released. Finalizers run at most once, including when they throw;
+all remaining owned closes are attempted and the first error remains visible.
+A finalization failure changes cancellation into a reconciliation result.
+Finalization grants no publication, source deletion, or staging-name cleanup
+authority.
+
 Journal flush includes both the file and its retained parent directory, so a
 successful record does not depend on an unflushed journal entry. Darwin also
-requires `F_FULLFSYNC`. The caller must durably provision the journal root and
-its ancestors before handing it to the library. These calls and fault tests do
+requires `F_FULLFSYNC`. Legacy pathname callers must durably provision the
+journal root and its ancestors before handing it to the library; the 0.4
+capability factory owns those preparation barriers. These calls and fault tests do
 not establish physical power-loss qualification.
 
 Linux staging uses `O_TMPFILE` and publishes the held object with a no-replace

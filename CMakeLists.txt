@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(ck-core-fs-lib VERSION 0.3.0 LANGUAGES C CXX)
-
+project(ck-core-fs-lib VERSION 0.4.0 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -67,6 +66,7 @@ set(CK_CORE_FS_SOURCES
   src/files/operation_execution_job.cpp
   src/files/operation_journal.cpp
   src/files/operation_journal_file.cpp
+  src/files/prepared_journal_root.cpp
   src/files/operation_metadata_job.cpp
   src/files/operation_plan_assembly.cpp
   src/files/operation_planning_coordinator.cpp
@@ -135,10 +135,14 @@ if(CK_CORE_FS_BUILD_BROWSER)
 endif()
 
 add_library(ck_files_platform STATIC)
+target_sources(ck_files_platform PRIVATE src/files/private_journal_scope.cpp
+  src/files/private_journal_membership.cpp)
 set_target_properties(ck_files_platform PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(WIN32)
   target_sources(ck_files_platform PRIVATE
     src/files/platform/metadata_windows.cpp
+    src/files/platform/private_journal_scope_windows.cpp
+    src/files/platform/private_journal_membership_windows.cpp
     src/files/platform/index_file_windows.cpp
     src/files/platform/operation_journal_file_windows.cpp
     src/files/platform/sync_session_windows.cpp
@@ -148,6 +152,8 @@ if(WIN32)
 else()
   target_sources(ck_files_platform PRIVATE
     src/files/platform/metadata_posix.cpp
+    src/files/platform/private_journal_scope_posix.cpp
+    src/files/platform/private_journal_membership_posix.cpp
     src/files/platform/index_file_posix.cpp
     src/files/platform/operation_journal_file_posix.cpp
     src/files/platform/sync_session_posix.cpp
@@ -172,7 +178,8 @@ target_link_libraries(ck_core_fs_native PUBLIC ck_files_platform)
 target_compile_features(ck_core_fs_native PUBLIC cxx_std_20)
 
 add_library(ck_file_engine_c_objects OBJECT src/c-api/ck_file_engine.cpp src/c-api/preservation_policy_c.cpp
-  src/c-api/comparison_plan_c.cpp src/c-api/tree_c.cpp src/c-api/actions_c.cpp src/c-api/session_c.cpp)
+  src/c-api/comparison_plan_c.cpp src/c-api/tree_c.cpp src/c-api/actions_c.cpp src/c-api/session_c.cpp
+  src/c-api/journal_root_c.cpp)
 set_target_properties(ck_file_engine_c_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(ck_file_engine_c_objects PRIVATE cxx_std_20)
 target_compile_definitions(ck_file_engine_c_objects PRIVATE CK_FILE_ENGINE_BUILD)
@@ -193,7 +200,12 @@ endif()
 set_target_properties(ck_file_engine_c PROPERTIES
   OUTPUT_NAME ck-core-fs-lib
   VERSION ${PROJECT_VERSION}
-  SOVERSION 0)
+  SOVERSION 0.4)
+if(WIN32)
+  # An older 0.3 DLL must not satisfy a new consumer's required imports.
+  # Keep the import-library/CMake target name stable; version the runtime DLL.
+  set_target_properties(ck_file_engine_c PROPERTIES RUNTIME_OUTPUT_NAME ck-core-fs-lib-0.4)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
@@ -219,6 +231,28 @@ if(BUILD_TESTING)
   target_link_libraries(ck_core_fs_c_abi_tests PRIVATE ck_file_engine_c)
   target_include_directories(ck_core_fs_c_abi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME ck_core_fs_c_abi_tests COMMAND ck_core_fs_c_abi_tests)
+  add_executable(ck_fs_journal_root_c_abi_tests tests/journal_root_c_smoke.c)
+  target_compile_definitions(ck_fs_journal_root_c_abi_tests PRIVATE CKFJR_C_SMOKE_MAIN)
+  target_link_libraries(ck_fs_journal_root_c_abi_tests PRIVATE ck_file_engine_c)
+  add_test(NAME journal_root_c_abi COMMAND ck_fs_journal_root_c_abi_tests)
+  add_executable(ck_fs_journal_root_c_native_tests tests/journal_root_c_native.c)
+  target_link_libraries(ck_fs_journal_root_c_native_tests PRIVATE ck_file_engine_c)
+  add_test(NAME journal_root_c_native COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py $<TARGET_FILE:ck_fs_journal_root_c_native_tests>
+    ${CK_CORE_FS_NATIVE_TEST_ROOT})
+  set_tests_properties(journal_root_c_native PROPERTIES TIMEOUT 180
+    ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ck_fs_journal_root_statx_tests tests/journal_root_statx_tests.cpp)
+    target_link_libraries(ck_fs_journal_root_statx_tests PRIVATE ck_core_fs_native)
+    target_compile_options(ck_fs_journal_root_statx_tests PRIVATE -UNDEBUG)
+    target_link_options(ck_fs_journal_root_statx_tests PRIVATE -Wl,--wrap=statx)
+    add_test(NAME journal_root_statx COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py $<TARGET_FILE:ck_fs_journal_root_statx_tests>
+      ${CK_CORE_FS_NATIVE_TEST_ROOT})
+    set_tests_properties(journal_root_statx PROPERTIES TIMEOUT 60
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  endif()
   add_executable(ck_fs_preservation_policy_tests tests/preservation_policy_tests.cpp)
   target_compile_definitions(ck_fs_preservation_policy_tests PRIVATE CK_FS_POLICY_STATIC)
   target_link_libraries(ck_fs_preservation_policy_tests PRIVATE ck_file_engine_c_test_support)
@@ -256,6 +290,13 @@ if(BUILD_TESTING)
     add_test(NAME ${suite} COMMAND ck_fs_${suite}_tests)
   endforeach()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ck_fs_private_journal_scope_mounts_tests tests/private_journal_scope_mounts.cpp)
+    target_link_libraries(ck_fs_private_journal_scope_mounts_tests PRIVATE ck_core_fs_native)
+    add_test(NAME private_journal_scope_mounts COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_private_scope_mounts.py
+      $<TARGET_FILE:ck_fs_private_journal_scope_mounts_tests> ${CK_CORE_FS_NATIVE_TEST_ROOT})
+    set_tests_properties(private_journal_scope_mounts PROPERTIES TIMEOUT 180
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
     add_executable(ck_fs_native_staging_tests tests/native_staging_tests.cpp)
     target_link_libraries(ck_fs_native_staging_tests PRIVATE ck_core_fs_native)
     target_compile_options(ck_fs_native_staging_tests PRIVATE -UNDEBUG)
@@ -282,16 +323,19 @@ if(BUILD_TESTING)
   else()
     target_compile_options(ck_fs_tree_c_tests PRIVATE -UNDEBUG)
   endif()
-  foreach(tree_case copy stale cancel cancelreview keepboth compare)
+  foreach(tree_case copy stale cancel cancelreview keepboth compare prepared_stale)
     add_test(NAME tree_c_${tree_case} COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tree_c.py $<TARGET_FILE:ck_fs_tree_c_tests>
       ${CK_CORE_FS_NATIVE_TEST_ROOT} ${tree_case})
     set_tests_properties(tree_c_${tree_case} PROPERTIES TIMEOUT 60
       ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   endforeach()
-  foreach(native_suite metadata_replay reviewed_tree_plan sync_session actions_c retained_target)
+  foreach(native_suite metadata_replay reviewed_tree_plan sync_session actions_c retained_target prepared_journal_root private_journal_scope private_journal_membership)
     add_executable(ck_fs_${native_suite}_tests tests/${native_suite}_tests.cpp)
-    if(native_suite STREQUAL "actions_c" OR native_suite STREQUAL "sync_session")
+    if(native_suite STREQUAL "prepared_journal_root")
+      target_sources(ck_fs_${native_suite}_tests PRIVATE tests/journal_root_c_smoke.c)
+    endif()
+    if(native_suite STREQUAL "actions_c" OR native_suite STREQUAL "sync_session" OR native_suite STREQUAL "prepared_journal_root")
       target_link_libraries(ck_fs_${native_suite}_tests PRIVATE ck_file_engine_c_test_support)
     else()
       target_link_libraries(ck_fs_${native_suite}_tests PRIVATE ck_core_fs_native)
@@ -302,7 +346,7 @@ if(BUILD_TESTING)
     else()
       target_compile_options(ck_fs_${native_suite}_tests PRIVATE -UNDEBUG)
     endif()
-    if(native_suite STREQUAL "actions_c" OR native_suite STREQUAL "retained_target")
+    if(native_suite STREQUAL "actions_c" OR native_suite STREQUAL "retained_target" OR native_suite STREQUAL "prepared_journal_root" OR native_suite STREQUAL "private_journal_scope" OR native_suite STREQUAL "private_journal_membership")
       add_test(NAME ${native_suite} COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py $<TARGET_FILE:ck_fs_${native_suite}_tests>
         ${CK_CORE_FS_NATIVE_TEST_ROOT})
@@ -315,6 +359,14 @@ if(BUILD_TESTING)
   add_test(NAME reviewed_tree_compare COMMAND ck_fs_reviewed_tree_plan_tests --compare-review-only)
   set_tests_properties(reviewed_tree_compare PROPERTIES TIMEOUT 60
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  add_test(NAME reviewed_tree_private_journal_scope COMMAND ck_fs_reviewed_tree_plan_tests --private-journal-scope)
+  set_tests_properties(reviewed_tree_private_journal_scope PROPERTIES TIMEOUT 180
+    ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME reviewed_tree_cancel_writer_finish COMMAND ck_fs_reviewed_tree_plan_tests --cancel-writer-finish)
+    set_tests_properties(reviewed_tree_cancel_writer_finish PROPERTIES TIMEOUT 180
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  endif()
 endif()
 
 set(CK_CORE_FS_INSTALL_TARGETS ck_core_fs_engine ck_files_platform ck_core_fs_native ck_file_engine_c)

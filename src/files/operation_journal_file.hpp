@@ -12,6 +12,8 @@
 
 namespace ck::files {
 
+class PreparedJournalRoot;
+
 // A worker-owned durable byte file. The native adapter is responsible for
 // opening an exclusively addressed, private regular file and for retaining
 // the handle until the worker finishes. It must never reopen a path between
@@ -48,6 +50,12 @@ Observation<bool> append_operation_journal_file(
 // create_new=true refuses an existing file; false opens an existing file only.
 Observation<std::unique_ptr<OperationJournalFile>> open_native_operation_journal_file(
     const NativeAbsolutePath& private_root, const NativeName& basename, bool create_new);
+
+// Additive retained-capability entry point. Never resolves private_root's
+// former navigation address. Keep the shared PreparedJournalRoot owner alive
+// until this journal has completed finish_io(). Worker-only.
+Observation<std::unique_ptr<OperationJournalFile>> open_prepared_operation_journal_file(
+    PreparedJournalRoot& private_root, const NativeName& basename, bool create_new);
 
 // Establish and verify the platform-private journal-root contract before
 // workers open individual journals. This may tighten an app-owned directory's

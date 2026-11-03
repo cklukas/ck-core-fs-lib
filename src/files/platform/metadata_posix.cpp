@@ -5,6 +5,7 @@
 #endif
 #include "native_filesystem.hpp"
 #include "native_home.hpp"
+#include "native_journal_directory_bridge.hpp"
 #include "metadata_replay.hpp"
 #include "linux_anonymous_staging.hpp"
 
@@ -1539,6 +1540,17 @@ public:
     PosixDirectoryCursor(OwnedDirectory directory, Observation<ObjectIdentity> identity, AdapterScope scope)
         : DirectoryCursor(std::move(identity)), directory_(std::move(directory)), scope_(std::move(scope)) {}
     Observation<AdapterScope> source_scope() const override { return Observation<AdapterScope>::available(scope_); }
+    Observation<int> duplicate_journal_directory() const {
+        auto current=inspect_basic();
+        if(!current.value())return Observation<int>::unavailable(current.state(),current.unavailable_detail()->error);
+        if(!identity().value()||!current.value()->identity.value()||
+            compare_identity(*identity().value(),*current.value()->identity.value())!=IdentityComparison::Same)
+            return Observation<int>::unavailable(ObservationState::Changed,
+                adapter_error(AdapterError::MetadataChanged,"journal_root.cursor_changed"));
+        const int duplicate=fcntl(dirfd(directory_.get()),F_DUPFD_CLOEXEC,0);
+        if(duplicate<0)return Observation<int>::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"journal_root.duplicate_cursor"});
+        return Observation<int>::available(duplicate);
+    }
     Observation<BasicMetadata> inspect_basic() const override {
 #if defined(__linux__)
         return statx_metadata(dirfd(directory_.get()), "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, scope_);
@@ -2406,6 +2418,13 @@ Observation<bool> PosixOpenedEntry::publish_noreplace(const DirectoryCursor& des
 }
 
 } // namespace
+
+Observation<int> detail::duplicate_posix_journal_directory(const DirectoryCursor& cursor) {
+    const auto* native=dynamic_cast<const PosixDirectoryCursor*>(&cursor);
+    if(!native)return Observation<int>::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::UnsupportedQuery,"journal_root.native_cursor_required"));
+    return native->duplicate_journal_directory();
+}
 
 Observation<BasicMetadata> NativeFileSystem::inspect_basic(const std::filesystem::path& path) const {
     const auto address = NativeAbsolutePath::from_host(path);

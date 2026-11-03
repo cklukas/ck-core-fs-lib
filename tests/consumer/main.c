@@ -12,7 +12,10 @@ int main(void) {
     ckfe_error error;
     ckfe_error_init(&error);
     assert(ckfe_abi_version_major() == 0);
-    assert(ckfe_abi_version_minor() >= 3);
+    assert(ckfe_abi_version_minor() >= 4);
+    ckfjr_options_v1 root_options;ckfjr_options_init_v1(&root_options);
+    ckfjr_root *root_owner=(ckfjr_root *)(uintptr_t)1;
+    assert(ckfjr_start_v1(&root_options,&root_owner)==CKFE_API_INVALID_ARGUMENT&&root_owner==NULL);
     ckfe_engine *engine = NULL;
     assert(ckfe_engine_create(&engine) == CKFE_API_OK);
     assert(engine != NULL);

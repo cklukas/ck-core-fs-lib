@@ -1,8 +1,9 @@
 # C API
 
 The entry header is [`include/ck_file_engine.h`](../include/ck_file_engine.h).
-`ck_fs_tree.h`, `ck_fs_actions.h`, and `ck_fs_session.h` expose native reviewed
-execution, action jobs, and durable sessions. All headers are usable from C and C++ and contain no C++ types, exceptions, STL
+`ck_fs_tree.h`, `ck_fs_actions.h`, `ck_fs_session.h` and
+`ck_fs_journal_root.h` expose native reviewed execution, action jobs, durable
+sessions and owned journal roots. All headers are usable from C and C++ and contain no C++ types, exceptions, STL
 containers, or frontend types.
 
 ## Ownership
@@ -28,8 +29,11 @@ runtime allocator.
 
 ## Jobs
 
-Library 0.3 exposes ABI minor 3 with additive native execution and session
-interfaces. Existing handles and snapshot layouts are unchanged.
+The 0.4 interface exposes ABI minor 4. Existing handles and snapshot layouts
+are unchanged. The shared runtime identity includes 0.4 (`libck-core-fs-lib.0.4`
+on Unix and `ck-core-fs-lib-0.4.dll` on Windows). An older runtime cannot
+satisfy the new exports. Use the installed CMake package and verify the actual
+runtime identity before use.
 
 Start functions return quickly. `CKFE_API_OK` means a non-null job handle was
 created; a rejected operation returns `CKFE_API_OPERATION_UNAVAILABLE` and a
@@ -122,6 +126,62 @@ destination.
 commit receipts. Open retains both root locks, including overlap protection;
 commit is generation-checked and crash recovery preserves uncertain evidence.
 These baseline primitives do not substitute for a composed two-way executor.
+
+## Owned journal roots
+
+Initialize `ckfjr_options_v1`, retain a held parent directory and select
+`ADOPT_HELD`, `ADOPT_CHILD` or `PROVISION_CHILD`. Start returns promptly;
+preparation, privacy/ancestry checks and durability barriers run on the owned
+worker. Only `CKFJR_READY` permits acquiring a consumer. Provisioning preserves
+a failed or cancelled created directory for explicit recovery; it never removes
+an object through a name that may have changed.
+
+`ckfjr_start_v1` returning Busy or InvalidArgument with a null output is a
+pre-worker admission/argument failure: no preparation or provisioning ran.
+OutOfMemory and Exception do not establish that guarantee. A failure after
+worker creation requests stop and joins before returning, but may already have
+created recovery evidence. A null output alone never authorizes cleanup.
+
+Pass the root to the additive tree entry point rather than
+reopening its displayed address. The capability owns the native directory;
+pathname fields are navigation hints only where that API permits them. Retain
+and poll are memory-only. A consumer finishes its own journal duplicates and
+releases its shared root owner; it does not finish the common root.
+
+For shutdown, cancel or complete each consumer and observe its worker drain.
+Then request `ckfjr_finish_v1`, continue polling until root worker drain, and
+inspect the final root snapshot for delayed flush/close errors before release
+or process exit. A terminal tree handle may remain alive for cached pages after
+its worker has drained; that cached handle does not keep the native root open.
+Root drain is a lifetime guarantee and does not imply operation success.
+
+Mutating tree inventory must isolate its active journal Root from both scan
+roots. Native ancestry and per-entry identity checks cover the actual held
+objects, including separate engine instances; a displayed address is not
+scope evidence. Proven overlap or unqualified alias topology is refused with
+Unsupported / Adapter / PlanTopologyUnsafe before a mutation plan is accepted.
+Unrelated directories with the same basename remain ordinary input. A changed
+Root membership instead retains its Changed/MetadataChanged or stale-plan
+outcome. Legacy tree addresses are adopted once on the worker and must already
+be private; rejection does not secure an overlapping user folder by chmod.
+
+The scope proof requires a qualified native filesystem provider as well as a
+native cursor. A stacked or network provider can translate identities and hide
+its backing ancestry. Linux scope certification is limited to direct ext4,
+XFS and Btrfs, and macOS to local APFS. Unsupported providers and per-entry
+mount boundaries are refused before review. A bind-mounted private journal
+file is therefore not treated as an ordinary file outside its Root. Windows
+certifies the actual kernel NTFS/ReFS driver in the held directory device
+path for both the journal Root and scan cursor; reported filesystem names
+alone are insufficient. Remote/unknown providers are refused.
+
+This isolation applies to the passed Root capability. It is not a global
+active-root registry. Cross-process protection for cooperating rename/Trash
+clients requires the separate native namespace-lease execution gate; external
+writers still require native revalidation and recovery handling.
+
+Action-with-Root, session and retry entry points are reserved for the
+separately qualified 0.5 increment. Existing 0.3 Actions are unchanged in 0.4.
 
 ## Comparison and policy headers
 

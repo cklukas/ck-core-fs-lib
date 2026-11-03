@@ -1,12 +1,13 @@
 # Operations and feature inventory
 
-## 0.3 implementation status
+## 0.4 implementation status
 
 | Surface | Implemented | Qualification boundary |
 | --- | --- | --- |
 | Comparison planning | Copy/Move/Update/Missing/Sync/Mirror/Compare proposals, size/time/digest modes, bounded immutable pages, filters and protected exclusions | Preview facts; no native mutation authority |
 | Conflict policies | Per-item/selection/subtree/class rules, precedence, newest/size/source/target/keep-both choices, explicit tie handling, zero-length/retention protection | Native tree review freezes rules and manual native names into a revocable receipt; provider refusal remains visible |
 | Durable sessions | Baseline codec/checksum, edit/delete classification, metadata conflicts, deletion guards, overlapping-root locks, native verification receipts, durable generation compare-and-swap and recovery | Session commit verifies both roots; a baseline receipt alone never executes a two-way data plan |
+| Owned journal roots | Worker-owned private directory preparation, native ancestry/barriers, memory-only polling, consumer drain and sticky native close errors | Guarded Tree integration; provider-specific qualification, no global Action lease guarantee |
 | Reviewed trees | Native inventory, immutable pages and facts, assessment, receipt-bound execution, stale receipt rejection, pause/resume/cancel and explicit worker drain | Each provider must qualify publication, metadata and source retirement; unsupported primitives cannot become success |
 | Retained replacement | Journaled old-target retention and explicit retained names before incoming publication | Requires stable old-object content and an object-bound native rename; unknown coverage refuses replacement |
 | Batch rename | Exception-free C jobs, exact native names, duplicate/cycle/collision review, reverse dependency order, one-use approval and bounded verified retry | Windows qualified native handle rename; POSIX source-name mutation remains refused |
@@ -63,3 +64,8 @@ preservation, provider-owned durable journal-root capabilities and verified
 prefix resume. Existing tree/action/session APIs already carry typed review,
 capability, partial/recovery and access outcomes. No interface declaration or
 capability-family bit authorizes weakening identity or path-safety rules.
+
+The 0.4 addition covers the owned journal-root factory and guarded Tree
+integration. New Actions-with-Root, two-way execution and verified retry
+interfaces remain in the separate 0.5 development increment. Existing
+publication and complete-preservation gates remain mandatory.

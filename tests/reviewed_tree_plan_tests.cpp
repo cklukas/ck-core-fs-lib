@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "../src/files/reviewed_tree_plan.hpp"
 #include "native_filesystem.hpp"
+#include "private_journal_scope.hpp"
+#include "platform/journal_root_test_faults.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -14,12 +16,31 @@
 #define NOMINMAX
 #include <windows.h>
 #include <winternl.h>
+#include <sddl.h>
 #include <bit>
 #include <cstddef>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+#endif
+#ifdef __linux__
+namespace tree_finish_fault {
+thread_local bool anonymous_writer_flush=false;
+thread_local unsigned hits=0;
+}
+// Interpose only in this test executable. Inject one failure on the actual
+// anonymous staging object; all other flushes reach the real kernel syscall.
+extern "C" int fsync(int fd) {
+    const int saved=errno;struct stat value{};
+    if(tree_finish_fault::anonymous_writer_flush&&::fstat(fd,&value)==0&&S_ISREG(value.st_mode)&&value.st_nlink==0) {
+        tree_finish_fault::anonymous_writer_flush=false;++tree_finish_fault::hits;errno=EIO;return -1;
+    }
+    errno=saved;return static_cast<int>(::syscall(SYS_fsync,fd));
+}
 #endif
 using namespace ck::files;
 namespace {
@@ -49,14 +70,49 @@ std::wstring extended(const std::filesystem::path& p) {
     CHECK(s.size() > 2 && s[1] == L':' && s[2] == L'\\');
     return L"\\\\?\\" + s;
 }
-void mkdir_new(const std::filesystem::path& p) { CHECK(CreateDirectoryW(extended(p).c_str(), nullptr)); }
+struct FixtureHandle {
+    HANDLE value=INVALID_HANDLE_VALUE;
+    ~FixtureHandle() {if(value!=INVALID_HANDLE_VALUE&&value!=nullptr&&!CloseHandle(value))std::abort();}
+    void close() {const auto raw=value;value=INVALID_HANDLE_VALUE;CHECK(CloseHandle(raw));}
+};
+struct FixtureLocal {
+    HLOCAL value=nullptr;
+    ~FixtureLocal() {if(value&&LocalFree(value))std::abort();}
+};
+struct FixtureSecurity {
+    FixtureLocal descriptor;
+    FixtureSecurity() {
+        FixtureHandle token;
+        CHECK(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token.value));
+        DWORD count=0;
+        CHECK(!GetTokenInformation(token.value,TokenUser,nullptr,0,&count)&&
+            GetLastError()==ERROR_INSUFFICIENT_BUFFER&&count>=sizeof(TOKEN_USER));
+        std::vector<std::byte> storage(count);
+        CHECK(GetTokenInformation(token.value,TokenUser,storage.data(),count,&count));
+        const auto user=reinterpret_cast<TOKEN_USER*>(storage.data())->User.Sid;
+        CHECK(IsValidSid(user));
+        LPWSTR raw_sid=nullptr;CHECK(ConvertSidToStringSidW(user,&raw_sid));FixtureLocal sid{raw_sid};
+        const std::wstring sddl=L"O:"+std::wstring(raw_sid)+L"D:P(A;;FA;;;"+raw_sid+L")(A;;FA;;;SY)";
+        PSECURITY_DESCRIPTOR raw_descriptor=nullptr;
+        CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(),SDDL_REVISION_1,&raw_descriptor,nullptr));
+        descriptor.value=raw_descriptor;token.close();
+    }
+    SECURITY_ATTRIBUTES attributes() const {return {sizeof(SECURITY_ATTRIBUTES),descriptor.value,FALSE};}
+};
+void mkdir_new(const std::filesystem::path& p) {
+    FixtureSecurity security;auto attributes=security.attributes();
+    CHECK(CreateDirectoryW(extended(p).c_str(),&attributes));
+}
 void write_file(const std::filesystem::path& p, const std::string& data, bool replace = false) {
-    HANDLE h = CreateFileW(extended(p).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, replace ? TRUNCATE_EXISTING : CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    CHECK(h != INVALID_HANDLE_VALUE);
-    DWORD size = 0;
-    CHECK(WriteFile(h, data.data(), DWORD(data.size()), &size, nullptr) && size == data.size());
-    CHECK(CloseHandle(h));
+    // Parent privacy preparation removes inherited child ACEs. Protect the
+    // fixture's exact objects so postconditions still reopen and verify them.
+    FixtureSecurity security;auto attributes=security.attributes();
+    FixtureHandle file{CreateFileW(extended(p).c_str(),GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+        &attributes,replace?TRUNCATE_EXISTING:CREATE_NEW,FILE_FLAG_OPEN_REPARSE_POINT,nullptr)};
+    CHECK(file.value!=INVALID_HANDLE_VALUE);
+    DWORD size=0;
+    CHECK(WriteFile(file.value,data.data(),DWORD(data.size()),&size,nullptr)&&size==data.size());
+    file.close();
 }
 void rename_exact(const std::filesystem::path& a, const std::filesystem::path& b) {
     struct Handle {
@@ -228,8 +284,12 @@ struct Fixture {
             relative.erase(0, pos + 1);
         }
         auto entry = take(dir->open_child(name(relative), EntryAccess::ContentRead));
-        auto data = take(entry->read_content({4096}));
-        return {reinterpret_cast<const char*>(data.bytes.data()), data.bytes.size()};
+        std::string result;
+        for(;;) {
+            auto data=take(entry->read_content({4096},result.size()));
+            if(data.bytes.empty())return result;
+            result.append(reinterpret_cast<const char*>(data.bytes.data()),data.bytes.size());
+        }
     }
 };
 unsigned Fixture::sequence = 0;
@@ -252,6 +312,101 @@ ConflictRule keep_rule(ReviewedTreePlanJob& job, ConflictScope scope = ConflictS
     return r;
 }
 void start(ReviewedTreePlanJob& job) { CHECK(take(job.begin_execution(take(job.review({}))))); }
+
+void test_private_journal_scope(unsigned placement,bool typed) {
+    Fixture f;
+    write_file(f.path("s/a"),"incoming");write_file(f.path("d/extra"),"retained");
+    std::filesystem::path protected_path=f.path("journals");
+    if(placement==0||placement==1) {
+        protected_path=f.path(placement==0?"s/.dtfile-operations":"d/.dtfile-operations");mkdir_new(protected_path);
+    } else if(placement==2||placement==4)protected_path=f.path("s");
+    else if(placement==3||placement==5)protected_path=f.path("d");
+    if(placement==4){mkdir_new(f.path("s/scan"));write_file(f.path("s/scan/a"),"incoming");}
+    if(placement==5)mkdir_new(f.path("d/scan"));
+    const auto address=take(NativeAbsolutePath::from_host(protected_path));
+    CHECK(take(prepare_native_operation_journal_root(address)));
+    write_file(protected_path/"private-marker","state must never enter a copy or deletion plan");
+    if(placement==6) {
+        // Matching a protected basename is not evidence of protected identity.
+        mkdir_new(f.path("s/.dtfile-operations"));write_file(f.path("s/.dtfile-operations/ordinary"),"ordinary source data");
+    }
+    auto request=f.request();request.journal_root=address;
+    if(placement==4) {
+        auto parent=std::shared_ptr<const DirectoryCursor>(take(f.parent->open_directory_child(name("s"))));
+        request.source_root=take(HeldChild::observe(parent,name("scan")));
+    }
+    if(placement==5) {
+        auto parent=std::shared_ptr<const DirectoryCursor>(take(f.parent->open_directory_child(name("d"))));
+        request.destination_root=take(HeldChild::observe(parent,name("scan")));
+    }
+    PreparedJournalRoot::Pointer root;
+    if(typed) {
+        root=take(acquire_native_journal_root(address,{}));
+        CHECK(compare_identity(root->identity(),*request.source_root->metadata().identity.value())==IdentityComparison::Unknown);
+        request.prepared_journal_root=root;
+        // Deliberately different hint: the actual retained owner controls scope.
+        request.journal_root=take(NativeAbsolutePath::from_host(f.path("journals")));
+    }
+    auto job=take(ReviewedTreePlanJob::create(std::move(request)));run(*job);
+    if(placement==6) {
+        if(job->state()!=ReviewedTreeState::AwaitingReview&&job->progress().failure)
+            std::fprintf(stderr,"scope placement=%u typed=%u state=%u error=%s domain=%u code=%lld\n",placement,unsigned(typed),unsigned(job->state()),
+                job->progress().failure->error.operation.c_str(),unsigned(job->progress().failure->error.domain),static_cast<long long>(job->progress().failure->error.code));
+        CHECK(job->state()==ReviewedTreeState::AwaitingReview&&job->preview());
+        bool ordinary=false;for(const auto& item:take(job->page(0,16)).items)
+            if(!item.relative_components.empty()&&item.relative_components.front()==name(".dtfile-operations"))ordinary=true;
+        CHECK(ordinary);std::stop_source stop;stop.request_stop();job->advance(stop.get_token());
+        CHECK(job->state()==ReviewedTreeState::Cancelled);
+    } else {
+        CHECK(job->state()==ReviewedTreeState::Failed&&!job->preview());
+        CHECK(!job->progress().counts_complete&&job->progress().failure);
+        CHECK(job->progress().failure->state==ObservationState::Unsupported);
+    }
+    CHECK(!f.exists("d/a")&&f.read("d/extra")=="retained");
+    job.reset();if(root){CHECK(take(root->revalidate()));CHECK(take(root->finish_io()));root.reset();}
+}
+thread_local unsigned legacy_root_close_calls=0;
+std::optional<std::int64_t> legacy_root_close_fault(detail::JournalRootFaultPoint point) {
+    if(point==detail::JournalRootFaultPoint::DirectoryClose){++legacy_root_close_calls;return 5;}
+    return std::nullopt;
+}
+void test_legacy_root_terminal_close_failure() {
+    Fixture f;auto job=f.job();preview(*job);
+    const auto prior=detail::journal_root_test_fault;
+    struct RestoreFault {detail::JournalRootFault previous;~RestoreFault(){detail::journal_root_test_fault=previous;}} restore{prior};
+    legacy_root_close_calls=0;detail::journal_root_test_fault=legacy_root_close_fault;
+    start(*job);run(*job);
+    CHECK(job->state()==ReviewedTreeState::NeedsReconciliation&&job->progress().recovery_required);
+    CHECK(job->progress().failure&&job->progress().failure->error.code==5);
+    CHECK(legacy_root_close_calls>0);
+    const auto closed=legacy_root_close_calls;job.reset();CHECK(legacy_root_close_calls==closed);
+}
+#ifdef __linux__
+void test_cancel_copy_writer_finish(bool typed) {
+    Fixture f;const std::string payload(3*64*1024+17,'z');write_file(f.path("s/a"),payload);
+    auto request=f.request();request.digest_chunk_bytes=64*1024;
+    PreparedJournalRoot::Pointer root;
+    if(typed) {
+        root=take(acquire_native_journal_root(*request.journal_root));request.prepared_journal_root=root;
+    }
+    auto job=take(ReviewedTreePlanJob::create(std::move(request)));preview(*job);start(*job);
+    for(unsigned n=0;n<10000&&active(job->state())&&!job->progress().copied_bytes;++n)job->advance();
+    CHECK(active(job->state())&&job->progress().copied_bytes>0&&job->progress().copied_bytes<payload.size());
+    tree_finish_fault::hits=0;tree_finish_fault::anonymous_writer_flush=true;
+    struct Disarm {~Disarm(){tree_finish_fault::anonymous_writer_flush=false;}} disarm;
+    std::stop_source stop;stop.request_stop();job->advance(stop.get_token());
+    CHECK(tree_finish_fault::hits==1);
+    CHECK(job->state()==ReviewedTreeState::NeedsReconciliation&&job->progress().recovery_required);
+    CHECK(job->progress().failure&&job->progress().failure->error.domain==ErrorDomain::Posix&&job->progress().failure->error.code==EIO);
+    CHECK(job->progress().failure->error.operation.starts_with("content."));
+    CHECK(take(job->page(0,1)).items.front().state==ReviewedTreeItemState::NeedsReconciliation);
+    job->advance(stop.get_token());CHECK(tree_finish_fault::hits==1);
+    // A cached terminal plan does not retain the private Root's native users.
+    if(root)CHECK(take(root->finish_io()));
+    CHECK(!f.exists("d/a")&&f.read("s/a")==payload);
+    job.reset();CHECK(tree_finish_fault::hits==1);
+}
+#endif
 void test_copy(bool long_path = false) {
     Fixture f(long_path);
     mkdir_new(f.path("s/folder")); mkdir_new(f.path("s/folder/empty"));
@@ -410,7 +565,18 @@ void test_changed_receipts() {
             CHECK(before.value() && after.value());
             CHECK(compare_identity(*before.value(), *after.value()) == IdentityComparison::Different);
         }
-        CHECK(take(job->begin_execution(receipt))); run(*job);
+        auto begun=job->begin_execution(receipt);
+        if(variant==3||variant==5) {
+            // A substituted scan root is now rejected at receipt admission,
+            // before the revalidation scan or any mutation can start.
+            CHECK(!begun.value()&&begun.state()==ObservationState::Changed);
+            CHECK(begun.unavailable_detail()->error.domain==ErrorDomain::Adapter);
+            CHECK(begun.unavailable_detail()->error.code==static_cast<std::int64_t>(AdapterError::PlanDecisionStale));
+            CHECK(begun.unavailable_detail()->error.operation=="reviewed_tree.private_scan_membership_changed");
+            CHECK(!job->progress().partial&&!job->progress().recovery_required);
+            CHECK(!job->begin_execution(receipt).value());
+        } else CHECK(take(std::move(begun)));
+        run(*job);
         CHECK(job->state() == ReviewedTreeState::Failed);
         CHECK(job->progress().failure.has_value());
         CHECK(!f.exists("d/folder"));
@@ -691,16 +857,24 @@ void test_compare_acknowledges_descriptive_choices() {
     CHECK(!job->review(std::span(&invalid, 1)).value());
     CHECK(!job->begin_execution(descriptive).value());
     receipt = take(job->review(std::span(&ask, 1)));
+    // Compare remains root-free. Mutating previews must bind a private Root
+    // before inventory, even when they are only foreign-receipt test probes.
+    auto missing_root=f.request(ComparisonProfile::Copy);
+    missing_root.journal_root.reset();missing_root.open_journal={};
+    auto denied=take(ReviewedTreePlanJob::create(std::move(missing_root)));run(*denied);
+    CHECK(denied->state()==ReviewedTreeState::Failed&&!denied->preview());
+    CHECK(denied->progress().failure&&denied->progress().failure->state==ObservationState::Unsupported);
     for (auto profile : {ComparisonProfile::Copy, ComparisonProfile::Sync}) {
         auto mutating_request = f.request(profile);
         mutating_request.copy_policy.allow_unhandled_metadata_loss = false;
         mutating_request.copy_policy.metadata_scope = RegularMetadataScope::CompleteMetadataV1;
-        mutating_request.journal_root.reset(); mutating_request.open_journal = {};
         auto mutating = take(ReviewedTreePlanJob::create(std::move(mutating_request))); preview(*mutating);
         CHECK(mutating->begin_execution(receipt).state() == ObservationState::Changed);
         CHECK(!mutating->reviewed_page(receipt, 0, 32).value());
         auto copy_ask = ask; copy_ask.plan = mutating->preview()->identity();
         CHECK(!mutating->review(std::span(&copy_ask, 1)).value());
+        std::stop_source stop;stop.request_stop();
+        CHECK(mutating->advance(stop.get_token())==ReviewedTreeState::Cancelled);
     }
     auto other_instance = f.job(ComparisonProfile::Compare); preview(*other_instance);
     CHECK(other_instance->begin_execution(receipt).state() == ObservationState::Changed);
@@ -742,6 +916,21 @@ void test_exact_names_links_and_fifo() {
 }
 int main(int argc, char** argv) {
     try {
+        if(argc==2&&std::string_view(argv[1])=="--changed-receipts-only") {
+            test_changed_receipts();
+            std::printf("reviewed_tree_plan stale receipts: %u checks passed\n",checks);return 0;
+        }
+#ifdef __linux__
+        if(argc==2&&std::string_view(argv[1])=="--cancel-writer-finish") {
+            for(bool typed:{false,true})test_cancel_copy_writer_finish(typed);
+            std::printf("reviewed_tree_plan cancelled writer finish: %u checks passed\n",checks);return 0;
+        }
+#endif
+        if(argc==2&&std::string_view(argv[1])=="--private-journal-scope") {
+            for(unsigned placement=0;placement<7;++placement)for(bool typed:{false,true})test_private_journal_scope(placement,typed);
+            test_legacy_root_terminal_close_failure();
+            std::printf("reviewed_tree_plan protected journal scope: %u checks passed\n",checks);return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--compare-review-only") {
             test_compare_acknowledges_descriptive_choices();
             std::printf("reviewed_tree_plan Compare review: %u checks passed\n", checks); return 0;

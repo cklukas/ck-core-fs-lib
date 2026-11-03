@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_filesystem.hpp"
 #include "../native_trash.hpp"
+#include "native_journal_directory_bridge.hpp"
 #include "metadata_replay.hpp"
 #include "windows_name.hpp"
 #include "windows_directory_record.hpp"
@@ -35,10 +36,22 @@
 
 namespace ck::files {
 namespace {
+thread_local detail::WindowsJournalCloseObserver journal_close_observer;
+}
+detail::WindowsJournalCloseObserver detail::exchange_windows_journal_close_observer(WindowsJournalCloseObserver next) noexcept {
+    const auto previous=journal_close_observer;
+    journal_close_observer=next;
+    return previous;
+}
+namespace {
 
 struct HandleCloser {
     void operator()(void* handle) const noexcept {
-        if (handle != nullptr && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+        if (handle != nullptr && handle != INVALID_HANDLE_VALUE && !CloseHandle(handle)) {
+            const auto code=GetLastError();
+            const auto observer=journal_close_observer;
+            if(observer.record)observer.record(observer.context,code,"sync_session.native_cursor_close");
+        }
     }
 };
 
@@ -2466,6 +2479,21 @@ Observation<std::unique_ptr<DirectoryCursor>> NativeFileSystem::open_directory(
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::NotDirectory), "open_directory.kind"});
     auto native_identity = identity(handle.get(), scope_);
     return Result::available(std::make_unique<WindowsDirectoryCursor>(std::move(handle), std::move(native_identity), scope_));
+}
+Observation<void*> detail::duplicate_windows_journal_directory(const DirectoryCursor& cursor) {
+    const auto* native=dynamic_cast<const WindowsDirectoryCursor*>(&cursor);
+    if(!native)return Observation<void*>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::UnsupportedQuery),"journal_root.native_cursor_required"});
+    const auto current=native->inspect_basic();
+    if(!current.value())return Observation<void*>::unavailable(current.state(),current.unavailable_detail()->error);
+    if(!cursor.identity().value()||!current.value()->identity.value()||
+        compare_identity(*cursor.identity().value(),*current.value()->identity.value())!=IdentityComparison::Same)
+        return Observation<void*>::unavailable(ObservationState::Changed,
+            {ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::MetadataChanged),"journal_root.cursor_changed"});
+    auto duplicate=native->duplicate_trash_parent();
+    if(!duplicate.value())return Observation<void*>::unavailable(duplicate.state(),duplicate.unavailable_detail()->error);
+    auto owner=std::move(duplicate).take_value();
+    return Observation<void*>::available(owner.release());
 }
 Observation<WindowsTrashHandle> duplicate_windows_trash_parent(const DirectoryCursor& cursor) {
     const auto* native=dynamic_cast<const WindowsDirectoryCursor*>(&cursor);

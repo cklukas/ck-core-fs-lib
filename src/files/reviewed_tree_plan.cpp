@@ -5,6 +5,8 @@
 #include "native_delete_recovery_evidence.hpp"
 #include "retained_target.hpp"
 #include "directory_name_rules.hpp"
+#include "prepared_journal_root.hpp"
+#include "private_journal_scope.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -105,14 +107,14 @@ struct Tree {
 // full scan is required before the immutable comparison plan is published.
 class Scanner {
 public:
-    Scanner(HeldChild::Pointer root, const ReviewedTreePlanRequest& request)
-        : root_(std::move(root)), request_(request) {}
+    Scanner(HeldChild::Pointer root, const ReviewedTreePlanRequest& request,JournalScopeGuard::Pointer scope)
+        : root_(std::move(root)), request_(request),scope_guard_(std::move(scope)) {}
     bool complete = false;
     std::optional<UnavailableObservation> failure;
     Tree tree;
     void step(std::stop_token stop) {
         if (complete || failure || stop.stop_requested()) return;
-        if (!tree.root) { start(); return; }
+        if (!tree.root) { start(stop); return; }
         if (reading_) { read_step(stop); return; }
         if (frames_.empty()) { complete = true; return; }
         auto& frame = frames_.back();
@@ -135,12 +137,22 @@ public:
             if (!folded_.insert(folded).second) { fail(AdapterError::PlanTopologyUnsafe, "reviewed_tree.case_collision"); return; }
             auto held = HeldChild::observe(frame.cursor, name, stop);
             if (!held.value()) { failure = *held.unavailable_detail(); return; }
+            if(scope_guard_) {
+                auto allowed=scope_guard_->check_entry(**held.value(),stop);
+                if(!allowed.value()){failure=*allowed.unavailable_detail();return;}
+                if(!*allowed.value()){fail(AdapterError::PlanTopologyUnsafe,"reviewed_tree.private_entry_false",ObservationState::Unsupported);return;}
+            }
             const auto m = (*held.value())->metadata();
             if (!qualified(m)) { fail(AdapterError::UnsupportedQuery, "reviewed_tree.kind_or_version", ObservationState::Unsupported); return; }
             if (*m.mount_id.value() != *tree.root_metadata.mount_id.value()) { fail(AdapterError::PlanTopologyUnsafe, "reviewed_tree.mount_crossing"); return; }
             if (*m.kind.value() == ObjectKind::RegularFile) {
                 auto readable = HeldChild::observe_with_access(frame.cursor, name, EntryAccess::ContentRead, stop);
                 if (!readable.value()) { failure = *readable.unavailable_detail(); return; }
+                if(scope_guard_) {
+                    auto allowed=scope_guard_->check_entry(**readable.value(),stop);
+                    if(!allowed.value()){failure=*allowed.unavailable_detail();return;}
+                    if(!*allowed.value()){fail(AdapterError::PlanTopologyUnsafe,"reviewed_tree.private_read_entry_false",ObservationState::Unsupported);return;}
+                }
                 if (!unchanged(m, (*readable.value())->metadata())) { fail(AdapterError::MetadataChanged, "reviewed_tree.read_open_changed", ObservationState::Changed); return; }
                 held = std::move(readable);
             }
@@ -168,6 +180,11 @@ public:
             return;
         }
         if (read.state == DirectoryReadState::End) {
+            if(scope_guard_) {
+                auto valid=scope_guard_->check_root(stop);
+                if(!valid.value()){failure=*valid.unavailable_detail();return;}
+                if(!*valid.value()){fail(AdapterError::PlanTopologyUnsafe,"reviewed_tree.private_root_false",ObservationState::Unsupported);return;}
+            }
             auto now = frame.cursor->inspect_basic();
             if (!now.value() || !unchanged(frame.before, *now.value())) {
                 fail(AdapterError::MetadataChanged, "reviewed_tree.directory_version", ObservationState::Changed); return;
@@ -178,9 +195,14 @@ public:
 private:
     struct Frame { std::shared_ptr<DirectoryCursor> cursor; std::vector<NativeName> names; BasicMetadata before; };
     void fail(AdapterError c, const char* op, ObservationState s = ObservationState::Failed) { failure = error(c, op, s); }
-    void start() {
+    void start(std::stop_token stop) {
         auto now = root_->refresh();
         if (!now.value()) { failure = *now.unavailable_detail(); return; }
+        if(scope_guard_) {
+            auto checked=scope_guard_->check_entry(**now.value(),stop);
+            if(!checked.value()){failure=*checked.unavailable_detail();return;}
+            if(!*checked.value()){fail(AdapterError::PlanTopologyUnsafe,"reviewed_tree.private_scan_entry_false",ObservationState::Unsupported);return;}
+        }
         if (!qualified((*now.value())->metadata()) || !root_->metadata().identity.value() ||
             !same(*root_->metadata().identity.value(), *(*now.value())->metadata().identity.value()) ||
             *(*now.value())->metadata().kind.value() != ObjectKind::Directory) {
@@ -209,6 +231,11 @@ private:
         if (!value.complete) return;
         auto now = n.held->inspect_basic();
         auto member = n.held->refresh(stop);
+        if(member.value()&&scope_guard_) {
+            auto allowed=scope_guard_->check_entry(**member.value(),stop);
+            if(!allowed.value()){failure=*allowed.unavailable_detail();return;}
+            if(!*allowed.value()){fail(AdapterError::PlanTopologyUnsafe,"reviewed_tree.private_digest_entry_false",ObservationState::Unsupported);return;}
+        }
         if (offset_ != size || !now.value() || !member.value() ||
             !unchanged(n.metadata, *now.value()) || !unchanged(n.metadata, (*member.value())->metadata())) {
             fail(AdapterError::MetadataChanged, "reviewed_tree.digest_version", ObservationState::Changed); return;
@@ -228,6 +255,7 @@ private:
     std::size_t path_bytes_ = 0;
     Sha256 hash_;
     std::uint64_t offset_ = 0;
+    JournalScopeGuard::Pointer scope_guard_;
 };
 bool equal_tree(const Tree& a, const Tree& b) {
     if (!unchanged(a.root_metadata, b.root_metadata) || a.nodes.size() != b.nodes.size()) return false;
@@ -316,6 +344,102 @@ struct ReviewedTreePlanJob::Impl {
     bool staging_verified = false;
     std::optional<UnavailableObservation> failure;
 
+    bool private_root_initialized=false,owns_private_root=false;
+    std::array<JournalScopeGuard::Pointer,2> scope_guards;
+
+    Observation<bool> initialize_private_root(std::stop_token stop) {
+        if(private_root_initialized)return Observation<bool>::available(true);
+        if(request.comparison.profile==ComparisonProfile::Compare) {
+            private_root_initialized=true;return Observation<bool>::available(true);
+        }
+        if(!request.prepared_journal_root) {
+            if(!request.journal_root)return unavailable<bool>(error(AdapterError::UnsupportedQuery,
+                "reviewed_tree.private_journal_root_required",ObservationState::Unsupported));
+            // The legacy address is used once, on this worker, as initial
+            // navigation. No checked pathname is later reopened as authority.
+            auto prepared=acquire_native_journal_root(*request.journal_root,stop);
+            if(!prepared.value())return unavailable<bool>(*prepared.unavailable_detail());
+            request.prepared_journal_root=std::move(prepared).take_value();owns_private_root=true;
+        }
+        auto valid=request.prepared_journal_root->revalidate();
+        if(!valid.value())return valid;
+        if(!*valid.value())return unavailable<bool>(error(AdapterError::ProviderReviewRequired,
+            "reviewed_tree.private_journal_root_false",ObservationState::Unsupported));
+        if(!request.journal_root&&request.prepared_journal_root->navigation_address())
+            request.journal_root=*request.prepared_journal_root->navigation_address();
+        // All current call sites, including retained replacement, now use the
+        // SAME retained owner. The address argument is a navigation hint only.
+        request.open_journal=[root=request.prepared_journal_root](const NativeAbsolutePath&,const NativeName& name,bool create) {
+            return root->open_journal(name,create);
+        };
+        unsigned side=0;
+        for(const auto& root:{request.source_root,request.destination_root}) {
+            auto opened=root->parent()->open_directory_child(root->name());
+            if(!opened.value())return unavailable<bool>(*opened.unavailable_detail());
+            auto cursor=std::shared_ptr<const DirectoryCursor>(std::move(opened).take_value());
+            auto observed=cursor->inspect_basic();
+            if(!observed.value())return unavailable<bool>(*observed.unavailable_detail());
+            if(!qualified(*observed.value())||*observed.value()->kind.value()!=ObjectKind::Directory||
+                !same(*root->metadata().identity.value(),*observed.value()->identity.value())||
+                !equal(root->metadata().mount_id,observed.value()->mount_id))
+                return unavailable<bool>(error(AdapterError::PlanDecisionStale,"reviewed_tree.private_scope_scan_root_changed",ObservationState::Changed));
+            auto scoped=JournalScopeGuard::create(request.prepared_journal_root,std::move(cursor),stop);
+            if(!scoped.value())return unavailable<bool>(*scoped.unavailable_detail());
+            scope_guards[side++]=std::move(scoped).take_value();
+        }
+        private_root_initialized=true;return Observation<bool>::available(true);
+    }
+    Observation<bool> private_scope_guard(std::stop_token stop={}) const {
+        if(request.comparison.profile==ComparisonProfile::Compare)return Observation<bool>::available(true);
+        if(!private_root_initialized||!request.prepared_journal_root)
+            return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.private_journal_root_unbound",ObservationState::Unsupported));
+        if(!roots_current())return unavailable<bool>(error(AdapterError::PlanDecisionStale,"reviewed_tree.private_scan_membership_changed",ObservationState::Changed));
+        for(const auto& guard:scope_guards) {
+            if(!guard)return unavailable<bool>(error(AdapterError::ProviderReviewRequired,"reviewed_tree.private_guard_missing",ObservationState::Unsupported));
+        }
+        return JournalScopeGuard::check_pair(scope_guards[0],scope_guards[1],stop);
+    }
+    Observation<std::unique_ptr<OperationJournalFile>> open_bound_journal(const NativeName& name,bool create) {
+        if(!request.prepared_journal_root)return unavailable<std::unique_ptr<OperationJournalFile>>(
+            error(AdapterError::ProviderReviewRequired,"reviewed_tree.private_journal_root_unbound",ObservationState::Unsupported));
+        return request.prepared_journal_root->open_journal(name,create);
+    }
+    void finish_owned_private_root() {
+        if(progress.state<ReviewedTreeState::Complete)return;
+        std::optional<UnavailableObservation> close_failure;
+        // Active children must relinquish their native journal owners before
+        // terminal state is exposed, for caller-owned Roots as well as legacy
+        // Roots. The execution protocol finalizes writer and journal on cancel.
+        if(copy) {
+            std::stop_source stop;stop.request_stop();
+            const auto state=copy->advance(stop.get_token());
+            if(copy->result().failure)close_failure=copy->result().failure;
+            else if(state==OperationExecutionState::NeedsReconciliation||state==OperationExecutionState::RetainedSource)
+                close_failure=error(AdapterError::InvalidNativeResult,"reviewed_tree.private_copy_terminal");
+            copy.reset();staging=nullptr;metadata_phase=nullptr;
+        }
+        retained.reset();scanner.reset();scope_guards={};
+        if(deleting) {
+            auto closed=deleting->file->finish_io();
+            if((!closed.value()||!*closed.value())&&!close_failure)close_failure=closed.value()?
+                error(AdapterError::InvalidNativeResult,"reviewed_tree.private_delete_finish_false"):*closed.unavailable_detail();
+            deleting.reset();
+        }
+        request.open_journal={};auto root=std::move(request.prepared_journal_root);
+        if(owns_private_root) {
+            owns_private_root=false;
+            auto finished=root->finish_io();
+            if((!finished.value()||!*finished.value())&&!close_failure)close_failure=finished.value()?
+                error(AdapterError::InvalidNativeResult,"reviewed_tree.private_root_finish_false"):*finished.unavailable_detail();
+        }
+        if(close_failure) {
+            for(auto& item:items)if(mutation(item.action)&&item.state==ReviewedTreeItemState::Complete) {
+                item.state=ReviewedTreeItemState::NeedsReconciliation;item.failure=*close_failure;item.recovery_required=true;
+                --progress.completed_items;++progress.failed_items;
+            }
+            fail(std::move(*close_failure),true);
+        }
+    }
     void fail(UnavailableObservation e, bool reconcile = false) {
         failure = e; progress.failure = e;
         progress.partial = mutated;
@@ -384,7 +508,8 @@ struct ReviewedTreePlanJob::Impl {
     }
     void start_scan(unsigned phase) {
         scan_phase = phase;
-        scanner = std::make_unique<Scanner>((phase % 2 == 0) ? request.source_root : request.destination_root, request);
+        scanner = std::make_unique<Scanner>((phase % 2 == 0) ? request.source_root : request.destination_root,
+            request,scope_guards[phase%2]);
     }
     void scan_step(std::stop_token stop) {
         if (!scanner) {
@@ -442,6 +567,8 @@ struct ReviewedTreePlanJob::Impl {
             fail(error(AdapterError::PlanTopologyUnsafe, "reviewed_tree.name_lookup_unknown"));
     }
     void seal() {
+        auto protected_scope=private_scope_guard();
+        if(!protected_scope.value()){fail(*protected_scope.unavailable_detail());return;}
         if (source.nodes.size() > request.limits.max_entries - target.nodes.size()) {
             fail(error(AdapterError::InventoryLimit, "reviewed_tree.combined_entries")); return;
         }
@@ -514,6 +641,7 @@ struct ReviewedTreePlanJob::Impl {
         return item.name_side == ReviewedTreeNameSide::Incoming && item.proposed_name ? *item.proposed_name : n.names.back();
     }
     Observation<bool> guard(const Node& n) const {
+        auto private_scope=private_scope_guard();if(!private_scope.value())return private_scope;
         if (!roots_current_const()) return unavailable<bool>(error(AdapterError::PlanDecisionStale, "reviewed_tree.root_substituted", ObservationState::Changed));
         auto s = parent_for(n, true), d = parent_for(n, false);
         if (!s.value()) return unavailable<bool>(*s.unavailable_detail());
@@ -679,6 +807,8 @@ struct ReviewedTreePlanJob::Impl {
             }
             RetainedTargetRequest retention{old.held, *items[index()].retained_name, old.entry.digest->bytes,
                 *request.journal_root, *retention_id, address_for(old), [this, &old] { return target_guard(old); }, request.digest_chunk_bytes};
+            retention.open_journal=request.open_journal;
+            retention.prepared_journal_root=request.prepared_journal_root;
             auto prepared = RetainedTarget::create(std::move(retention));
             if (!prepared.value()) { fail(*prepared.unavailable_detail(), prepared.state() == ObservationState::Unknown); return; }
             retained = *prepared.value(); progress.recovery_required = true; items[index()].recovery_required = true;
@@ -688,7 +818,7 @@ struct ReviewedTreePlanJob::Impl {
         items[index()].journal_name = name(".ck-reviewed-journal-");
         items[index()].staging_name = name(".ck-reviewed-staging-");
         items[index()].recovery_required = true;
-        auto file = request.open_journal(*request.journal_root, *items[index()].journal_name, true);
+        auto file = open_bound_journal(*items[index()].journal_name, true);
         if (!file.value()) { fail(*file.unavailable_detail(), true); return; }
         auto journal = OperationJournal::create(FileOperation::Copy, id, request.copy_policy.journal_limits);
         if (!journal.value()) { fail(*journal.unavailable_detail(), true); return; }
@@ -948,6 +1078,7 @@ struct ReviewedTreePlanJob::Impl {
         return *last_assessment;
     }
     Observation<bool> target_guard(const Node& n, bool require_native_rename = true) const {
+        auto private_scope=private_scope_guard();if(!private_scope.value())return private_scope;
         if (!roots_current_const()) return unavailable<bool>(error(AdapterError::PlanDecisionStale, "reviewed_tree.deletion_root_changed", ObservationState::Changed));
         auto parent = parent_for(n, false);
         if (!parent.value()) return unavailable<bool>(*parent.unavailable_detail());
@@ -976,7 +1107,7 @@ struct ReviewedTreePlanJob::Impl {
             for (auto byte : id.bytes) { auto v = std::to_integer<unsigned>(byte); text += hex[v >> 4]; text += hex[v & 15]; }
             auto journal_name = n.names.back().posix_bytes() ? NativeName::from_posix(text) : NativeName::from_windows(std::u16string(text.begin(), text.end()));
             item.journal_id = id; item.journal_name = journal_name; item.recovery_required = true;
-            auto file = request.open_journal(*request.journal_root, *journal_name, true);
+            auto file = open_bound_journal(*journal_name, true);
             if (!file.value()) { fail(*file.unavailable_detail(), true); return; }
             auto journal = OperationJournal::create(FileOperation::Delete, id, request.copy_policy.journal_limits);
             if (!journal.value()) { fail(*journal.unavailable_detail(), true); return; }
@@ -1253,6 +1384,10 @@ Observation<ReviewedTreeReceipt> ReviewedTreePlanJob::review(std::span<const Con
 Observation<bool> ReviewedTreePlanJob::begin_execution(const ReviewedTreeReceipt& receipt) {
     if (state() != ReviewedTreeState::AwaitingReview || !receipt.state_ || receipt.state_->plan != impl_->plan->identity() || receipt.state_->revision != impl_->revision)
         return unavailable<bool>(error(AdapterError::PlanDecisionStale, "reviewed_tree.receipt", ObservationState::Changed));
+    auto private_scope=impl_->private_scope_guard();
+    if(!private_scope.value()) {
+        impl_->fail(*private_scope.unavailable_detail());impl_->finish_owned_private_root();return private_scope;
+    }
     // Compare acknowledgement is bound to this immutable plan instance and
     // profile. Its descriptive unresolved choices grant no mutation authority.
     if (impl_->request.comparison.profile == ComparisonProfile::Compare &&
@@ -1261,6 +1396,8 @@ Observation<bool> ReviewedTreePlanJob::begin_execution(const ReviewedTreeReceipt
         })) return invalid<bool>("reviewed_tree.compare_requires_all_report");
     for (const auto& item : receipt.state_->items) {
         if (item.action == ReviewedTreeAction::Replace) {
+            if(!impl_->request.journal_root)
+                return unavailable<bool>(error(AdapterError::UnsupportedQuery,"reviewed_tree.retention_navigation_contract",ObservationState::Unsupported));
             const auto s = impl_->source.nodes.find(item.row.relative_path), d = impl_->target.nodes.find(item.row.relative_path);
             if (s == impl_->source.nodes.end() || d == impl_->target.nodes.end() || !s->second.entry.digest || !d->second.entry.digest ||
                 *s->second.metadata.kind.value() != ObjectKind::RegularFile || *d->second.metadata.kind.value() != ObjectKind::RegularFile)
@@ -1277,7 +1414,7 @@ Observation<bool> ReviewedTreePlanJob::begin_execution(const ReviewedTreeReceipt
             if (!*capability.value()) return unavailable<bool>(error(AdapterError::UnsupportedQuery, "reviewed_tree.identity_bound_deletion_unavailable", ObservationState::Unsupported));
         }
         if ((item.action == ReviewedTreeAction::CreateDirectory && !impl_->request.copy_policy.allow_unhandled_metadata_loss) ||
-            (mutation(item.action) && (!impl_->request.journal_root || !impl_->request.open_journal)))
+            (mutation(item.action) && !impl_->request.prepared_journal_root))
             return unavailable<bool>(error(AdapterError::UnsupportedQuery, "reviewed_tree.tree_metadata_or_journal_contract", ObservationState::Unsupported));
     }
     auto names = impl_->qualify_new_names(receipt.state_->items);
@@ -1300,20 +1437,28 @@ ReviewedTreeState ReviewedTreePlanJob::advance(std::stop_token stop) {
     if (state >= ReviewedTreeState::Complete || (state == ReviewedTreeState::AwaitingReview && !stop.stop_requested())) return state;
     if (stop.stop_requested()) {
         auto copy_state = p.copy ? p.copy->advance(stop) : OperationExecutionState::Cancelled;
+        if(p.copy&&p.copy->result().failure) {
+            p.fail(*p.copy->result().failure,true);
+            p.finish_owned_private_root();return p.progress.state;
+        }
         const bool ambiguous = copy_state == OperationExecutionState::NeedsReconciliation || copy_state == OperationExecutionState::Complete ||
             (p.deleting && p.deleting->phase >= 3);
         p.progress.state = ambiguous ? ReviewedTreeState::NeedsReconciliation : p.mutated ? ReviewedTreeState::Partial : ReviewedTreeState::Cancelled;
         p.progress.partial = p.mutated;
-        p.progress.recovery_required = p.progress.recovery_required || p.mutated;
+        p.progress.recovery_required = p.progress.recovery_required || p.mutated || ambiguous;
         if (p.current < p.items.size()) {
             p.items[p.index()].state = ambiguous ? ReviewedTreeItemState::NeedsReconciliation : ReviewedTreeItemState::Cancelled;
             p.items[p.index()].recovery_required = p.progress.recovery_required;
         }
-        return p.progress.state;
+        p.finish_owned_private_root();return p.progress.state;
     }
+    auto initialized=p.initialize_private_root(stop);
+    if(!initialized.value()){p.fail(*initialized.unavailable_detail());p.finish_owned_private_root();return p.progress.state;}
+    auto private_scope=p.private_scope_guard(stop);
+    if(!private_scope.value()){p.fail(*private_scope.unavailable_detail(),p.mutated||bool(p.copy)||bool(p.deleting));p.finish_owned_private_root();return p.progress.state;}
     if (!p.topology_done) p.topology_step();
     else if (state == ReviewedTreeState::Inventory || state == ReviewedTreeState::Revalidating) p.scan_step(stop);
     else p.execute_step(stop);
-    return p.progress.state;
+    p.finish_owned_private_root();return p.progress.state;
 }
 } // namespace ck::files

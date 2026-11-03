@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "retained_target.hpp"
+#include "prepared_journal_root.hpp"
 #include <algorithm>
 
 namespace ck::files {
@@ -73,9 +74,12 @@ Observation<RetainedTarget::Pointer> RetainedTarget::create(RetainedTargetReques
     if (!parent || !object) return unavailable<Pointer>(rejected("retained_target.identity",ObservationState::Unknown,AdapterError::UnqualifiedIdentity));
     auto journal = OperationJournal::create(FileOperation::Move,r.journal_id,{1,16,1024 * 1024});
     if (!journal.value()) return unavailable<Pointer>(*journal.unavailable_detail());
-    const auto safe_root = prepare_native_operation_journal_root(r.journal_root);
+    const auto safe_root = r.prepared_journal_root ? r.prepared_journal_root->revalidate()
+                                                  : prepare_native_operation_journal_root(r.journal_root);
     if (!safe_root.value()) return unavailable<Pointer>(*safe_root.unavailable_detail());
-    auto file = r.open_journal(r.journal_root,journal_name(r),true);
+    if (!*safe_root.value()) return unavailable<Pointer>(rejected("retained_target.private_root_unqualified",ObservationState::Denied,AdapterError::InvalidAccess));
+    auto file = r.prepared_journal_root ? open_prepared_operation_journal_file(*r.prepared_journal_root,journal_name(r),true)
+                                      : r.open_journal(r.journal_root,journal_name(r),true);
     if (!file.value()) return unavailable<Pointer>(*file.unavailable_detail());
     if (!*file.value()) return unavailable<Pointer>(rejected("retained_target.null_journal",ObservationState::Failed,AdapterError::InvalidNativeResult));
     NativeOperationRecoveryEvidence evidence{r.target->name(),r.retained_name,*parent,*object,*parent,*object,

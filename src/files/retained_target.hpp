@@ -19,6 +19,7 @@ struct RetainedTargetRequest final {
     std::size_t chunk_bytes = 64 * 1024;
     std::function<Observation<std::unique_ptr<OperationJournalFile>>(
         const NativeAbsolutePath&, const NativeName&, bool)> open_journal = open_native_operation_journal_file;
+    std::shared_ptr<PreparedJournalRoot> prepared_journal_root = {};
 };
 enum class RetainedTargetState { Verifying, Ready, Retained, Failed, Cancelled, NeedsReconciliation };
 // Worker-owned replacement prerequisite. Original data, ACLs, xattrs and

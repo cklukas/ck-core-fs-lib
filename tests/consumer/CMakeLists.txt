@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(ck_core_fs_installed_consumer LANGUAGES C)
-find_package(ck-core-fs CONFIG REQUIRED)
+find_package(ck-core-fs 0.4 CONFIG REQUIRED)
 add_executable(ck_core_fs_installed_consumer main.c)
 target_link_libraries(ck_core_fs_installed_consumer PRIVATE ck::ck_file_engine_c)
 enable_testing()

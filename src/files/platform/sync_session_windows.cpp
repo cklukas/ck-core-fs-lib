@@ -3,6 +3,14 @@
 #include "../sync_session.hpp"
 #include "../sha256.hpp"
 #include "../windows_name.hpp"
+#include "../native_filesystem.hpp"
+#include "../windows_parent_record.hpp"
+#include "native_journal_directory_bridge.hpp"
+#include "prepared_journal_root_bridge.hpp"
+#include "native_windows_journal_volume.hpp"
+#include <winioctl.h>
+#include <cstring>
+#include <new>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -16,8 +24,82 @@
 
 namespace ck::files {
 namespace {
-struct Close { void operator()(void* h) const noexcept { if(h && h!=INVALID_HANDLE_VALUE) CloseHandle(h); } };
+// Scalar capture precedes all diagnostics. The stack context covers genuine
+// native cursor/parent owners as well as Sync's own transient handles.
+struct CloseFailure {
+    DWORD code=ERROR_SUCCESS;
+    const char* operation=nullptr;
+    void record(DWORD error,const char* tag,const PreparedJournalRoot::Pointer& owner) noexcept {
+        if(!operation) {code=error;operation=tag;}
+        if(owner)detail::record_prepared_journal_consumer_failure(*owner,
+            ObservationState::Failed,ErrorDomain::Win32,error,tag);
+    }
+    template<class T> Observation<T> result() const noexcept {
+        try {return Observation<T>::unavailable(ObservationState::Failed,{ErrorDomain::Win32,code,operation});}
+        catch(const std::bad_alloc&) {
+            return Observation<T>::unavailable(ObservationState::Failed,{ErrorDomain::Win32,code,{}});
+        }
+    }
+};
+struct CloseContext;
+thread_local CloseContext* active_close_context=nullptr;
+struct CloseContext {
+    PreparedJournalRoot::Pointer owner;
+    CloseFailure failure;
+    CloseContext* previous;
+    detail::WindowsJournalCloseObserver previous_native;
+    static void native_failure(void* opaque,std::uint32_t code,const char* operation) noexcept {
+        auto& self=*static_cast<CloseContext*>(opaque);
+        self.record(code,operation);
+    }
+    explicit CloseContext(PreparedJournalRoot::Pointer root):owner(std::move(root)),previous(active_close_context),
+        previous_native(detail::exchange_windows_journal_close_observer({this,&native_failure})) {
+        if(previous&&previous->owner.get()==owner.get())failure=previous->failure;
+        active_close_context=this;
+    }
+    void record(DWORD code,const char* operation) noexcept {
+        // Publish first failure into all enclosing scopes for this same Root
+        // (including the ownerless factory), before outer cleanup can fail.
+        for(auto* context=this;context&&context->owner.get()==owner.get();context=context->previous)
+            context->failure.record(code,operation,context->owner);
+    }
+    ~CloseContext() {
+        detail::exchange_windows_journal_close_observer(previous_native);
+        active_close_context=previous;
+    }
+    template<class T,class F> Observation<T> run(F&& body) {
+        try {
+            auto result=body(); // body locals, including native smart owners, drain here
+            if(failure.operation)return failure.result<T>();
+            return result;
+        } catch(...) {
+            if(failure.operation)return failure.result<T>();
+            throw;
+        }
+    }
+};
+PreparedJournalRoot::Pointer close_owner() noexcept {
+    return active_close_context?active_close_context->owner:PreparedJournalRoot::Pointer{};
+}
+struct Close {
+    PreparedJournalRoot::Pointer owner=close_owner();
+    void operator()(void* h) const noexcept {
+        if(h&&h!=INVALID_HANDLE_VALUE&&!CloseHandle(h)) {
+            const auto code=GetLastError();
+            if(active_close_context&&(!owner||owner.get()==active_close_context->owner.get()))active_close_context->record(code,"sync_session.directory_CloseHandle");
+            else if(owner)detail::record_prepared_journal_consumer_failure(*owner,
+                ObservationState::Failed,ErrorDomain::Win32,code,"sync_session.directory_CloseHandle");
+        }
+    }
+};
 using Handle=std::unique_ptr<void,Close>;
+bool consume_transient(Handle& handle,const char* operation,CloseContext& context) noexcept {
+    const auto raw=handle.release();
+    if(CloseHandle(raw))return true;
+    const auto code=GetLastError();
+    context.record(code,operation);
+    return false;
+}
 struct FreeLocal { void operator()(void* p) const noexcept { if(p) LocalFree(p); } };
 using Local=std::unique_ptr<void,FreeLocal>;
 template<class T> Observation<T> fail(DWORD e,const char* op) {
@@ -33,7 +115,9 @@ template<class T> Observation<T> reject(const char* op,ObservationState s=Observ
         static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),op});
 }
 template<class T,class U> Observation<T> propagate(const Observation<U>& r) {
-    return Observation<T>::unavailable(r.state(),r.unavailable_detail()->error);
+    const auto& error=r.unavailable_detail()->error;
+    try {return Observation<T>::unavailable(r.state(),error);}
+    catch(const std::bad_alloc&) {return Observation<T>::unavailable(r.state(),{error.domain,error.code,{}});}
 }
 void put(Sha256& h,std::uint64_t n) {
     std::array<std::byte,8> b; for(unsigned i=0;i<8;++i) b[i]=std::byte((n>>(8*i))&255); h.update(b);
@@ -132,61 +216,289 @@ Observation<bool> private_security(HANDLE object,bool protected_root=false) {
     }
     return Observation<bool>::available(true);
 }
-struct Node { Handle handle; std::wstring name; Object object; };
-using Chain=std::vector<Node>;
-Observation<Chain> chain(const NativeAbsolutePath& path,bool writable) {
-    if(!path.is_valid() || !path.windows_units()) return reject<Chain>("sync_session.windows_path",ObservationState::Unsupported);
-    auto root=path.namespace_root(); if(!root.value()) return propagate<Chain>(root);
-    auto components=path.relative_components_from(*root.value()); if(!components.value()) return propagate<Chain>(components);
-    auto host=root.value()->host_path(); if(!host.value()) return propagate<Chain>(host);
-    auto extended=windows_extended_path(host.value()->native());
-    if(!extended) return reject<Chain>("sync_session.extended_namespace",ObservationState::Failed);
-    // UNC/redirectors cannot establish local volume identity/ancestry durability.
-    if(extended->starts_with(L"\\\\?\\UNC\\")) return reject<Chain>("sync_session.unc_scope",ObservationState::Unsupported);
-    const auto root_access=FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL|
-        (writable && components.value()->empty() ? FILE_GENERIC_WRITE : 0);
-    Handle h(CreateFileW(extended->c_str(),root_access,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
-    if(h.get()==INVALID_HANDLE_VALUE) return fail<Chain>(GetLastError(),"sync_session.open_namespace");
-    auto id=identity(h.get(),true); if(!id.value()) return propagate<Chain>(id);
-    if(!id.value()->volume_root) return reject<Chain>("sync_session.hidden_native_ancestors",ObservationState::Unsupported);
-    Chain out; out.push_back({std::move(h),*extended,std::move(id).take_value()});
-    for(std::size_t i=0;i<components.value()->size();++i) {
-        const auto& c=(*components.value())[i];
-        if(!c.windows_units()) return reject<Chain>("sync_session.component_encoding",ObservationState::Failed);
-        std::wstring name; for(auto u:*c.windows_units()) name+=static_cast<wchar_t>(u);
-        const auto access=FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL|
-            (writable && i+1==components.value()->size() ? FILE_GENERIC_WRITE : 0);
-        auto child=relative(out.back().handle.get(),name,access,FILE_OPEN,true);
-        if(!child.value()) return propagate<Chain>(child);
-        auto child_id=identity(child.value()->get(),true); if(!child_id.value()) return propagate<Chain>(child_id);
-        // Mounted folders are reparse points (rejected above); crossing volume
-        // without a proven namespace root is never treated as ancestry proof.
-        if(child_id.value()->volume!=out.front().object.volume)
-            return reject<Chain>("sync_session.cross_volume_ancestry",ObservationState::Unsupported);
-        out.push_back({std::move(child).take_value(),std::move(name),std::move(child_id).take_value()});
-    }
-    return Observation<Chain>::available(std::move(out));
+struct ParentRecord {
+    FILE_ID_INFO native{};
+    NativeIdentifier child{},parent{};
+    std::wstring name;
+};
+Observation<ParentRecord> parent_record(HANDLE h) {
+    ParentRecord out;
+    if(!GetFileInformationByHandleEx(h,FileIdInfo,&out.native,sizeof(out.native)))
+        return fail<ParentRecord>(GetLastError(),"sync_session.parent_file_id");
+    READ_FILE_USN_DATA request{3,3};alignas(8) std::array<std::byte,65536+80> wire{};DWORD size{};
+    if(!DeviceIoControl(h,FSCTL_READ_FILE_USN_DATA,&request,sizeof(request),wire.data(),static_cast<DWORD>(wire.size()),&size,nullptr))
+        return fail<ParentRecord>(GetLastError(),"sync_session.parent_record");
+    if(size>wire.size())return reject<ParentRecord>("sync_session.parent_record_size",ObservationState::Failed);
+    auto decoded=detail::decode_windows_parent_record(std::span<const std::byte>(wire).first(size),3);
+    if(!decoded.value())return propagate<ParentRecord>(decoded);
+    std::memcpy(out.child.bytes.data(),out.native.FileId.Identifier,16);out.parent=decoded.value()->parent;
+    if(decoded.value()->child!=out.child||!(decoded.value()->attributes&FILE_ATTRIBUTE_DIRECTORY))
+        return reject<ParentRecord>("sync_session.parent_record_identity");
+    USHORT bytes{},offset{};std::memcpy(&bytes,wire.data()+72,2);std::memcpy(&offset,wire.data()+74,2);
+    out.name.resize(bytes/2);if(bytes)std::memcpy(out.name.data(),wire.data()+offset,bytes);
+    return Observation<ParentRecord>::available(std::move(out));
 }
-Observation<bool> validate(const Chain& c) {
-    for(std::size_t i=0;i<c.size();++i) {
-        auto id=identity(c[i].handle.get(),true); if(!id.value()) return propagate<bool>(id);
-        if(id.value()->id!=c[i].object.id) return reject<bool>("sync_session.held_identity");
-        if(!i) {
-            Handle seen_root(CreateFileW(c[i].name.c_str(),FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
-            if(seen_root.get()==INVALID_HANDLE_VALUE) return fail<bool>(GetLastError(),"sync_session.namespace_root_check");
-            auto seen=identity(seen_root.get(),true); if(!seen.value()) return propagate<bool>(seen);
-            if(seen.value()->id!=c[i].object.id) return reject<bool>("sync_session.namespace_root_changed");
-        } else {
-            auto edge=relative(c[i-1].handle.get(),c[i].name,FILE_READ_ATTRIBUTES,FILE_OPEN,true);
-            if(!edge.value()) return propagate<bool>(edge);
-            auto seen=identity(edge.value()->get(),true); if(!seen.value()) return propagate<bool>(seen);
-            if(seen.value()->id!=c[i].object.id) return reject<bool>("sync_session.namespace_changed");
-        }
+Observation<bool> trusted_directory(HANDLE h) {
+    const auto proof=detail::prove_windows_journal_volume(h);
+    if(!proof.qualified)return Observation<bool>::unavailable(proof.state,{proof.domain,proof.code,proof.operation});
+    return Observation<bool>::available(true);
+}
+Observation<bool> match_native(const BasicMetadata& basic,const ParentRecord& record) {
+    if(!basic.kind.value())return propagate<bool>(basic.kind);
+    if(!basic.identity.value())return propagate<bool>(basic.identity);
+    const auto& id=*basic.identity.value();
+    if(*basic.kind.value()!=ObjectKind::Directory||id.scheme!=IdentityScheme::WindowsFileId128||!id.scope.is_valid())
+        return reject<bool>("sync_session.native_parent_kind",ObservationState::Unsupported);
+    if(id.volume!=NativeIdentifier::from_u64(record.native.VolumeSerialNumber)||id.object!=record.child)
+        return reject<bool>("sync_session.native_parent_identity");
+    return Observation<bool>::available(true);
+}
+Observation<Handle> directory_by_id(HANDLE volume,const NativeIdentifier& id,bool writable) {
+    FILE_ID_DESCRIPTOR descriptor{};descriptor.dwSize=sizeof(descriptor);descriptor.Type=ExtendedFileIdType;
+    std::memcpy(descriptor.ExtendedFileId.Identifier,id.bytes.data(),16);
+    Handle out(OpenFileById(volume,&descriptor,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL|SYNCHRONIZE|
+        (writable?FILE_GENERIC_WRITE:0),FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,
+        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+    if(!out||out.get()==INVALID_HANDLE_VALUE)return fail<Handle>(GetLastError(),"sync_session.parent_by_id");
+    return Observation<Handle>::available(std::move(out));
+}
+struct MountWitness {
+    ParentRecord record;
+    std::int64_t creation{};
+    NativeBytes raw;
+    std::u16string target;
+};
+Observation<MountWitness> mount_witness(HANDLE h) {
+    FILE_ATTRIBUTE_TAG_INFO tag{};FILE_BASIC_INFO basic{};FILE_STANDARD_INFO standard{};
+    if(!GetFileInformationByHandleEx(h,FileAttributeTagInfo,&tag,sizeof(tag))||
+        !GetFileInformationByHandleEx(h,FileBasicInfo,&basic,sizeof(basic))||
+        !GetFileInformationByHandleEx(h,FileStandardInfo,&standard,sizeof(standard)))
+        return fail<MountWitness>(GetLastError(),"sync_session.mount_metadata");
+    constexpr DWORD allowed=FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_READONLY|
+        FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM|FILE_ATTRIBUTE_ARCHIVE|FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+    if(tag.ReparseTag!=IO_REPARSE_TAG_MOUNT_POINT||!(tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)||
+        (tag.FileAttributes&~allowed)||standard.DeletePending)
+        return reject<MountWitness>("sync_session.mount_kind",ObservationState::Unsupported);
+    auto record=parent_record(h);if(!record.value())return propagate<MountWitness>(record);
+    alignas(8) std::array<std::byte,detail::windows_reparse_max_bytes> wire{};DWORD size{};
+    if(!DeviceIoControl(h,FSCTL_GET_REPARSE_POINT,nullptr,0,wire.data(),static_cast<DWORD>(wire.size()),&size,nullptr))
+        return fail<MountWitness>(GetLastError(),"sync_session.mount_payload");
+    if(size>wire.size())return reject<MountWitness>("sync_session.mount_payload_size",ObservationState::Failed);
+    auto decoded=detail::decode_windows_reparse(std::span<const std::byte>(wire).first(size),{});
+    if(!decoded.value())return propagate<MountWitness>(decoded);
+    if(decoded.value()->kind!=WindowsReparseKind::MountPoint||!decoded.value()->names||decoded.value()->names->flags)
+        return reject<MountWitness>("sync_session.mount_payload_kind",ObservationState::Unsupported);
+    MountWitness out;out.record=std::move(record).take_value();out.creation=basic.CreationTime.QuadPart;
+    out.raw=std::move(decoded.value()->raw);out.target=std::move(decoded.value()->names->substitute);
+    return Observation<MountWitness>::available(std::move(out));
+}
+struct Node { Handle handle; std::wstring name; Object object; std::optional<MountWitness> mount; std::wstring namespace_root; };
+using Chain=std::vector<Node>;
+Observation<bool> validate(const Chain&);
+Observation<Chain> physical_chain(NativeFileSystem& fs,const NativeAbsolutePath& path,bool writable,const PreparedJournalRoot::Pointer& owner) {
+    CloseContext close(owner);
+    return close.run<Chain>([&]() -> Observation<Chain> {
+    auto cursor=fs.open_native_directory(path,DirectoryLinkPolicy::RejectFinalLink);
+    if(!cursor.value())return propagate<Chain>(cursor);
+    auto duplicate=detail::duplicate_windows_journal_directory(**cursor.value());
+    if(!duplicate.value())return propagate<Chain>(duplicate);
+    Handle volume(std::move(duplicate).take_value());
+    auto trusted=trusted_directory(volume.get());if(!trusted.value())return propagate<Chain>(trusted);
+    auto seed=parent_record(volume.get());if(!seed.value())return propagate<Chain>(seed);
+    auto basic=(*cursor.value())->inspect_basic();if(!basic.value())return propagate<Chain>(basic);
+    auto checked=match_native(*basic.value(),*seed.value());if(!checked.value())return propagate<Chain>(checked);
+    auto acquired=directory_by_id(volume.get(),seed.value()->child,writable);
+    if(!acquired.value())return propagate<Chain>(acquired);
+    Handle current=std::move(acquired).take_value();std::unique_ptr<OpenedEntry> reference;Chain out;
+    for(;;) {
+        if(close.failure.operation)return close.failure.result<Chain>();
+        if(out.size()>=256)return reject<Chain>("sync_session.ancestor_limit",ObservationState::Unsupported);
+        trusted=trusted_directory(current.get());if(!trusted.value())return propagate<Chain>(trusted);
+        auto object=identity(current.get(),true);if(!object.value())return propagate<Chain>(object);
+        auto record=parent_record(current.get());if(!record.value())return propagate<Chain>(record);
+        checked=match_native(*basic.value(),*record.value());if(!checked.value())return propagate<Chain>(checked);
+        if(record.value()->native.VolumeSerialNumber!=seed.value()->native.VolumeSerialNumber)
+            return reject<Chain>("sync_session.physical_volume_changed");
+        if(std::any_of(out.begin(),out.end(),[&](const auto& n){return n.object.id==object.value()->id;}))
+            return reject<Chain>("sync_session.ancestor_cycle",ObservationState::Unsupported);
+        auto parent=reference?reference->open_parent_directory():(*cursor.value())->open_parent_directory();
+        if(close.failure.operation)return close.failure.result<Chain>();
+        if(!parent.value())return propagate<Chain>(parent);
+        auto parent_basic=(*parent.value())->inspect_basic();if(!parent_basic.value())return propagate<Chain>(parent_basic);
+        if(!parent_basic.value()->identity.value())return propagate<Chain>(parent_basic.value()->identity);
+        const auto& parent_id=*parent_basic.value()->identity.value();
+        if(parent_id.scheme!=IdentityScheme::WindowsFileId128||parent_id.volume!=basic.value()->identity.value()->volume||
+            parent_id.object!=record.value()->parent||parent_id.scope!=basic.value()->identity.value()->scope)
+            return reject<Chain>("sync_session.audited_parent_mismatch");
+        const bool top=record.value()->parent==record.value()->child;
+        if(top&&!object.value()->volume_root)return reject<Chain>("sync_session.hidden_native_ancestors",ObservationState::Unsupported);
+        out.push_back({std::move(current),std::move(record.value()->name),std::move(object).take_value(),{}});
+        if(top)break;
+        auto next=directory_by_id(volume.get(),parent_id.object,false);if(!next.value())return propagate<Chain>(next);
+        current=std::move(next).take_value();reference=std::move(parent).take_value();basic=std::move(parent_basic);
+    }
+    if(close.failure.operation)return close.failure.result<Chain>();
+    if(!consume_transient(volume,"sync_session.cursor_duplicate_close",close))return close.failure.result<Chain>();
+    std::reverse(out.begin(),out.end());checked=validate(out);if(!checked.value())return propagate<Chain>(checked);
+    return Observation<Chain>::available(std::move(out));
+
+    });
+}
+bool target_matches(const MountWitness& mount,const Object& root) {
+    // Only an actual volume-root mount is a qualified namespace bridge.
+    // No drive substitution, arbitrary junction target, or derived open path.
+    const std::wstring expected=L"\\??\\"+root.volume_path.substr(4)+L"\\";
+    if(mount.target.size()!=expected.size())return false;
+    return CompareStringOrdinal(reinterpret_cast<const wchar_t*>(mount.target.data()),static_cast<int>(mount.target.size()),
+        expected.data(),static_cast<int>(expected.size()),TRUE)==CSTR_EQUAL;
+}
+Observation<bool> match_suffix(const Chain& physical,std::span<const NativeName> names) {
+    CloseContext close(physical.empty()?PreparedJournalRoot::Pointer{}:physical.front().handle.get_deleter().owner);
+    return close.run<bool>([&]() -> Observation<bool> {
+    if(physical.size()!=names.size()+1)return reject<bool>("sync_session.namespace_depth_changed");
+    for(std::size_t i=0;i<names.size();++i) {
+        if(!names[i].windows_units())return reject<bool>("sync_session.component_encoding",ObservationState::Failed);
+        const auto& units=*names[i].windows_units();const std::wstring name(units.begin(),units.end());
+        auto lookup=relative(physical[i].handle.get(),name,FILE_READ_ATTRIBUTES,FILE_OPEN,true);
+        if(!lookup.value())return propagate<bool>(lookup);
+        Handle lookup_handle=std::move(lookup).take_value();
+        auto trusted=trusted_directory(lookup_handle.get());
+        auto seen=identity(lookup_handle.get(),true);
+        if(!consume_transient(lookup_handle,"sync_session.edge_lookup_close",close))return close.failure.result<bool>();
+        if(!trusted.value())return trusted;if(!seen.value())return propagate<bool>(seen);
+        if(seen.value()->id!=physical[i+1].object.id)return reject<bool>("sync_session.namespace_capture_changed");
     }
     return Observation<bool>::available(true);
+
+    });
+}
+Observation<Chain> chain(const NativeAbsolutePath& path,bool writable,PreparedJournalRoot::Pointer owner={}) {
+    CloseContext close(std::move(owner));
+    return close.run<Chain>([&]() -> Observation<Chain> {
+    if(!path.is_valid()||!path.windows_units())return reject<Chain>("sync_session.windows_path",ObservationState::Unsupported);
+    auto root=path.namespace_root();if(!root.value())return propagate<Chain>(root);
+    auto parts=path.relative_components_from(*root.value());if(!parts.value())return propagate<Chain>(parts);
+    auto host=root.value()->host_path();if(!host.value())return propagate<Chain>(host);
+    auto extended=windows_extended_path(host.value()->native());
+    if(!extended)return reject<Chain>("sync_session.extended_namespace",ObservationState::Failed);
+    if(extended->starts_with(L"\\\\?\\UNC\\"))return reject<Chain>("sync_session.unc_scope",ObservationState::Unsupported);
+    NativeFileSystem fs;auto physical=physical_chain(fs,path,writable,close.owner);if(!physical.value())return physical;
+    auto native_root=fs.open_native_directory(*root.value(),DirectoryLinkPolicy::RejectFinalLink);
+    if(!native_root.value())return propagate<Chain>(native_root);
+    auto duplicate=detail::duplicate_windows_journal_directory(**native_root.value());if(!duplicate.value())return propagate<Chain>(duplicate);
+    Handle current(std::move(duplicate).take_value());auto trusted=trusted_directory(current.get());if(!trusted.value())return propagate<Chain>(trusted);
+    auto object=identity(current.get(),true);if(!object.value())return propagate<Chain>(object);
+    auto record=parent_record(current.get());if(!record.value())return propagate<Chain>(record);
+    if(record.value()->child!=record.value()->parent)return reject<Chain>("sync_session.namespace_root_unqualified",ObservationState::Unsupported);
+    if(object.value()->id==physical.value()->front().object.id) {
+        if(!consume_transient(current,"sync_session.namespace_duplicate_close",close))return close.failure.result<Chain>();
+        auto same=match_suffix(*physical.value(),*parts.value());if(!same.value())return propagate<Chain>(same);
+        auto out=std::move(physical).take_value();out.front().namespace_root=*extended;
+        same=validate(out);if(!same.value())return propagate<Chain>(same);
+        return Observation<Chain>::available(std::move(out));
+    }
+    Chain out;out.push_back({std::move(current),{},std::move(object).take_value(),{}});
+    out.front().namespace_root=*extended;
+    for(std::size_t i=0;i<parts.value()->size();++i) {
+        if(out.size()>=256)return reject<Chain>("sync_session.namespace_ancestor_limit",ObservationState::Unsupported);
+        const auto* units=(*parts.value())[i].windows_units();if(!units)return reject<Chain>("sync_session.component_encoding",ObservationState::Failed);
+        const std::wstring name(units->begin(),units->end());auto child=relative(out.back().handle.get(),name,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL,FILE_OPEN,true);
+        if(!child.value())return propagate<Chain>(child);
+        Handle child_handle=std::move(child).take_value();
+        FILE_ATTRIBUTE_TAG_INFO tag{};if(!GetFileInformationByHandleEx(child_handle.get(),FileAttributeTagInfo,&tag,sizeof(tag)))
+            return fail<Chain>(GetLastError(),"sync_session.namespace_kind");
+        if(tag.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT) {
+            auto mount=mount_witness(child_handle.get());
+            if(!consume_transient(child_handle,"sync_session.mount_lookup_close",close))return close.failure.result<Chain>();
+            if(!mount.value())return propagate<Chain>(mount);
+            auto previous=parent_record(out.back().handle.get());if(!previous.value())return propagate<Chain>(previous);
+            if(mount.value()->record.native.VolumeSerialNumber!=previous.value()->native.VolumeSerialNumber||mount.value()->record.parent!=previous.value()->child)
+                return reject<Chain>("sync_session.mount_parent_changed");
+            if(!target_matches(*mount.value(),physical.value()->front().object))
+                return reject<Chain>("sync_session.unqualified_mount_target",ObservationState::Unsupported);
+            auto same=match_suffix(*physical.value(),std::span<const NativeName>(*parts.value()).subspan(i+1));
+            if(!same.value())return propagate<Chain>(same);
+            auto leaf=std::move(physical).take_value();
+            if(out.size()+leaf.size()>256)return reject<Chain>("sync_session.namespace_ancestor_limit",ObservationState::Unsupported);
+            auto top=std::move(leaf.front());
+            top.name=mount.value()->record.name;top.mount=std::move(mount).take_value();out.push_back(std::move(top));
+            for(std::size_t n=1;n<leaf.size();++n)out.push_back(std::move(leaf[n]));
+            auto valid=validate(out);if(!valid.value())return propagate<Chain>(valid);
+            return Observation<Chain>::available(std::move(out));
+        }
+        trusted=trusted_directory(child_handle.get());if(!trusted.value())return propagate<Chain>(trusted);
+        object=identity(child_handle.get(),true);if(!object.value())return propagate<Chain>(object);
+        record=parent_record(child_handle.get());if(!record.value())return propagate<Chain>(record);
+        auto previous=parent_record(out.back().handle.get());if(!previous.value())return propagate<Chain>(previous);
+        if(record.value()->native.VolumeSerialNumber!=previous.value()->native.VolumeSerialNumber||record.value()->parent!=previous.value()->child)
+            return reject<Chain>("sync_session.namespace_parent_changed");
+        if(std::any_of(out.begin(),out.end(),[&](const auto& n){return n.object.id==object.value()->id;}))
+            return reject<Chain>("sync_session.namespace_cycle",ObservationState::Unsupported);
+        out.push_back({std::move(child_handle),std::move(record.value()->name),std::move(object).take_value(),{}});
+    }
+    return reject<Chain>("sync_session.namespace_bridge_missing",ObservationState::Unsupported);
+
+    });
+}
+Observation<bool> validate(const Chain& c) {
+    CloseContext close(c.empty()?PreparedJournalRoot::Pointer{}:c.front().handle.get_deleter().owner);
+    return close.run<bool>([&]() -> Observation<bool> {
+    if(c.empty())return reject<bool>("sync_session.empty_ancestry",ObservationState::Failed);
+    std::optional<ParentRecord> previous;
+    for(std::size_t i=0;i<c.size();++i) {
+        auto trusted=trusted_directory(c[i].handle.get());if(!trusted.value())return trusted;
+        auto id=identity(c[i].handle.get(),true);if(!id.value())return propagate<bool>(id);
+        if(id.value()->id!=c[i].object.id)return reject<bool>("sync_session.held_identity");
+        auto record=parent_record(c[i].handle.get());if(!record.value())return propagate<bool>(record);
+        if(!i) {
+            if(record.value()->parent!=record.value()->child||!id.value()->volume_root)return reject<bool>("sync_session.namespace_root_changed");
+            if(!c[i].namespace_root.empty()) {
+                // Reopen only the original namespace endpoint to VERIFY its
+                // binding, as before. It is never substituted for held-node
+                // authority or used to discover physical/native parents.
+                Handle endpoint(CreateFileW(c[i].namespace_root.c_str(),FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL,nullptr));
+                if(!endpoint||endpoint.get()==INVALID_HANDLE_VALUE)return fail<bool>(GetLastError(),"sync_session.namespace_root_check");
+                auto proof=trusted_directory(endpoint.get());auto seen=identity(endpoint.get(),true);
+                if(!consume_transient(endpoint,"sync_session.namespace_endpoint_close",close))return close.failure.result<bool>();
+                if(!proof.value())return proof;if(!seen.value())return propagate<bool>(seen);
+                if(seen.value()->id!=c[i].object.id)return reject<bool>("sync_session.namespace_root_changed");
+            }
+        } else if(c[i].mount) {
+            auto edge=relative(c[i-1].handle.get(),c[i].name,FILE_READ_ATTRIBUTES,FILE_OPEN,true);
+            if(!edge.value())return propagate<bool>(edge);
+            Handle edge_handle=std::move(edge).take_value();
+            auto seen=mount_witness(edge_handle.get());
+            if(!consume_transient(edge_handle,"sync_session.mount_revalidate_close",close))return close.failure.result<bool>();
+            if(!seen.value())return propagate<bool>(seen);
+            const auto& expected=*c[i].mount;
+            if(seen.value()->record.native.VolumeSerialNumber!=previous->native.VolumeSerialNumber||
+                seen.value()->record.parent!=previous->child||seen.value()->record.child!=expected.record.child||
+                seen.value()->record.name!=expected.record.name||seen.value()->creation!=expected.creation||
+                seen.value()->raw!=expected.raw||record.value()->parent!=record.value()->child||!id.value()->volume_root||!target_matches(*seen.value(),c[i].object))
+                return reject<bool>("sync_session.mount_binding_changed");
+        } else {
+            if(record.value()->native.VolumeSerialNumber!=previous->native.VolumeSerialNumber||record.value()->parent!=previous->child||record.value()->name!=c[i].name)
+                return reject<bool>("sync_session.parent_membership_changed");
+            auto edge=relative(c[i-1].handle.get(),c[i].name,FILE_READ_ATTRIBUTES,FILE_OPEN,true);
+            if(!edge.value())return propagate<bool>(edge);
+            Handle edge_handle=std::move(edge).take_value();
+            auto seen=identity(edge_handle.get(),true);
+            if(!consume_transient(edge_handle,"sync_session.edge_revalidate_close",close))return close.failure.result<bool>();
+            if(!seen.value())return propagate<bool>(seen);
+            if(seen.value()->id!=c[i].object.id)return reject<bool>("sync_session.namespace_changed");
+        }
+        previous=std::move(record).take_value();
+    }
+    return Observation<bool>::available(true);
+
+    });
+}
+std::vector<SyncDigest> lease_scopes(const Chain& left,const Chain& right) {
+    std::vector<SyncDigest> out;
+    for(const auto* chain:{&left,&right})for(const auto& node:*chain)out.push_back(node.object.volume);
+    return out;
 }
 bool contains(const Chain& c,const SyncDigest& id) {
     return std::any_of(c.begin(),c.end(),[&](const auto& n){return n.object.id==id;});
@@ -354,7 +666,7 @@ Observation<std::unique_ptr<SyncSessionBackend>> open_native_sync_session_backen
     if(contains(b->left,b->right_identity()) || contains(b->right,b->left_identity()) ||
         contains(b->store,b->left_identity()) || contains(b->store,b->right_identity()))
         return reject<P>("sync_session.overlapping_pair_or_store",ObservationState::Failed);
-    std::vector<SyncDigest> volumes{b->left.back().object.volume,b->right.back().object.volume};
+    auto volumes=lease_scopes(b->left,b->right);
     std::sort(volumes.begin(),volumes.end()); volumes.erase(std::unique(volumes.begin(),volumes.end()),volumes.end());
     for(const auto& v:volumes) {
         auto lease=std::make_unique<Lease>(); auto acquired=lease->acquire(v);
