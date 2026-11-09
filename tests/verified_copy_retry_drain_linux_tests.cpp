@@ -2,6 +2,8 @@
 // Real exported C worker; no external cleanup observer assists production code.
 #include "ck_fs_retry.h"
 #include "verified_copy_retry.hpp"
+#include "prepared_journal_directory.hpp"
+#include "platform/journal_root_test_faults.hpp"
 #include "native_handles.hpp"
 #include "journal_root_handles.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
@@ -30,6 +32,22 @@ namespace {
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x);std::abort();}}while(false)
 thread_local bool no_alloc=false;
 std::atomic<unsigned> denied{0};
+std::atomic<bool> pending_trigger{false},pending_paused{false},pending_release{false},retry_drain_returned{false},pending_after_drain{false};
+thread_local bool pending_publisher=false;
+void after_retry_drain()noexcept {
+ retry_drain_returned.store(true,std::memory_order_release);
+ if(!pending_after_drain.load(std::memory_order_acquire))return;
+ pending_trigger.store(true,std::memory_order_release);pending_trigger.notify_all();
+ while(!pending_paused.load(std::memory_order_acquire))pending_paused.wait(false,std::memory_order_acquire);
+}
+void pause_root_publication()noexcept {
+ if(!pending_publisher)return;
+ pending_paused.store(true,std::memory_order_release);pending_paused.notify_all();
+ while(!pending_release.load(std::memory_order_acquire))pending_release.wait(false,std::memory_order_acquire);
+}
+std::optional<std::int64_t> pending_close_fault(detail::JournalRootFaultPoint point){
+ return pending_publisher&&point==detail::JournalRootFaultPoint::DirectoryClose?std::optional<std::int64_t>{ENOSPC}:std::nullopt;
+}
 enum class Owner {Source,BaseSource,Candidate,Original,Attempt,Prior};
 struct Id {dev_t dev=0;ino_t ino=0;};
 bool same(const struct stat&s,Id i){return s.st_dev==i.dev&&s.st_ino==i.ino;}
@@ -48,7 +66,17 @@ template<class T>T take(Observation<T> o){if(!o.value())std::fprintf(stderr,"nat
 NativeName name(const char*s){return *NativeName::from_posix(s);}
 ckfer_native_v1 text(const char*s){ckfer_native_v1 n;ckfer_native_init_v1(&n);n.data=s;n.byte_count=std::strlen(s);return n;}
 ckfer_snapshot_v1 poll(ckfer_job*j){ckfer_snapshot_v1 s;ckfer_snapshot_init_v1(&s);CHECK(ckfer_poll_v1(j,&s)==CKFE_API_OK);return s;}
-ckfer_snapshot_v1 wait(ckfer_job*j,bool drain){for(unsigned i=0;i<20000;++i){auto s=poll(j);if(drain?s.worker_drained:s.state==CKFER_AWAITING_REVIEW||s.worker_drained)return s;std::this_thread::sleep_for(std::chrono::milliseconds(1));}std::abort();}
+ckfer_snapshot_v1 wait(ckfer_job*j,bool drain){
+ for(unsigned i=0;i<20000;++i){auto s=poll(j);if(drain?s.worker_drained:s.state==CKFER_AWAITING_REVIEW||s.worker_drained)return s;std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+ const auto last=poll(j);
+ std::fprintf(stderr,"RETRY_WAIT_TIMEOUT waitingFor=%s state=%u drained=%u sequence=%llu reviewed=%llu copied=%llu failure=%u/%lld/%s denied=%u\n",drain?"drain":"review",last.state,last.worker_drained,(unsigned long long)last.sequence,(unsigned long long)last.reviewed_bytes,(unsigned long long)last.copied_bytes,last.failure_domain,(long long)last.failure_code,last.failure_operation,denied.load());
+ if(control.mutex.try_lock()){
+  std::fprintf(stderr,"RETRY_CLOSE_STATUS injected=%d tracked=%u\n",int(control.injected),control.used);
+  for(unsigned i=0;i<control.used;++i)std::fprintf(stderr,"RETRY_FD owner=%u fd=%d closes=%u\n",unsigned(control.fds[i].owner),control.fds[i].value,control.fds[i].closes);
+  control.mutex.unlock();
+ }else std::fprintf(stderr,"RETRY_CLOSE_STATUS mutex_busy=1\n");
+ std::fflush(stderr);std::abort();
+}
 ckfjr_snapshot_v1 root_poll(ckfjr_root*r){ckfjr_snapshot_v1 s;ckfjr_snapshot_init_v1(&s);CHECK(ckfjr_poll_v1(r,&s)==CKFE_API_OK);return s;}
 Id file_id(const std::string&path){struct stat s{};CHECK(lstat(path.c_str(),&s)==0);return {s.st_dev,s.st_ino};}
 constexpr std::string_view bytes="real native prefix data and strict metadata";
@@ -82,9 +110,12 @@ extern "C" int __wrap_openat(int d,const char*p,int flags,...){
 }
 int main(int argc,char**argv){
  CHECK(argc==3);const std::string root=argv[1];const std::string_view mode=argv[2];
+ const bool pending=mode.find("pending")!=mode.npos;
+ const bool pending_before=mode.starts_with("pending-before-finish")||mode.starts_with("cpp-pending");
+ const bool cpp_destructor=mode=="cpp-pending-destructor";
  const bool cpp=mode.starts_with("cpp-");
- const bool cancel=cpp||mode.starts_with("cancel")||mode.starts_with("prior");
- const bool fault=mode!="success"&&mode!="cancel"&&mode!="cpp-finish";
+ const bool cancel=cpp||mode.starts_with("cancel")||mode.starts_with("prior")||pending_before;
+ const bool fault=!pending&&mode!="success"&&mode!="cancel"&&mode!="cpp-finish";
  const bool oom=mode.find("oom")!=mode.npos;
  const bool prior=mode.starts_with("prior");
  const bool second=mode.find("second")!=mode.npos;
@@ -100,6 +131,7 @@ int main(int argc,char**argv){
  for(unsigned n=0;n<20000;++n){auto s=root_poll(cap);if(s.state!=CKFJR_PREPARING){CHECK(s.state==CKFJR_READY);break;}std::this_thread::sleep_for(std::chrono::milliseconds(1));}
  ckfjr_root*attempt_cap=cap;
  if(second){ro.child.data="k";CHECK(ckfjr_start_v1(&ro,&attempt_cap)==CKFE_API_OK);for(unsigned n=0;n<20000;++n){auto s=root_poll(attempt_cap);if(s.state==CKFJR_READY)break;CHECK(!s.worker_drained);std::this_thread::sleep_for(std::chrono::milliseconds(1));}CHECK(root_poll(attempt_cap).state==CKFJR_READY);}
+ auto initial_root=root_poll(cap);if(initial_root.state!=CKFJR_READY)std::fprintf(stderr,"ROOT prerequisite state=%u drained=%u failure=%u/%lld/%s\n",initial_root.state,initial_root.worker_drained,initial_root.failure_domain,(long long)initial_root.failure_code,initial_root.failure_operation);CHECK(initial_root.state==CKFJR_READY);
  auto native_root=take(retain_prepared_journal_root(cap));
  auto native_attempt=second?take(retain_prepared_journal_root(attempt_cap)):PreparedJournalRoot::Pointer{};
  auto journal=take(OperationJournal::create(FileOperation::Copy,OperationJournalId{std::byte{7}}));
@@ -108,6 +140,18 @@ int main(int argc,char**argv){
  for(auto state:{OperationJournalState::Planned,OperationJournalState::Prepared,OperationJournalState::Failed})CHECK(take(append_operation_journal_file(*original,*journal,{journal->records().size()+1,0,state,take(encode_native_operation_recovery_evidence(evidence))})));
  CHECK(take(original->finish_io()));original.reset();control.original=file_id(root+"/j/origin");
  ckfer_options_v1 options;ckfer_options_init_v1(&options);options.source=source;options.candidate=candidate;options.destination=dst;options.prefix_bytes=13;options.original_journal_name=text("origin");options.attempt_journal_name=text("attempt");options.staging_hint=text("stage-hint");options.destination_name=text("output");options.metadata_scope=CKFER_ORDINARY_METADATA_V1;options.metadata_ownership=CKFER_CURRENT_CALLER_OWNERSHIP;options.attempt_id[0]=8;
+ std::thread publisher;
+ if(pending){
+  CHECK(mode.starts_with("pending-before-finish")||mode=="pending-after-final-journal-check"||mode=="cpp-pending-finish"||mode=="cpp-pending-destructor");
+  auto view=take(open_prepared_journal_directory(second?native_attempt:native_root));
+  detail::journal_root_test_publication_pause=pause_root_publication;
+  publisher=std::thread([view=std::move(view)]()mutable{
+   while(!pending_trigger.load(std::memory_order_acquire))pending_trigger.wait(false,std::memory_order_acquire);
+   pending_publisher=true;detail::journal_root_test_fault=pending_close_fault;
+   auto closed=view->finish_io();CHECK(!closed.value()&&closed.unavailable_detail()->error.code==ENOSPC);
+   detail::journal_root_test_fault=nullptr;pending_publisher=false;view.reset();
+  });
+ }
  control.active=true;ckfer_job*job=nullptr;VerifiedCopyRetryJob::Pointer core;
  if(cpp){VerifiedCopyRetryRequest input(native_root,name("origin"),native_root,name("attempt"),name("stage-hint"),name("output"));
   input.source=source->child;input.candidate=candidate->child;input.candidate_prefix_bytes=13;input.destination=dst->cursor;input.destination_address=dst->address;input.attempt_id.bytes[0]=std::byte{8};
@@ -121,11 +165,56 @@ int main(int argc,char**argv){
  {std::lock_guard lock(control.mutex);control.review_complete=true;}
  if(cpp&&mode.find("copy")!=mode.npos){CHECK(take(core->approve()));for(unsigned i=0;i<10000&&core->state()!=VerifiedCopyRetryState::Copying;++i)CHECK(core->advance()!=VerifiedCopyRetryState::ReviewRequired);CHECK(core->state()==VerifiedCopyRetryState::Copying);}
  if(prior){control.prior_arm=true;auto first=take((second?native_attempt:native_root)->open_journal(name("prior"),true));auto closed=first->finish_io();CHECK(!closed.value()&&closed.unavailable_detail()->error.code==ENOSPC);first.reset();control.prior_arm=false;CHECK(control.prior_injected);}
- {std::lock_guard lock(control.mutex);control.arm=fault;control.oom=oom;}
+ {std::lock_guard lock(control.mutex);control.arm=fault||pending_before;control.oom=oom;if(pending_before)control.inject=Owner::Original;}
+ bool complete_while_pending=false,drained_while_pending=false;
+ if(pending&&!cpp){pending_after_drain=!pending_before;detail::verified_copy_retry_test_after_drain=after_retry_drain;}
+ if(pending_before){pending_trigger.store(true,std::memory_order_release);pending_trigger.notify_all();while(!pending_paused.load(std::memory_order_acquire))pending_paused.wait(false,std::memory_order_acquire);}
+
  ckfer_snapshot_v1 done{};
- if(cpp){if(mode=="cpp-finish"){CHECK(take(core->finish_io()));CHECK(!core->approve().value());CHECK(core->advance()==VerifiedCopyRetryState::Cancelled);CHECK(take(core->finish_io()));}core.reset();}else{if(cancel)CHECK(ckfer_cancel_v1(job)==CKFE_API_OK);else CHECK(ckfer_execute_v1(job,ready.review_id)==CKFE_API_OK);done=wait(job,true);}
- const auto expected=prior?ENOSPC:EIO;
- if(fault){CHECK(control.injected);if(!cpp&&done.failure_code!=expected)std::fprintf(stderr,"terminal mode=%.*s state=%u domain=%u code=%lld op=%s expected=%d\n",int(mode.size()),mode.data(),done.state,done.failure_domain,(long long)done.failure_code,done.failure_operation,expected);
+ bool cpp_returned_while_pending=true,cpp_provisional=true;
+ if(cpp&&pending){
+  std::atomic<bool> returned{false};
+  // A separate caller observes return while the native Root writer is STILL
+  // paused. A buggy blocking finalizer is released for cleanup and then fails
+  // the assertion, rather than deadlocking this fixture indefinitely.
+  std::thread finalizer([&]{
+   if(cpp_destructor)core.reset();
+   else {auto result=core->finish_io();cpp_provisional=!result.value()&&result.unavailable_detail()->error.operation=="copy_retry.root_failure_pending"&&!core->native_finish_failure().present;}
+   returned.store(true,std::memory_order_release);
+  });
+  for(unsigned i=0;i<200&&!returned.load(std::memory_order_acquire);++i)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  cpp_returned_while_pending=returned.load(std::memory_order_acquire);
+  if(!cpp_returned_while_pending){pending_release.store(true,std::memory_order_release);pending_release.notify_all();}
+  finalizer.join();
+  if(cpp_returned_while_pending){std::lock_guard lock(control.mutex);for(unsigned i=0;i<control.used;++i)CHECK(control.fds[i].closes==1);}
+  if(cpp_returned_while_pending&&!cpp_destructor){
+   for(unsigned i=0;i<16;++i){auto result=core->finish_io();cpp_provisional&=!result.value()&&result.unavailable_detail()->error.operation=="copy_retry.root_failure_pending"&&!core->native_finish_failure().present;}
+  }
+  pending_release.store(true,std::memory_order_release);pending_release.notify_all();publisher.join();detail::journal_root_test_publication_pause=nullptr;
+  if(!cpp_destructor){auto result=core->finish_io();CHECK(!result.value());CHECK(core->native_finish_failure().present&&core->native_finish_failure().code==ENOSPC);core.reset();}
+ }else if(cpp){if(mode=="cpp-finish"){CHECK(take(core->finish_io()));CHECK(!core->approve().value());CHECK(core->advance()==VerifiedCopyRetryState::Cancelled);CHECK(take(core->finish_io()));}core.reset();}
+ else{
+  if(cancel)CHECK(ckfer_cancel_v1(job)==CKFE_API_OK);else CHECK(ckfer_execute_v1(job,ready.review_id)==CKFE_API_OK);
+  if(pending){
+   for(unsigned n=0;n<20000&&!pending_paused.load(std::memory_order_acquire);++n)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+   CHECK(pending_paused.load(std::memory_order_acquire));
+   for(unsigned i=0;i<20000&&!retry_drain_returned.load(std::memory_order_acquire);++i)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+   CHECK(retry_drain_returned.load(std::memory_order_acquire));
+   {std::lock_guard lock(control.mutex);for(unsigned i=0;i<control.used;++i)CHECK(control.fds[i].closes==1);}
+   detail::PreparedJournalConsumerFailure slot;
+   CHECK(detail::read_prepared_journal_consumer_failure(*(second?native_attempt:native_root),slot)&&slot.pending);
+   for(unsigned n=0;n<200;++n){const auto sample=poll(job);complete_while_pending|=sample.state==CKFER_COMPLETE;drained_while_pending|=sample.worker_drained!=0;std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+   pending_release.store(true,std::memory_order_release);pending_release.notify_all();publisher.join();detail::journal_root_test_publication_pause=nullptr;detail::verified_copy_retry_test_after_drain=nullptr;
+  }
+  done=wait(job,true);
+ }
+ const auto expected=prior||pending?ENOSPC:EIO;
+ if(pending){
+  std::fprintf(stderr,"PENDING mode=%.*s CompleteWhilePending=%d DrainedWhilePending=%d FinalizerReturnedWhilePending=%d Provisional=%d laterConsumedEIO=%d final=%u/%u/%lld/%s expectedNative=%d\n",int(mode.size()),mode.data(),int(complete_while_pending),int(drained_while_pending),int(cpp_returned_while_pending),int(cpp_provisional),int(control.injected),done.state,done.failure_domain,(long long)done.failure_code,done.failure_operation,ENOSPC);
+  CHECK(!complete_while_pending&&!drained_while_pending&&cpp_returned_while_pending&&cpp_provisional);
+  if(!cpp){CHECK(done.state==CKFER_REVIEW_REQUIRED&&done.failure_domain==unsigned(ErrorDomain::Posix)&&done.failure_code==ENOSPC&&done.recovery_required);CHECK(std::string_view(done.failure_operation)=="journal_root.enumeration_close");}
+  if(pending_before)CHECK(control.injected);
+ }else if(fault){CHECK(control.injected);if(!cpp&&done.failure_code!=expected)std::fprintf(stderr,"terminal mode=%.*s state=%u domain=%u code=%lld op=%s expected=%d\n",int(mode.size()),mode.data(),done.state,done.failure_domain,(long long)done.failure_code,done.failure_operation,expected);
   if(!cpp)CHECK(done.state==CKFER_REVIEW_REQUIRED&&done.failure_domain==unsigned(ErrorDomain::Posix)&&done.failure_code==expected&&done.recovery_required);
   detail::PreparedJournalConsumerFailure failure;CHECK(detail::read_prepared_journal_consumer_failure(*native_root,failure)&&!failure.pending&&failure.code==(second?EIO:expected));
   if(second)CHECK(detail::read_prepared_journal_consumer_failure(*native_attempt,failure)&&!failure.pending&&failure.code==expected);
@@ -143,6 +232,6 @@ int main(int argc,char**argv){
  CHECK(!control.retried);control.reuse_guard=false;
  for(unsigned i=0;i<control.reused_count;++i)CHECK(close(control.reused[i])==0);
  if(second){native_attempt.reset();CHECK(ckfjr_finish_v1(attempt_cap)==CKFE_API_OK);for(unsigned n=0;n<20000&&!root_poll(attempt_cap).worker_drained;++n)std::this_thread::sleep_for(std::chrono::milliseconds(1));CHECK(root_poll(attempt_cap).worker_drained&&root_poll(attempt_cap).failure_code==expected);ckfjr_release(attempt_cap);}
- native_root.reset();CHECK(ckfjr_finish_v1(cap)==CKFE_API_OK);for(unsigned n=0;n<20000;++n){auto s=root_poll(cap);if(s.worker_drained)break;std::this_thread::sleep_for(std::chrono::milliseconds(1));}CHECK(root_poll(cap).worker_drained);if(fault)CHECK(root_poll(cap).failure_code==(second?EIO:expected));ckfjr_release(cap);
- std::printf("PASS retry route=%s mode=%.*s actualConsumedClose=1 noExternalObserver=1 readersAndJournalsClosedBeforeDrained=1 RootCode=%lld noRetryAfterFDReuse=1 OOM=%u\n",cpp?"Cpp-destructor":"production-Cworker",int(mode.size()),mode.data(),(long long)(fault?expected:done.failure_code),denied.load());
+ native_root.reset();CHECK(ckfjr_finish_v1(cap)==CKFE_API_OK);for(unsigned n=0;n<20000;++n){auto s=root_poll(cap);if(s.worker_drained)break;std::this_thread::sleep_for(std::chrono::milliseconds(1));}CHECK(root_poll(cap).worker_drained);if(fault||pending)CHECK(root_poll(cap).failure_code==(second?EIO:expected));ckfjr_release(cap);
+ std::printf("PASS retry route=%s mode=%.*s actualConsumedClose=1 noExternalObserver=1 readersAndJournalsClosedBeforeDrained=1 RootCode=%lld noRetryAfterFDReuse=1 OOM=%u\n",cpp?(mode=="cpp-pending-finish"?"Cpp-explicit-finish":"Cpp-destructor"):"production-Cworker",int(mode.size()),mode.data(),(long long)(fault||pending?expected:done.failure_code),denied.load());
 }

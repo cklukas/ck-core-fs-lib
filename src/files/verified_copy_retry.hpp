@@ -7,8 +7,16 @@
 #include "sha256.hpp"
 #include <string_view>
 #include <type_traits>
+#include <atomic>
 
 namespace ck::files {
+namespace detail {
+// Failure-only worker seam for native contract tests. Invoked after all retry
+// finalizers return; tests can start a genuine Root failure writer here. No
+// public C callback, native success, or authority can be supplied through it.
+using VerifiedCopyRetryAfterDrain=void(*)()noexcept;
+inline std::atomic<VerifiedCopyRetryAfterDrain> verified_copy_retry_test_after_drain{nullptr};
+}
 // This is an explicitly reviewed NEW copy, not adoption of a reopened stage.
 // The old journal/staging object is never changed, cleaned or replayed. An
 // existing destination or any historical publication intent requires review.
@@ -82,7 +90,15 @@ public:
     std::optional<std::array<std::byte,32>> reviewed_digest() const noexcept { return reviewed_digest_; }
     std::optional<std::array<std::byte,32>> origin_digest() const noexcept { return origin_digest_; }
     // Always called before a public terminal state, including cancellation.
+    // Drains once and never waits for a separate Root failure writer. A
+    // pending first writer yields copy_retry.root_failure_pending, not success.
+    // Repeats refresh memory-only Root diagnostics; no native close is retried.
     Observation<bool> finish_io();
+    bool finish_pending()const noexcept{return pending_roots_[0]||pending_roots_[1];}
+    // Worker only, AFTER finish_io/callbacks have returned. No allocation or
+    // native I/O. False means retain this job/Root and poll again outside any
+    // finalizer before publishing a final cached result/worker_drained.
+    bool refresh_finish_failure()noexcept;
 private:
     explicit VerifiedCopyRetryJob(VerifiedCopyRetryRequest request):request_(std::move(request)){}
     Observation<bool> load_original_step();
@@ -99,7 +115,7 @@ private:
     void record_finish(ObservationState,ErrorDomain,std::int64_t,std::string_view)noexcept;
     void read_root_finish_failure()noexcept;
     Observation<bool> finish_consumers();
-    Observation<bool> finish_result()const;
+    Observation<bool> finish_result(bool include_pending=true)const;
     VerifiedCopyRetryRequest request_;
     // Two genuine Root owners, each checked against both selected inputs and
     // the new destination namespace. Addresses are adopted only once.
@@ -126,6 +142,11 @@ private:
     bool finished_=false,consumers_finished_=false,had_attempt_=false,have_final_progress_=false;
     OperationProgress final_progress_{};
     VerifiedCopyRetryFinishFailure finish_failure_;
+    std::array<bool,2> pending_roots_{};
+    // The first observed pending writer reserves priority over subsequent
+    // diagnostic placeholders and native close errors until its real tuple is
+    // published. The pending Adapter tuple is never made sticky.
+    std::uint8_t first_pending_root_=2;
     // Allocated at factory construction, before acquiring worker read/journal owners.
     std::stop_source drain_stop_;
 };

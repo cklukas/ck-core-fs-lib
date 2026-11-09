@@ -992,3 +992,35 @@ and 11.30 seconds. Original SDK sources, headers, libraries and both sanitizer
 runtimes remained hash-identical; no normal/instrumented object mixing occurred.
 The initial failure cohort remains immutable. This is focused sanitizer proof,
 not a subsequent whole-suite or Windows/macOS qualification claim.
+
+
+## Retry worker waits for a genuine pending first-error writer
+
+A forced native interleaving reproduced two defects in the prior retry worker:
+an early pending Root failure became a sticky Adapter placeholder, and a late
+pending writer could coexist with public Complete/worker_drained. The fix tracks
+pending writers separately, reserves their diagnostic priority and reads their
+eventual native tuple. Core finish drains native owners once and returns a typed
+provisional result immediately. Only the enclosing worker waits, after every
+callback/finalizer has returned and outside locks, using allocation-free memory
+readback while retaining the genuine Roots. Final Complete/drained publication
+waits for the writer; cached/repeated calls never retry a consumed close.
+
+Frozen packet manifest SHA-256:
+`cf3492a20e929ac303419bb8e4f39a1335682cb7f440a99b84e55a218b30e30e`.
+All packet files, four live baseline hashes, final hashes and narrow CMake hunks
+were verified before integration. The failure-only compiled after-drain test seam
+starts a real Root failure writer; it grants no native success or authority.
+The unchanged public C ABI v1 remains, but the private retry class layout changes,
+so every dependent translation unit and facade must be rebuilt coherently.
+
+On native Linux ext4/noatime, GNU 14 O1 normal qualification passed **46 native
+cases plus the existing retry suite**. Six new cases force early/late publication,
+C++ explicit/destructor finish, distinct Roots and persistent allocation failure.
+They require already-drained readers/journals while the first writer is paused,
+no premature Complete/drained, eventual exact ENOSPC rather than later EIO, and
+no close retry after descriptor reuse. The fresh baseline build took 454.88
+seconds; all class-dependent candidate objects rebuilt in 20.52 seconds. Original
+forced counterfailures and diagnostics are retained. This receipt does not
+qualify Windows, Darwin or sanitizer execution; the two earlier sanitizer OOM
+failures remain open and are being diagnosed against their immutable SDK.

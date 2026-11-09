@@ -430,7 +430,9 @@ if(BUILD_TESTING)
       "LINKER:--wrap=close" "LINKER:--wrap=pread" "LINKER:--wrap=openat")
     foreach(retry_case success cancel source-eio candidate-eio source-oom candidate-oom base-oom journal-oom
         cancel-source-oom cancel-candidate-oom cancel-journal-oom prior-source-oom cpp-source-oom cpp-copy-source-oom
-        cpp-finish prior-second-journal-oom)
+        cpp-finish prior-second-journal-oom
+        pending-before-finish pending-after-final-journal-check cpp-pending-finish cpp-pending-destructor
+        pending-before-finish-second pending-before-finish-second-oom)
       add_test(NAME verified_copy_retry_drain_${retry_case} COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py $<TARGET_FILE:ck_fs_verified_copy_retry_drain_linux_tests>
         ${CK_CORE_FS_NATIVE_TEST_ROOT} ${retry_case})

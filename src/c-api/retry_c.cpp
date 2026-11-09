@@ -163,18 +163,20 @@ void run(std::shared_ptr<RetryState> state,VerifiedCopyRetryRequest request) noe
     // Finalization and destruction stay on the worker. This path allocates no
     // cached error strings and cannot turn an exception into public Complete.
     if(core) {
+        bool finish_failed=false;
         try {
             auto finished=core->finish_io();
-            std::lock_guard lock(state->mutex);
-            if(!exceptional)cache_core(*state,*core,true);
-            if(!finished.value()||!*finished.value()) {
-                if(!finished.value()) {
-                    const auto& e=*finished.unavailable_detail();error(state->cache,e);
-                    if(!core->finish_operation().empty())error(state->cache,e.state,e.error.domain,e.error.code,core->finish_operation().data(),core->finish_operation().size());
-                } else if(!finish_error(state->cache,*core))emergency(state->cache);
-                state->cache.state=CKFER_REVIEW_REQUIRED;state->cache.recovery_required=1;
-            }
-        } catch(...) {std::lock_guard lock(state->mutex);if(!finish_error(state->cache,*core))emergency(state->cache);}
+            finish_failed=!finished.value()||!*finished.value();
+        }catch(...){finish_failed=true;}
+        if(const auto hook=detail::verified_copy_retry_test_after_drain.load(std::memory_order_acquire))hook();
+        // All callbacks/finalizers have returned and ownership was drained.
+        // Keep the genuine Roots alive while a separate first writer publishes
+        // its native tuple. This loop performs memory-only POD readback; it is
+        // deliberately outside native close callbacks, finalizers and locks.
+        while(!core->refresh_finish_failure())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::lock_guard lock(state->mutex);
+        if(!exceptional)cache_core(*state,*core,true);
+        if(!finish_error(state->cache,*core)&&finish_failed)emergency(state->cache);
     }
     core.reset();
     // A failed core factory may leave request holding native inputs. Release

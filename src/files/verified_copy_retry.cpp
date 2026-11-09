@@ -410,23 +410,36 @@ struct VerifiedCopyRetryJob::FinishLatch final:MetadataCaptureFailureLatch {
     }
 };
 void VerifiedCopyRetryJob::read_root_finish_failure()noexcept {
-    // A Root error already observed by this job precedes later errors from
-    // the other Root. Never replace that first fixed tuple during draining.
-    if(finish_failure_.present)return;
-    for(const auto& root:{request_.original_prepared_root,request_.attempt_prepared_root})if(root){
+    std::array<PreparedJournalRoot*,2> roots{request_.original_prepared_root.get(),request_.attempt_prepared_root.get()};
+    for(size_t i=0;i<roots.size();++i)if(roots[i]){
         detail::PreparedJournalConsumerFailure failure;
-        if(detail::read_prepared_journal_consumer_failure(*root,failure)&&!failure.pending){
-            // An already latched native Root failure precedes formatting and
-            // cannot be replaced by a secondary close/diagnostic exception.
+        if(!detail::read_prepared_journal_consumer_failure(*roots[i],failure))continue;
+        if(failure.pending){
+            pending_roots_[i]=true;
+            if(!finish_failure_.present&&first_pending_root_==2)first_pending_root_=static_cast<std::uint8_t>(i);
+            continue;
+        }
+        pending_roots_[i]=false;
+        if(!finish_failure_.present&&(first_pending_root_==2||first_pending_root_==i)){
             finish_failure_.present=true;finish_failure_.state=failure.state;
             finish_failure_.domain=failure.domain;finish_failure_.code=failure.code;
-            finish_failure_.operation=failure.operation;return;
+            finish_failure_.operation=failure.operation;first_pending_root_=2;
         }
     }
+}
+bool VerifiedCopyRetryJob::refresh_finish_failure()noexcept {
+    if(!finished_)return false;
+    read_root_finish_failure();
+    if(finish_pending()||finish_failure_.present)phase_=VerifiedCopyRetryState::ReviewRequired;
+    return !finish_pending();
 }
 void VerifiedCopyRetryJob::record_finish(ObservationState state,ErrorDomain domain,
     std::int64_t code,std::string_view operation)noexcept {
     read_root_finish_failure();
+    // That genuine Root already owns the first-writer slot. A pending Adapter
+    // placeholder (or a later EIO) must not replace its eventual native error
+    // or be propagated into another Root's immutable failure latch.
+    if(first_pending_root_!=2)return;
     if(!finish_failure_.present){
         finish_failure_.present=true;finish_failure_.state=state;finish_failure_.domain=domain;finish_failure_.code=code;
         const auto n=std::min(operation.size(),finish_failure_.operation.size()-1);
@@ -436,13 +449,18 @@ void VerifiedCopyRetryJob::record_finish(ObservationState state,ErrorDomain doma
     for(const auto& root:{request_.original_prepared_root,request_.attempt_prepared_root})if(root)
         detail::record_prepared_journal_consumer_failure(*root,first.state,first.domain,first.code,first.operation.data());
 }
-Observation<bool> VerifiedCopyRetryJob::finish_result()const {
+Observation<bool> VerifiedCopyRetryJob::finish_result(bool include_pending)const {
+    if(include_pending&&finish_pending())return Observation<bool>::unavailable(ObservationState::Changed,
+        {ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidAccess),"copy_retry.root_failure_pending"});
     if(!finish_failure_.present)return Observation<bool>::available(true);
     const auto& e=finish_failure_;
     return Observation<bool>::unavailable(e.state,{e.domain,e.code,e.operation.data()});
 }
 Observation<bool> VerifiedCopyRetryJob::finish_consumers() {
-    if(consumers_finished_)return finish_result();
+    // Internal NativeCopy finalization must drain and return without waiting.
+    // Pending Root state is carried separately to the enclosing retry worker;
+    // do not turn its provisional Adapter tuple into a NativeCopy first error.
+    if(consumers_finished_)return finish_result(false);
     FinishLatch latch(*this);
     {
         detail::MetadataCaptureCleanupScope scope(&latch);
@@ -466,10 +484,10 @@ Observation<bool> VerifiedCopyRetryJob::finish_consumers() {
         consumers_finished_=true;
         read_root_finish_failure();
     }
-    return finish_result();
+    return finish_result(false);
 }
 Observation<bool> VerifiedCopyRetryJob::finish_io() {
-    if(finished_)return finish_result();
+    if(finished_){(void)refresh_finish_failure();return finish_result();}
     FinishLatch latch(*this);
     {
         detail::MetadataCaptureCleanupScope scope(&latch);
@@ -514,7 +532,7 @@ Observation<bool> VerifiedCopyRetryJob::finish_io() {
         }catch(...){read_root_finish_failure();if(!finish_failure_.present)record_finish(ObservationState::Unknown,
             ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.root_finish_exception");}
         read_root_finish_failure();finished_=true;
-        if(finish_failure_.present)phase_=VerifiedCopyRetryState::ReviewRequired;
+        if(finish_pending()||finish_failure_.present)phase_=VerifiedCopyRetryState::ReviewRequired;
         else if(phase_!=VerifiedCopyRetryState::Complete&&phase_!=VerifiedCopyRetryState::ReviewRequired&&phase_!=VerifiedCopyRetryState::Cancelled)
             phase_=VerifiedCopyRetryState::Cancelled;
     }
