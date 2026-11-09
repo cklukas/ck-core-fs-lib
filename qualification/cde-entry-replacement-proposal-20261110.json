@@ -1,0 +1,38 @@
+{
+  "start_utc": "2026-11-09T23:31:02.847879+00:00",
+  "base_commit": "99489ef7835aa5e95be3bc319e676ede021034a4",
+  "archive_sha256": "44c3d6d2eef84d5cbbc4a0e16ab80f51bbefe74b3ef0a76f6bf479ae11153512",
+  "overlay": {
+    "docs/native-contracts.md": "26d50eabd34d60f196a3ff1be99cae44d345e41cc26d8fc9346e6cfcdbae1b55",
+    "docs/integration.md": "b192bc05973fbc802263fd54fe8f56507a812f8cab32e7476dc313ff48df8536",
+    "docs/roadmap.md": "e9458c679802a24f3e47224796e3356353d7b6f7654ba30ef9c31a31a0358f15"
+  },
+  "tool_sha256": "78a61c7afc6b25ed0fe097d0babfde21186e5e7e9c7dc7733600d63ad7127630",
+  "tool_version": "ckdocs 0.10.1+g7e3ee5eb57a2",
+  "command": [
+    "/opt/homebrew/bin/ckdocs-0.10.1",
+    "build",
+    "--root",
+    "/Volumes/S8T/tmp/ckutilities-docs-compiler.bb4ibdup/backend-docs-overlay",
+    "--out",
+    "/Volumes/S8T/tmp/ckutilities-docs-compiler.bb4ibdup/backend-docs-site",
+    "--strict"
+  ],
+  "scope": "ONE strict backend docs render; proposed CDE contract only, no API implementation or 0.3/Apply qualification",
+  "exit": 0,
+  "seconds": 0.03705833398271352,
+  "end_utc": "2026-11-09T23:31:02.908732+00:00",
+  "source_live_unchanged": true,
+  "anchor_pages": [
+    "native-contracts.html"
+  ],
+  "anchor_link_pages": [
+    "integration.html",
+    "site-index.html",
+    "roadmap.html",
+    "native-contracts.html"
+  ],
+  "roadmap_branch_wording": [
+    "The unreleased 0.5 work on `master` is being qualified independently of released frontend"
+  ]
+}

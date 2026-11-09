@@ -23,3 +23,11 @@ reopening or operation safety logic.
 The ABI deliberately keeps allocation and lifetime rules explicit so a CDE
 adapter can translate snapshots and structured errors into its own status
 bar/event loop without crossing a C++ exception or callback boundary.
+
+CDE currently keeps qualified SDK 0.3/`3972516` frozen and FS Apply disabled.
+dtfile's legacy worker-owned conflict/Replace path is a compatibility contract;
+its best-effort backup does not claim durable publication, retention or restart
+safety. Migrating it requires the proposed [held entry and durable replacement
+contract](native-contracts.md#proposed-cde-entry-and-replacement-contract), a
+coherent qualified installed SDK, and an explicit downstream admission. Do not
+borrow newer API headers or treat local SAME_ENTRY flags as backend authority.

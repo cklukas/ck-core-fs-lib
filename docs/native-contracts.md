@@ -81,6 +81,106 @@ contract. Neither does an advisory session lock. Unsupported providers refuse
 this operation before moving the old target. Provider refusals are limits,
 not completed platform implementations.
 
+## Proposed CDE entry and replacement contract
+
+**Blocking integration gap; proposal only.** CDE currently pins qualified SDK
+0.3 at `3972516`, keeps FS Apply disabled, and uses dtfile's legacy worker-owned
+mutation contract. Its local Replace backup is best-effort compatibility
+behavior, not durable retention or crash/restart evidence. A local SAME_ENTRY
+flag based on resolved pathname equality is a conservative action blocker only.
+It is never backend execution authority. This proposal does not add exports,
+qualify a provider, or authorize using newer headers with that SDK.
+
+The replacement requires two additive opaque C capabilities. Existing v1
+layouts and exports must remain unchanged; exact names and ABI revision remain
+subject to implementation and qualification.
+
+| Proposed capability | Backend-owned evidence | Caller-visible result |
+| --- | --- | --- |
+| Held entry binding and relation job | Genuine held parent, exact native leaf, held object, provider namespace rules, and current binding/continuity checks | Same entry; distinct entries referencing the same object; distinct objects; or Unknown, with a typed reason |
+| Reviewed replacement job and receipt | Held source and destination bindings, verified incoming staging owner, old-target retention owner, policy, operation identity, review generation, and durable journals | Reviewable capabilities and consequences; one-use execution receipt; per-row publication, retention and recovery outcomes |
+
+Both jobs perform filesystem work on backend workers. UI calls submit bounded
+copied requests or retrieve cached snapshots, pages and exact native components.
+Cancellation and release are nonblocking requests; a separate drained query
+establishes that native owners and the admission slot have been released. An
+owned capability cannot be constructed from caller-authored IDs, hashes, native
+paths, or a relation enum. Releasing a handle invalidates further caller use
+without abandoning an in-flight native operation.
+
+Relation assessment must distinguish object identity from directory-entry
+identity. Two hard links can reference the same object while remaining distinct
+entries. Windows case aliases and short names require qualified native namespace
+evidence; raw UTF-16 inequality is not proof of distinct entries. Resolved path
+equality can refuse an operation but cannot mint a capability. Unknown or
+ambiguous parent/leaf continuity stays blocked. A relation snapshot is historical
+evidence, not a token authorizing later deletion or replacement.
+
+The backend must enforce the actual mutation through a qualified held-object
+boundary after fresh revalidation. A pathname check followed by pathname erase,
+rename, or overwrite leaves a race and does not satisfy this contract. A
+provider without the required primitive must refuse the affected operation;
+advisory locks, timestamps or another successful stat do not supply it.
+
+The review freezes job identity, row IDs, generation, source and destination
+observations, direction, exact native naming choices, metadata policy, retention
+policy and expected consequences. Only an accepted worker review issues a
+one-use receipt. A new review invalidates older receipts. The backend rejects
+stale, foreign, unresolved or already-consumed receipts before mutation. A bulk
+preference applies only to its reviewed scope; a newly discovered conflict needs
+a new review. Command outcomes remain identifiable until acknowledged even when
+progress events coalesce.
+
+Replacement uses the existing retained-target protocol: verify incoming content
+and required metadata, durably prepare retention, move the exact old target to
+its reviewed unique version name, flush and record that transition, then attempt
+no-replace publication of the incoming object. Never overwrite an intervening
+entry. Incoming success requires verified publication and every required file,
+journal and namespace durability barrier and fallible close. The old version
+remains retained after success; this proposal grants no automatic expiry or
+backup deletion. Any later retirement requires its own explicit policy and live
+native authority. Source retirement is likewise a separate reviewed operation.
+
+Snapshots must distinguish no mutation, old target retained, publication
+attempted, publication confirmed, verified completion, cancellation, partial
+work, and reconciliation required. These are separate facts, not a single
+success flag. Once retention or publication has occurred, cancellation cannot
+pretend that nothing changed. A failure or uncertain publication preserves the
+retained object and evidence; it does not authorize path-based rollback or
+deletion. Native first-error evidence must survive allocation failure, late
+finalizers and cancellation. Pending diagnostic publication is provisional,
+never a successful terminal result or an immutable placeholder error.
+
+Durable receipts record exact native components, observed object identities and
+versions, requested/achieved preservation, transition ordering, journal IDs and
+retained-version outcomes. Persisted evidence supports bounded read-only restart
+inspection. It does not recreate a live entry binding, grant cleanup authority,
+or authorize automatic mutation replay. Cross-object retention/publication is
+not advertised as an atomic transaction or a simultaneous filesystem snapshot.
+
+CDE may replace its compatibility path only after the following admission gates:
+
+1. Implement the opaque bindings, relation worker and replacement receipt bridge
+   using genuine native providers and bounded handle/memory admission, including
+   retained streams and overlapping ownership graphs.
+2. Qualify positive supported operations and explicit refusals on each admitted
+   provider. Cover hard links, native aliases, parent/leaf replacement and
+   reparenting, reparse/mount transitions, concurrent writers, security changes,
+   long DOS/UNC paths and exact UTF-16 names where applicable.
+3. Exercise stale/foreign/replayed receipts, review replacement, cancellation at
+   every transition, disk-full, persistent allocation failure, consumed-close
+   errors, partial publication and crash/restart inspection. Independently verify
+   that original, incoming, competing and retained objects have the promised
+   contents and identities, and that no unreviewed object was erased.
+4. Build a coherent installed SDK and independent C consumer; verify headers,
+   exports, lifetime/drained semantics and matching normal/sanitizer matrices.
+   Publish the exact admitted revision and provider limitations to CDE before
+   changing its dependency pin or enabling any previously blocked command.
+
+Until those gates pass, the compatibility path remains explicitly separate and
+FS Apply remains disabled. API declarations, relation labels, focused passing
+tests, or the existence of newer C++ internals do not close this integration gap.
+
 ## Metadata replay
 
 `MetadataReplayPolicy` selects the requested scope, original or current-caller

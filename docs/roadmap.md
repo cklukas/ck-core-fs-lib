@@ -45,7 +45,7 @@ qualification gate and does not authorize a frontend dependency pin.
 
 ## Current development gates
 
-The unreleased 0.5 branch is being qualified independently of released frontend
+The unreleased 0.5 work on `master` is being qualified independently of released frontend
 pins. Detailed frozen-cohort evidence is in the
 [development validation record](validation-2026-11-03-development.md).
 
@@ -55,6 +55,7 @@ pins. Detailed frozen-cohort evidence is in the
 | Retention and preservation | Native Windows retained versions; Windows Full Original metadata; narrow Linux Full issuer; bounded ACL/xattr replay | Combined Caller/clone/Full SDK; other provider scopes remain explicit refusals |
 | Durable two-way sessions | Flat coordinator, overlapping-root locks, durable generation recovery; qualified read-only Session leases | Recursive mutation and nested-path durable ledger/CAS binding |
 | Stable C operation APIs | Batch rename, native Trash receipts/restore, verified retry/prefix resume, cached name-side feedback | Final combined installed-consumer and platform checks |
+| CDE compatibility migration | Qualified 0.3 pin remains frozen; legacy worker ownership and best-effort Replace are explicitly separate | Additive backend-held parent/leaf/object relation capability and durable replacement/retention receipt; [proposal and admission gates](native-contracts.md#proposed-cde-entry-and-replacement-contract); FS Apply remains disabled |
 | Platform qualification | Scoped Linux/Windows normal and sanitizer receipts; corrected Darwin TSan tooling; strict ckdocs | Matching final SDK matrices, macOS native publication limits, and native-host CI admission/provenance |
 
 Typed Unsupported outcomes describe provider limits. They do not count as a
