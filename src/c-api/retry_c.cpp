@@ -93,6 +93,11 @@ void error(ckfer_snapshot_v1& cache,ObservationState observation,ErrorDomain dom
 void error(ckfer_snapshot_v1& cache,const UnavailableObservation& failure) noexcept {
     error(cache,failure.state,failure.error.domain,failure.error.code,failure.error.operation.data(),failure.error.operation.size());
 }
+bool finish_error(ckfer_snapshot_v1& cache,const VerifiedCopyRetryJob& core)noexcept {
+    const auto& e=core.native_finish_failure();if(!e.present)return false;
+    error(cache,e.state,e.domain,e.code,e.operation.data(),std::char_traits<char>::length(e.operation.data()));
+    cache.state=CKFER_REVIEW_REQUIRED;cache.recovery_required=1;return true;
+}
 void emergency(ckfer_snapshot_v1& cache) noexcept {
     error(cache,ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.worker_exception",27);
     cache.state=CKFER_FAILED;cache.recovery_required=1;
@@ -121,6 +126,7 @@ void cache_core(RetryState& state,const VerifiedCopyRetryJob& core,bool final) {
     if(!core.finish_operation().empty())
         error(out,static_cast<ObservationState>(out.failure_state),static_cast<ErrorDomain>(out.failure_domain),
             out.failure_code,core.finish_operation().data(),core.finish_operation().size());
+    if(final&&finish_error(out,core)){++out.sequence;state.cv.notify_all();return;}
     out.recovery_required=core.has_attempt()&&next!=CKFER_COMPLETE;
     if(next==CKFER_REVIEW_REQUIRED)out.recovery_required=1;
     if(next==CKFER_AWAITING_REVIEW&&!state.execute)out.review_id=out.job_id;
@@ -165,10 +171,10 @@ void run(std::shared_ptr<RetryState> state,VerifiedCopyRetryRequest request) noe
                 if(!finished.value()) {
                     const auto& e=*finished.unavailable_detail();error(state->cache,e);
                     if(!core->finish_operation().empty())error(state->cache,e.state,e.error.domain,e.error.code,core->finish_operation().data(),core->finish_operation().size());
-                } else emergency(state->cache);
+                } else if(!finish_error(state->cache,*core))emergency(state->cache);
                 state->cache.state=CKFER_REVIEW_REQUIRED;state->cache.recovery_required=1;
             }
-        } catch(...) {std::lock_guard lock(state->mutex);emergency(state->cache);}
+        } catch(...) {std::lock_guard lock(state->mutex);if(!finish_error(state->cache,*core))emergency(state->cache);}
     }
     core.reset();
     // A failed core factory may leave request holding native inputs. Release

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "verified_copy_retry.hpp"
+#include "platform/prepared_journal_root_bridge.hpp"
+#include <cstring>
 #include <algorithm>
 #include <array>
 
@@ -33,7 +35,11 @@ Observation<VerifiedCopyRetryJob::Pointer> VerifiedCopyRetryJob::create(Verified
             {ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::PlanInvalid),"copy_retry.request"});
     return Observation<Pointer>::available(Pointer(new VerifiedCopyRetryJob(std::move(request))));
 }
-VerifiedCopyRetryJob::~VerifiedCopyRetryJob()=default;
+VerifiedCopyRetryJob::~VerifiedCopyRetryJob(){
+    // Worker-only fallback while every member/callback target is still alive.
+    // The normal C worker already drained explicitly; repeats perform no I/O.
+    try{(void)finish_io();}catch(...){}
+}
 VerifiedCopyRetryState VerifiedCopyRetryJob::reject(const UnavailableObservation& e) {
     failure_=e;phase_=VerifiedCopyRetryState::ReviewRequired;return phase_;
 }
@@ -244,6 +250,7 @@ Observation<bool> VerifiedCopyRetryJob::begin_copy(std::stop_token stop) {
         request_.attempt_prepared_root->open_journal(request_.attempt_journal_name,true):
         open_native_operation_journal_file(*request_.attempt_journal_root,request_.attempt_journal_name,true);
     if(!opened.value())return forwarded(*opened.unavailable_detail());
+    had_attempt_=true;
     attempt_file_=std::shared_ptr<OperationJournalFile>(std::move(opened).take_value());
     auto journal=OperationJournal::create(FileOperation::Copy,request_.attempt_id);
     if(!journal.value())return forwarded(*journal.unavailable_detail());
@@ -281,9 +288,11 @@ Observation<bool> VerifiedCopyRetryJob::begin_copy(std::stop_token stop) {
         auto dest=check_destination();if(!dest.value()||!*dest.value())return dest;
         return metadata_->verify(entry,token);
     };
+    // NativeCopy cannot publish terminal success until strict metadata/source
+    // readers have been consumed and their actual close errors propagated.
+    copy_request.finish_metadata=[this]{return finish_consumers();};
     copy_request.reviewed_content_digest=reviewed_digest_;
     copy_request.prepare_stream=[this](OpenedEntry& source,OpenedEntry& stage,StreamCopyLimits limits) {
-        attempt_stage_=&stage;
         StreamCopyRequest stream;
         stream.limits=limits;
         stream.read_source=[this,&source](uint64_t offset,size_t maximum,std::stop_token token) {
@@ -344,35 +353,115 @@ VerifiedCopyRetryState VerifiedCopyRetryJob::advance(std::stop_token stop) {
     }
     return phase_;
 }
-Observation<bool> VerifiedCopyRetryJob::finish_io() {
-    if(finished_)return finish_failure_?forwarded(*finish_failure_):Observation<bool>::available(true);
-    // Finish both owners even when the first reports a delayed error.
-    const auto record=[this](ObservationState state,ErrorDomain domain,int64_t code,std::string_view operation) {
-        if(!finish_failure_) {
-            const auto count=std::min(operation.size(),finish_operation_.size()-1);
-            std::copy_n(operation.data(),count,finish_operation_.data());
-            finish_failure_=UnavailableObservation{state,{domain,code,{}}};
+struct VerifiedCopyRetryJob::FinishLatch final:MetadataCaptureFailureLatch {
+    VerifiedCopyRetryJob& job;
+    const MetadataCaptureFailureLatch* previous;
+    explicit FinishLatch(VerifiedCopyRetryJob& value):job(value),previous(detail::current_metadata_capture_cleanup()){}
+    void record_first(MetadataCaptureCleanupError e)const noexcept override {
+        job.record_finish(e.state,e.domain,e.code,e.operation?e.operation:"copy_retry.consumer_close");
+        if(previous)previous->record_first(e);
+    }
+};
+void VerifiedCopyRetryJob::read_root_finish_failure()noexcept {
+    for(const auto& root:{request_.original_prepared_root,request_.attempt_prepared_root})if(root){
+        detail::PreparedJournalConsumerFailure failure;
+        if(detail::read_prepared_journal_consumer_failure(*root,failure)&&!failure.pending){
+            // An already latched native Root failure precedes formatting and
+            // cannot be replaced by a secondary close/diagnostic exception.
+            finish_failure_.present=true;finish_failure_.state=failure.state;
+            finish_failure_.domain=failure.domain;finish_failure_.code=failure.code;
+            finish_failure_.operation=failure.operation;return;
         }
-    };
-    if(attempt_stage_) {
-        try {
-            auto result=attempt_stage_->finish_content_writes();
-            if(!result.value()) {const auto& e=*result.unavailable_detail();record(e.state,e.error.domain,e.error.code,e.error.operation);}
-            else if(!*result.value())record(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.finish_stage_result");
-        } catch(...) {record(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.finish_stage_exception");}
     }
-    for(auto* file:{original_file_.get(),attempt_file_.get()})if(file) {
-        try {
-            auto result=file->finish_io();
-            if(!result.value()) {const auto& e=*result.unavailable_detail();record(e.state,e.error.domain,e.error.code,e.error.operation);}
-            else if(!*result.value())record(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.finish_journal_result");
-        } catch(...) {record(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.finish_journal_exception");}
+}
+void VerifiedCopyRetryJob::record_finish(ObservationState state,ErrorDomain domain,
+    std::int64_t code,std::string_view operation)noexcept {
+    read_root_finish_failure();
+    if(!finish_failure_.present){
+        finish_failure_.present=true;finish_failure_.state=state;finish_failure_.domain=domain;finish_failure_.code=code;
+        const auto n=std::min(operation.size(),finish_failure_.operation.size()-1);
+        if(n)std::memcpy(finish_failure_.operation.data(),operation.data(),n);finish_failure_.operation[n]=0;
     }
-    finished_=true;
-    if(finish_failure_) {phase_=VerifiedCopyRetryState::ReviewRequired;failure_=finish_failure_;return forwarded(*finish_failure_);}
-    return Observation<bool>::available(true);
+    const auto& first=finish_failure_;
+    for(const auto& root:{request_.original_prepared_root,request_.attempt_prepared_root})if(root)
+        detail::record_prepared_journal_consumer_failure(*root,first.state,first.domain,first.code,first.operation.data());
+}
+Observation<bool> VerifiedCopyRetryJob::finish_result()const {
+    if(!finish_failure_.present)return Observation<bool>::available(true);
+    const auto& e=finish_failure_;
+    return Observation<bool>::unavailable(e.state,{e.domain,e.code,e.operation.data()});
+}
+Observation<bool> VerifiedCopyRetryJob::finish_consumers() {
+    if(consumers_finished_)return finish_result();
+    FinishLatch latch(*this);
+    {
+        detail::MetadataCaptureCleanupScope scope(&latch);
+        read_root_finish_failure();
+        // These are independently acquired worker read owners. Drop our alias
+        // before the preservation object's explicit close consumes its last
+        // HeldChild and all channel/security proof readers under this latch.
+        readable_source_.reset();
+        if(metadata_)try {
+            auto closed=metadata_->finish_io();
+            if(const auto* e=closed.unavailable_detail())record_finish(e->state,e->error.domain,e->error.code,e->error.operation);
+            else if(!*closed.value())record_finish(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.metadata_finish_false");
+        }catch(...){
+            read_root_finish_failure();
+            if(!finish_failure_.present)record_finish(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.metadata_finish_exception");
+        }
+        metadata_.reset();readable_candidate_.reset();
+        request_.source.reset();request_.candidate.reset();
+        consumers_finished_=true;
+        read_root_finish_failure();
+    }
+    return finish_result();
+}
+Observation<bool> VerifiedCopyRetryJob::finish_io() {
+    if(finished_)return finish_result();
+    FinishLatch latch(*this);
+    {
+        detail::MetadataCaptureCleanupScope scope(&latch);
+        read_root_finish_failure();
+        if(copy_) {
+            // Exceptional exits can interrupt execution before its terminal
+            // finalizer. A stopped advance drives the real copy's existing
+            // all-owner drain; never create validation/publication work here.
+            const auto state=copy_->state();
+            if(state!=OperationExecutionState::Complete&&state!=OperationExecutionState::Cancelled&&
+               state!=OperationExecutionState::Failed&&state!=OperationExecutionState::NeedsReconciliation&&
+               state!=OperationExecutionState::RetainedSource)try {
+                drain_stop_.request_stop();(void)copy_->advance(drain_stop_.get_token());
+            }catch(...){read_root_finish_failure();if(!finish_failure_.present)record_finish(ObservationState::Unknown,
+                ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.copy_finish_exception");}
+        }
+        // NativeCopy owns and consumes its writer. Never reopen/reclose a
+        // borrowed staging pointer after its terminal finalizer has returned.
+        if(copy_){final_progress_=copy_->progress();have_final_progress_=true;}
+        copy_.reset();
+        try{(void)finish_consumers();}catch(...){read_root_finish_failure();if(!finish_failure_.present)
+            record_finish(ObservationState::Unknown,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.consumer_finish_exception");}
+        // Never let allocating result diagnostics stop the second journal's
+        // explicit close. Scalar recording and exception fallback do not allocate.
+        for(auto* file:{original_file_.get(),attempt_file_.get()})if(file)try {
+            auto closed=file->finish_io();
+            if(const auto* e=closed.unavailable_detail())record_finish(e->state,e->error.domain,e->error.code,e->error.operation);
+            else if(!*closed.value())record_finish(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.journal_finish_false");
+        }catch(...){read_root_finish_failure();if(!finish_failure_.present)record_finish(ObservationState::Unknown,
+            ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.journal_finish_exception");}
+        original_file_.reset();attempt_file_.reset();request_.destination.reset();
+        read_root_finish_failure();finished_=true;
+        if(finish_failure_.present)phase_=VerifiedCopyRetryState::ReviewRequired;
+    }
+    // All native owners have been consumed before any error string can allocate.
+    // The C worker reads native_finish_failure() even if this construction throws.
+    if(finish_failure_.present){const auto& e=finish_failure_;
+        failure_=UnavailableObservation{e.state,{e.domain,e.code,e.operation.data()}};}
+    return finish_result();
 }
 OperationProgress VerifiedCopyRetryJob::progress() const noexcept {
-    return copy_?copy_->progress():OperationProgress{OperationExecutionState::Copying,0,source_size_};
+    return copy_?copy_->progress():have_final_progress_?final_progress_:OperationProgress{OperationExecutionState::Copying,0,source_size_};
 }
 } // namespace ck::files

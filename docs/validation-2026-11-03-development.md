@@ -828,3 +828,35 @@ failed; the corrected fixture passed **51 native checks** against the exact
 unchanged frozen SDK headers and three static archives. Source and archive
 hashes were verified before and after; no production source or original SDK
 was modified for this comparison. The other six tests remain under review.
+
+
+## Verified retry: reader drain before native and C terminal success
+
+The original production C-worker control reproduced Complete/code-zero after
+its review reader's consumed close failed. A separate allocation-failure
+control replaced a native journal close error with an Adapter error. Retry now
+provides NativeCopy with an explicit metadata/read-owner finalizer, drains
+source and prefix-candidate views, and preserves the first native error in a
+fixed POD before publishing terminal state. The worker reads that POD even
+when constructing an error Observation throws. Its destructor uses the same
+idempotent drain, and the raw borrowed staging pointer is removed. Progress and
+attempt existence remain available as immutable cached values after drain.
+
+The matched Linux AArch64 GCC 14/O1 normal cohort passed **12 production C-worker
+cases**, **two C++ abandonment cases**, and the existing verified-retry suite.
+Cases cover success/cancellation, consumed source/candidate/base-reader and
+journal close failures, persistent allocation failure, descriptor reuse with
+no repeated close, and preservation of prior Root ENOSPC. No external cleanup
+observer assists the production C worker. The affected SDK rebuild took
+12.13 seconds and the strict native probe build 12.18 seconds. All qualification
+stages passed; original failing controls remain preserved.
+
+Packet manifest:
+`ec311a016bae26cf42d93766c74877d9e3e832b4af0d43e05c53a4bbcb2baeb6`;
+frozen source manifest:
+`7bbbd73a9f53f659bcedeb3394ff1e0b953ababfe602f7524bfe2263afdf836d`.
+C ABI v1 layouts are unchanged. The private C++ retry class layout changed,
+requiring coherent rebuilds of its implementation, C wrapper and consumers.
+Permanent Linux CTest entries register all fourteen modes. Windows, sanitizer
+and final combined qualification remain pending. Genuine private-Root overlap
+admission is a separate implementation increment, still under qualification.

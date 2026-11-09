@@ -5,6 +5,7 @@
 #include "prepared_journal_root.hpp"
 #include "sha256.hpp"
 #include <string_view>
+#include <type_traits>
 
 namespace ck::files {
 // This is an explicitly reviewed NEW copy, not adoption of a reopened stage.
@@ -39,6 +40,17 @@ struct VerifiedCopyRetryRequest final {
     MetadataReplayPolicy metadata_policy;
     PreparedJournalRoot::Pointer original_prepared_root,attempt_prepared_root;
 };
+// Diagnostic only. Fixed native first-error storage remains readable even if
+// constructing an Observation/string throws AFTER all owners were drained.
+struct VerifiedCopyRetryFinishFailure final {
+    bool present=false;
+    ObservationState state=ObservationState::Unknown;
+    ErrorDomain domain=ErrorDomain::None;
+    std::int64_t code=0;
+    std::array<char,96> operation{};
+};
+static_assert(std::is_trivially_copyable_v<VerifiedCopyRetryFinishFailure>);
+static_assert(std::is_nothrow_default_constructible_v<VerifiedCopyRetryFinishFailure>);
 enum class VerifiedCopyRetryState {
     LoadingJournal, ReviewingSource, AwaitingReview, RevalidatingSource,
     Copying, Complete, ReviewRequired, Cancelled
@@ -53,14 +65,15 @@ public:
     ~VerifiedCopyRetryJob();
     VerifiedCopyRetryState state() const noexcept { return phase_; }
     const std::optional<UnavailableObservation>& failure() const noexcept { return failure_; }
-    std::string_view finish_operation() const noexcept { return finish_operation_.data(); }
+    std::string_view finish_operation() const noexcept { return finish_failure_.operation.data(); }
+    const VerifiedCopyRetryFinishFailure& native_finish_failure()const noexcept{return finish_failure_;}
     VerifiedCopyRetryState advance(std::stop_token stop={});
     Observation<bool> approve();
     std::uint64_t reviewed_bytes() const noexcept { return source_offset_; }
     std::uint64_t source_bytes() const noexcept { return source_size_; }
     std::uint64_t prefix_bytes() const noexcept { return request_.candidate_prefix_bytes; }
     std::uint64_t copied_prefix_bytes() const noexcept { return copied_prefix_bytes_; }
-    bool has_attempt() const noexcept { return bool(attempt_file_); }
+    bool has_attempt() const noexcept { return had_attempt_; }
     OperationProgress progress() const noexcept;
     std::optional<std::array<std::byte,32>> reviewed_digest() const noexcept { return reviewed_digest_; }
     std::optional<std::array<std::byte,32>> origin_digest() const noexcept { return origin_digest_; }
@@ -77,6 +90,11 @@ private:
     Observation<bool> check_destination() const;
     Observation<bool> begin_copy(std::stop_token);
     VerifiedCopyRetryState reject(const UnavailableObservation&);
+    struct FinishLatch;
+    void record_finish(ObservationState,ErrorDomain,std::int64_t,std::string_view)noexcept;
+    void read_root_finish_failure()noexcept;
+    Observation<bool> finish_consumers();
+    Observation<bool> finish_result()const;
     VerifiedCopyRetryRequest request_;
     VerifiedCopyRetryState phase_=VerifiedCopyRetryState::LoadingJournal;
     std::optional<UnavailableObservation> failure_;
@@ -95,9 +113,10 @@ private:
     std::uint64_t copied_prefix_bytes_=0;
     std::shared_ptr<OperationJournalFile> attempt_file_;
     NativeOperationCopyJob::Pointer copy_;
-    OpenedEntry* attempt_stage_=nullptr; // borrowed only while copy_ owns it
-    bool finished_=false;
-    std::optional<UnavailableObservation> finish_failure_;
-    std::array<char,96> finish_operation_{};
+    bool finished_=false,consumers_finished_=false,had_attempt_=false,have_final_progress_=false;
+    OperationProgress final_progress_{};
+    VerifiedCopyRetryFinishFailure finish_failure_;
+    // Allocated at factory construction, before acquiring worker read/journal owners.
+    std::stop_source drain_stop_;
 };
 } // namespace ck::files

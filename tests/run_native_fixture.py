@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 
-binary, scratch = sys.argv[1:]
+binary, scratch, *arguments = sys.argv[1:]
 parent = Path(scratch)
 if not parent.is_absolute():
     raise ValueError("native fixture scratch must be absolute")
@@ -24,4 +24,4 @@ if os.name == "nt":
 Path(native_parent).mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix="native-contract-", dir=native_parent) as work:
     env = dict(os.environ, TMPDIR=work, TEMP=work, TMP=work)
-    subprocess.run([binary, work], check=True, env=env, timeout=150)
+    subprocess.run([binary, work, *arguments], check=True, env=env, timeout=150)
