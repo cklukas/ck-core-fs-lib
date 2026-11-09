@@ -1024,3 +1024,26 @@ seconds; all class-dependent candidate objects rebuilt in 20.52 seconds. Origina
 forced counterfailures and diagnostics are retained. This receipt does not
 qualify Windows, Darwin or sanitizer execution; the two earlier sanitizer OOM
 failures remain open and are being diagnosed against their immutable SDK.
+
+
+## November 9 combined Linux ASan/UBSan retry and resolution qualification
+
+A new immutable `78c7386` snapshot passed **175/175 default tests, zero skipped**,
+with all 212 configured translation units instrumented by GCC 14 ASan/UBSan.
+No NDEBUG, sanitizer exclusions or mixed normal objects were used. This includes
+the six forced pending-writer cases, both formerly aborting OOM modes, the
+post-finish resolution guard, Session close tests and reconciled Tree fixtures.
+Configure took 1.28 seconds, the fresh 289-step build 1,165.04 seconds, and the
+serial test suite 334.91 seconds. The comparable preceding 212-TU instrumented
+build took 1,225.65 seconds. Source manifests, exact compile commands, outputs
+and both runtime hashes were checked and retained.
+
+The preceding `45914b8` cohort remains **159/169** in its original evidence.
+A separate bounded investigation passed two unchanged-binary and ten diagnostic
+runs of its two OOM cases without a recurrence, stall or sanitizer report. Their
+historical SIGABRTs remain unexplained; the new passing cohort is independent
+evidence, not a reinterpretation of those failures. No deadline was widened.
+
+This combined receipt qualifies the stated Linux snapshot only. Hierarchical
+Session relay, the later Windows rename/action patch, new archive ownership
+work, Windows/macOS runtime matrices and ThreadSanitizer remain separate gates.
