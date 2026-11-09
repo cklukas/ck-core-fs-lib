@@ -959,3 +959,36 @@ These client checks do not establish native coverage for the model-only Core
 consumer or qualify newer Main private C++ layouts. The separate full frozen
 ReFS SDK run completed **72/84 PASS, 12 failures, zero skipped**; its failures
 remain release/qualification work and are not changed into expected passes.
+
+
+## November 9 full Linux normal run and post-finish resolution guard
+
+Frozen `85085d8` passed **169/169 tests, zero skipped**, against a fresh
+212-TU GCC 14 Debug/O1 build. Configure took 1.12 seconds, all 289 build steps
+773.37 seconds, and tests 119.39 seconds. Source manifest SHA-256 is
+`75c77c029955c38fbd77847504c04488f6df6e2a13a430f2d27c258e023175b4`.
+The comparable earlier normal cohort took 577.56 seconds for 209 TUs/283 steps;
+the larger current build overlapped other bounded single-CPU jobs. The verbose
+compile log, exact outputs, timings and unchanged source receipt are retained;
+this receipt excludes subsequent pending-writer and hierarchy changes.
+
+The separate fully instrumented GCC 14 ASan/UBSan `45914b8` cohort completed
+**159/169 tests, 10 failures, zero skipped**. Six failures are the older Tree
+fixture expectations subsequently corrected in `85085d8`; two retry OOM aborts
+remain under investigation. Two resolution tests exposed a genuine UBSan null
+reference: after Session finish revokes `storage_root()`, `require_clean()`
+dereferenced that empty shared pointer while checking the saved close error.
+
+The guard now retains and checks the optional Root before reading it, then
+returns the existing first close failure. The regression checks matching error
+domain/code on repeated finish and post-finish assess, unchanged generation and
+fresh recovery. No header or class layout changed. A controlled derivative of
+the exact fully instrumented SDK rebuilt the production TU and strengthened
+test TU (18.72 and 8.94 seconds), replacing just that static archive member.
+Both affected binaries passed: **370 resolution checks** and the existing
+POSIX consumed-close/recovery suite (**669 checks**, including its 369-check
+resolution bundle). Their links took 0.67 seconds each and native runs 10.78
+and 11.30 seconds. Original SDK sources, headers, libraries and both sanitizer
+runtimes remained hash-identical; no normal/instrumented object mixing occurred.
+The initial failure cohort remains immutable. This is focused sanitizer proof,
+not a subsequent whole-suite or Windows/macOS qualification claim.

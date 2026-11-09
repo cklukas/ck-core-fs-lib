@@ -161,7 +161,10 @@ struct NativeSyncResolution::State final : MetadataCaptureFailureLatch {
     }
     void require_clean() {
         detail::PreparedJournalConsumerFailure failure;
-        if(session&&detail::read_prepared_journal_consumer_failure(*session->storage_root(),failure))
+        // Session finish revokes storage_root(), while this worker retains its
+        // immutable result and first close error for later API calls.
+        const auto root=session?session->storage_root():PreparedJournalRoot::Pointer{};
+        if(root&&detail::read_prepared_journal_consumer_failure(*root,failure))
             remember_close(failure.state,failure.domain,failure.code,failure.operation.data());
         if(close_failed)throw Failure{{close_failure.state,{close_failure.domain,close_failure.code,close_failure.operation.data()}}};
     }
