@@ -477,7 +477,18 @@ void test_cancel_copy_writer_finish(bool typed) {
     CHECK(take(job->page(0,1)).items.front().state==ReviewedTreeItemState::NeedsReconciliation);
     job->advance(stop.get_token());CHECK(tree_finish_fault::hits==1);
     // A cached terminal plan does not retain the private Root's native users.
-    if(root)CHECK(take(root->finish_io()));
+    if(root) {
+        const auto finished=root->finish_io();
+        CHECK(!finished.value()&&finished.unavailable_detail());
+        const auto& failure=*finished.unavailable_detail();
+        CHECK(failure.error.domain==ErrorDomain::Posix&&failure.error.code==EIO);
+        CHECK(failure.error.operation.starts_with("content."));
+        const auto repeated=root->finish_io();
+        CHECK(!repeated.value()&&repeated.unavailable_detail());
+        CHECK(repeated.unavailable_detail()->error.domain==failure.error.domain&&
+              repeated.unavailable_detail()->error.code==failure.error.code&&
+              repeated.unavailable_detail()->error.operation==failure.error.operation);
+    }
     CHECK(!f.exists("d/a")&&f.read("s/a")==payload);
     job.reset();CHECK(tree_finish_fault::hits==1);
 }

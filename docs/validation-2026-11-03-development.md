@@ -806,3 +806,25 @@ The Windows implementation and native fixtures are present but **unqualified**:
 SSH timed out before any build launched. Matching sanitizer and combined SDK
 qualification also remain pending. The bounded review found no additional
 concrete overlap-lock bypass or durable-intent ordering defect.
+
+
+## Full Linux normal cohort and cancellation fixture reconciliation
+
+The frozen `2fffc30` cohort contains 469 files. Its fresh GCC 14 Debug/O1/g0
+build compiled all **209 configured translation units in 283 steps**, taking
+577.56 seconds. Every configured object was observed in Ninja, with output
+timestamps within the recorded build interval. The empty output directory,
+compiler commands and source hashes prove freshness; no compiler cache launcher
+or reused object was found. Earlier selected-build timings are not the same
+workload. The complete default CTest run was **126/133 PASS**, with seven
+failures retained in its original XML/logs. This cohort is not fully qualified.
+
+One failure was an obsolete cancellation-fixture expectation: after proving an
+anonymous writer's failed flush and NeedsReconciliation, it still expected Root
+finalization success. The corrected fixture requires the Root's native POSIX
+EIO and `content.*` operation to remain sticky across repeated finalization,
+with no repeated writer flush or destination publication. The original fixture
+failed; the corrected fixture passed **51 native checks** against the exact
+unchanged frozen SDK headers and three static archives. Source and archive
+hashes were verified before and after; no production source or original SDK
+was modified for this comparison. The other six tests remain under review.
