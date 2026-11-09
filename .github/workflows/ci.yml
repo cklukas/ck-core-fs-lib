@@ -27,6 +27,7 @@ jobs:
       CK_FS_NAMESPACE_BOOTSTRAP: ${{ matrix.os == 'ubuntu-24.04' && 'privileged-id-map' || 'unprivileged' }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         os: [ubuntu-24.04, windows-2025]
         browser: ['ON']
@@ -59,10 +60,13 @@ jobs:
 
   sanitizers:
     name: Linux / ${{ matrix.sanitizer }}
+    needs: build
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-26.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         sanitizer: [address-undefined, thread]
     env:
@@ -109,7 +113,8 @@ jobs:
 
   macos:
     name: Mac qualification / requires mounted temporary volume
-    if: github.event_name == 'workflow_dispatch' && inputs.macos_qualification
+    needs: sanitizers
+    if: always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.macos_qualification
     runs-on: [self-hosted, macOS, ck-core-fs-qualification]
     timeout-minutes: 20
     steps:

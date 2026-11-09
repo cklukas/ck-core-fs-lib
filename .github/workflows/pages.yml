@@ -35,7 +35,7 @@ jobs:
           work="$RUNNER_TEMP/ckdocs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$work/tmp" "$work/build"
           export TMPDIR="$work/tmp"
-          make -j2 -C .docs-tool BUILD_ROOT="$work" BUILD_DIR="$work/build" \
+          make -j1 -C .docs-tool BUILD_ROOT="$work" BUILD_DIR="$work/build" \
             CKGIT_BUILD_VERSION=0.10.1+g7e3ee5eb57a2 \
             "$work/build/bin/ckdocs"
           echo "CKDOCS=$work/build/bin/ckdocs" >> "$GITHUB_ENV"
