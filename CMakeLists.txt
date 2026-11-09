@@ -429,7 +429,8 @@ if(BUILD_TESTING)
     target_link_options(ck_fs_verified_copy_retry_drain_linux_tests PRIVATE
       "LINKER:--wrap=close" "LINKER:--wrap=pread" "LINKER:--wrap=openat")
     foreach(retry_case success cancel source-eio candidate-eio source-oom candidate-oom base-oom journal-oom
-        cancel-source-oom cancel-candidate-oom cancel-journal-oom prior-source-oom cpp-source-oom cpp-copy-source-oom)
+        cancel-source-oom cancel-candidate-oom cancel-journal-oom prior-source-oom cpp-source-oom cpp-copy-source-oom
+        cpp-finish prior-second-journal-oom)
       add_test(NAME verified_copy_retry_drain_${retry_case} COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py $<TARGET_FILE:ck_fs_verified_copy_retry_drain_linux_tests>
         ${CK_CORE_FS_NATIVE_TEST_ROOT} ${retry_case})
@@ -437,6 +438,26 @@ if(BUILD_TESTING)
         LABELS "linux;native;c-api;retry;finalization;allocation-failure"
         ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
     endforeach()
+    add_executable(ck_fs_verified_copy_retry_scope_linux_tests tests/verified_copy_retry_scope_linux_tests.cpp)
+    target_link_libraries(ck_fs_verified_copy_retry_scope_linux_tests PRIVATE ck_file_engine_c_test_support ${CMAKE_DL_LIBS})
+    target_include_directories(ck_fs_verified_copy_retry_scope_linux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/c-api)
+    target_compile_options(ck_fs_verified_copy_retry_scope_linux_tests PRIVATE -UNDEBUG -Wall -Wextra -Wpedantic -Werror)
+    foreach(retry_scope_case positive positive-alias positive-legacy source candidate destination
+        source-second candidate-second destination-second source-alias candidate-alias source-alias-second
+        candidate-alias-second source-legacy destination-legacy late-source-alias late-candidate-alias-second late-destination-second)
+      add_test(NAME verified_copy_retry_scope_${retry_scope_case} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py $<TARGET_FILE:ck_fs_verified_copy_retry_scope_linux_tests>
+        ${CK_CORE_FS_NATIVE_TEST_ROOT} ${retry_scope_case})
+      set_tests_properties(verified_copy_retry_scope_${retry_scope_case} PROPERTIES TIMEOUT 180
+        LABELS "linux;native;c-api;retry;private-root"
+        ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    endforeach()
+    add_test(NAME verified_copy_retry_scope_mounts COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_verified_copy_retry_scope_mounts.py
+      $<TARGET_FILE:ck_fs_verified_copy_retry_scope_linux_tests> ${CK_CORE_FS_NATIVE_TEST_ROOT})
+    set_tests_properties(verified_copy_retry_scope_mounts PROPERTIES TIMEOUT 180
+      LABELS "linux;native;c-api;retry;private-root;namespaces"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
     add_test(NAME archive_layer_dependencies COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/audit_archive_layers.py ${CMAKE_NM}
       $<TARGET_FILE:ck_core_fs_engine> $<TARGET_FILE:ck_files_platform> $<TARGET_FILE:ck_core_fs_native>)

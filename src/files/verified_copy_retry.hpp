@@ -3,6 +3,7 @@
 #include "native_operation_copy_job.hpp"
 #include "native_operation_recovery_evidence.hpp"
 #include "prepared_journal_root.hpp"
+#include "private_journal_scope.hpp"
 #include "sha256.hpp"
 #include <string_view>
 #include <type_traits>
@@ -58,6 +59,9 @@ enum class VerifiedCopyRetryState {
 // Serialized worker only. Native owners, including the ORIGINAL selected
 // source, survive review/execution. No factory accepts rehydrated value IDs as
 // native ownership. NativeCopy alone creates and owns the new staging object.
+// Both genuine journal Roots are excluded from selected inputs and the new
+// destination namespace before attempt creation, then checked again during
+// execution. This protects the passed Roots; it grants no global mutation lease.
 class VerifiedCopyRetryJob final {
 public:
     using Pointer=std::unique_ptr<VerifiedCopyRetryJob>;
@@ -82,7 +86,8 @@ public:
 private:
     explicit VerifiedCopyRetryJob(VerifiedCopyRetryRequest request):request_(std::move(request)){}
     Observation<bool> load_original_step();
-    Observation<bool> revalidate_roots() const;
+    Observation<bool> admit_private_scope(std::stop_token);
+    Observation<bool> revalidate_roots(std::stop_token = {}) const;
     Observation<bool> check_original() const;
     Observation<bool> validate_history();
     Observation<bool> source_step(std::stop_token);
@@ -96,6 +101,11 @@ private:
     Observation<bool> finish_consumers();
     Observation<bool> finish_result()const;
     VerifiedCopyRetryRequest request_;
+    // Two genuine Root owners, each checked against both selected inputs and
+    // the new destination namespace. Addresses are adopted only once.
+    std::array<JournalScopeGuard::Pointer,6> scope_guards_{};
+    std::array<bool,2> owned_roots_{};
+    bool scope_ready_=false;
     VerifiedCopyRetryState phase_=VerifiedCopyRetryState::LoadingJournal;
     std::optional<UnavailableObservation> failure_;
     std::unique_ptr<OperationJournalFile> original_file_;

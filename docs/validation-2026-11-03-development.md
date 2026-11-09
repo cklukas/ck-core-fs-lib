@@ -860,3 +860,37 @@ requiring coherent rebuilds of its implementation, C wrapper and consumers.
 Permanent Linux CTest entries register all fourteen modes. Windows, sanitizer
 and final combined qualification remain pending. Genuine private-Root overlap
 admission is a separate implementation increment, still under qualification.
+
+
+## Verified retry: private-Root admission and first error across Roots
+
+Retry now admits both genuine journal Roots against the held source,
+read-only prefix candidate, and destination namespace before opening the
+original journal or creating an attempt. Legacy addresses are adopted once;
+subsequent I/O uses those held owners. Scope and membership are rechecked during
+execution and before publication. Only privately adopted Roots are finished
+by retry; passed capabilities remain borrowed. No global active-Root registry
+or exclusion against arbitrary external writers is claimed.
+
+A separate drain amendment preserves the first Root error already observed
+by the job when the other Root later fails. Its original-code control
+reproduced earlier attempt-Root ENOSPC being replaced by later original-journal
+EIO. Early explicit finish also revokes subsequent approval/advance authority.
+
+The combined Linux normal packet passed **40 native cases and the existing
+retry suite**: 16 drain/lifecycle cases, 18 scope cases, and six actual bind
+aliases in private user/mount namespaces. It covers both Roots, source/candidate
+hard links into private state, post-review topology changes, valid external
+hard links, and address adoption. Persistent allocation-failure and descriptor
+reuse controls retain native error and no-retry checks. Namespace setup exit77
+is unqualified/failure, never a skipped pass. The affected rebuild took
+13.35 seconds against the preceding comparable 12.13-second drain rebuild.
+
+Packet manifest:
+`c519aa217addf644437e767bca911394f69e330aa587a3e6e9d559594c51d1fb`;
+qualified source manifest:
+`0bd297d29db41d2ea09610b16f788cdbc74b2aa318813b59870cd199d3a71cc8`.
+Public C ABI v1 is unchanged; the private C++ retry layout changed again and
+requires rebuilding all dependent translation units. Windows, Darwin,
+sanitizers and the final combined Main revision remain unqualified. A separate
+source review of the Root pending-first-writer protocol is still in progress.

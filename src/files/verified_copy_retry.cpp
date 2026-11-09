@@ -45,10 +45,8 @@ VerifiedCopyRetryState VerifiedCopyRetryJob::reject(const UnavailableObservation
 }
 Observation<bool> VerifiedCopyRetryJob::load_original_step() {
     if(!original_file_) {
-        auto valid=revalidate_roots();if(!valid.value()||!*valid.value())return valid;
-        auto opened=request_.original_prepared_root?
-            request_.original_prepared_root->open_journal(request_.original_journal_name,false):
-            open_native_operation_journal_file(*request_.original_journal_root,request_.original_journal_name,false);
+        auto valid=admit_private_scope({});if(!valid.value()||!*valid.value())return valid;
+        auto opened=request_.original_prepared_root->open_journal(request_.original_journal_name,false);
         if(!opened.value())return forwarded(*opened.unavailable_detail());
         original_file_=std::move(opened).take_value();
         auto size=original_file_->size();if(!size.value())return forwarded(*size.unavailable_detail());
@@ -130,10 +128,55 @@ Observation<bool> VerifiedCopyRetryJob::validate_history() {
     destination_identity_=*dest.value()->identity.value();
     return check_destination();
 }
-Observation<bool> VerifiedCopyRetryJob::revalidate_roots() const {
-    for(const auto& root:{request_.original_prepared_root,request_.attempt_prepared_root})if(root) {
-        auto valid=root->revalidate();if(!valid.value())return forwarded(*valid.unavailable_detail());
-        if(!*valid.value())return denied("copy_retry.prepared_root_false",ObservationState::Changed);
+Observation<bool> VerifiedCopyRetryJob::admit_private_scope(std::stop_token stop) {
+    if(scope_ready_)return revalidate_roots(stop);
+    std::array<PreparedJournalRoot::Pointer*,2> roots{&request_.original_prepared_root,&request_.attempt_prepared_root};
+    std::array<std::optional<NativeAbsolutePath>*,2> addresses{&request_.original_journal_root,&request_.attempt_journal_root};
+    for(size_t i=0;i<roots.size();++i) {
+        if(!*roots[i]) {
+            // Legacy address is an initial adoption only, never authority for
+            // reopening after a checked owner has been obtained.
+            auto acquired=acquire_native_journal_root(**addresses[i],stop);
+            if(!acquired.value())return forwarded(*acquired.unavailable_detail());
+            *roots[i]=std::move(acquired).take_value();owned_roots_[i]=true;
+            addresses[i]->reset();
+        }
+        auto source=JournalScopeGuard::create_for_entry(*roots[i],*request_.source,stop);
+        if(!source.value())return forwarded(*source.unavailable_detail());
+        scope_guards_[3*i]=std::move(source).take_value();
+        auto checked=scope_guards_[3*i]->check_entry(*request_.source,stop);
+        if(!checked.value()||!*checked.value())return checked;
+        if(request_.candidate) {
+            auto candidate=JournalScopeGuard::create_for_entry(*roots[i],*request_.candidate,stop);
+            if(!candidate.value())return forwarded(*candidate.unavailable_detail());
+            scope_guards_[3*i+1]=std::move(candidate).take_value();
+            checked=scope_guards_[3*i+1]->check_entry(*request_.candidate,stop);
+            if(!checked.value()||!*checked.value())return checked;
+        }
+        auto destination=JournalScopeGuard::create_for_namespace_child(*roots[i],request_.destination,stop);
+        if(!destination.value())return forwarded(*destination.unavailable_detail());
+        scope_guards_[3*i+2]=std::move(destination).take_value();
+    }
+    scope_ready_=true;
+    return revalidate_roots(stop);
+}
+Observation<bool> VerifiedCopyRetryJob::revalidate_roots(std::stop_token stop) const {
+    if(!scope_ready_)return denied("copy_retry.private_scope_unadmitted",ObservationState::Unsupported,AdapterError::PlanTopologyUnsafe);
+    for(size_t i=0;i<2;++i) {
+        for(size_t j=0;j<3;++j)if(const auto& guard=scope_guards_[3*i+j]) {
+            auto checked=guard->check_root(stop);
+            if(!checked.value()||!*checked.value())return checked;
+        }
+        // Root ancestry alone does not prove that multiply linked selected
+        // files are outside private state. Recheck the actual held entries.
+        if(request_.source) {
+            auto checked=scope_guards_[3*i]->check_entry(*request_.source,stop);
+            if(!checked.value()||!*checked.value())return checked;
+        }
+        if(request_.candidate) {
+            auto checked=scope_guards_[3*i+1]->check_entry(*request_.candidate,stop);
+            if(!checked.value()||!*checked.value())return checked;
+        }
     }
     return Observation<bool>::available(true);
 }
@@ -240,15 +283,13 @@ Observation<bool> VerifiedCopyRetryJob::source_step(std::stop_token stop) {
     return Observation<bool>::available(true);
 }
 Observation<bool> VerifiedCopyRetryJob::approve() {
-    if(phase_!=VerifiedCopyRetryState::AwaitingReview)return denied("copy_retry.review_required");
+    if(finished_||phase_!=VerifiedCopyRetryState::AwaitingReview)return denied("copy_retry.review_required");
     phase_=VerifiedCopyRetryState::RevalidatingSource;source_offset_=0;source_hash_.reset();
     return Observation<bool>::available(true);
 }
 Observation<bool> VerifiedCopyRetryJob::begin_copy(std::stop_token stop) {
     auto valid=revalidate_roots();if(!valid.value()||!*valid.value())return valid;
-    auto opened=request_.attempt_prepared_root?
-        request_.attempt_prepared_root->open_journal(request_.attempt_journal_name,true):
-        open_native_operation_journal_file(*request_.attempt_journal_root,request_.attempt_journal_name,true);
+    auto opened=request_.attempt_prepared_root->open_journal(request_.attempt_journal_name,true);
     if(!opened.value())return forwarded(*opened.unavailable_detail());
     had_attempt_=true;
     attempt_file_=std::shared_ptr<OperationJournalFile>(std::move(opened).take_value());
@@ -326,10 +367,16 @@ Observation<bool> VerifiedCopyRetryJob::begin_copy(std::stop_token stop) {
     (void)stop;return Observation<bool>::available(true);
 }
 VerifiedCopyRetryState VerifiedCopyRetryJob::advance(std::stop_token stop) {
+    if(finished_)return phase_;
     if(phase_==VerifiedCopyRetryState::Complete||
         phase_==VerifiedCopyRetryState::ReviewRequired||phase_==VerifiedCopyRetryState::Cancelled)return phase_;
     if(stop.stop_requested()&&phase_!=VerifiedCopyRetryState::Copying) {
         phase_=VerifiedCopyRetryState::Cancelled;return phase_;
+    }
+    if(scope_ready_) {
+        auto valid=revalidate_roots(stop);
+        if(!valid.value())return reject(*valid.unavailable_detail());
+        if(!*valid.value())return reject(*denied("copy_retry.private_scope_false").unavailable_detail());
     }
     if(phase_==VerifiedCopyRetryState::AwaitingReview)return phase_;
     if(phase_==VerifiedCopyRetryState::Copying) {
@@ -363,6 +410,9 @@ struct VerifiedCopyRetryJob::FinishLatch final:MetadataCaptureFailureLatch {
     }
 };
 void VerifiedCopyRetryJob::read_root_finish_failure()noexcept {
+    // A Root error already observed by this job precedes later errors from
+    // the other Root. Never replace that first fixed tuple during draining.
+    if(finish_failure_.present)return;
     for(const auto& root:{request_.original_prepared_root,request_.attempt_prepared_root})if(root){
         detail::PreparedJournalConsumerFailure failure;
         if(detail::read_prepared_journal_consumer_failure(*root,failure)&&!failure.pending){
@@ -452,8 +502,21 @@ Observation<bool> VerifiedCopyRetryJob::finish_io() {
         }catch(...){read_root_finish_failure();if(!finish_failure_.present)record_finish(ObservationState::Unknown,
             ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.journal_finish_exception");}
         original_file_.reset();attempt_file_.reset();request_.destination.reset();
+        for(auto& guard:scope_guards_)guard.reset();
+        // Only roots privately adopted by this job are ours to finish. Passed
+        // capabilities remain borrowed and are never closed by a consumer.
+        std::array<PreparedJournalRoot::Pointer*,2> roots{&request_.original_prepared_root,&request_.attempt_prepared_root};
+        for(size_t i=0;i<roots.size();++i)if(owned_roots_[i]&&*roots[i])try {
+            auto closed=(*roots[i])->finish_io();
+            if(const auto* e=closed.unavailable_detail())record_finish(e->state,e->error.domain,e->error.code,e->error.operation);
+            else if(!*closed.value())record_finish(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.root_finish_false");
+        }catch(...){read_root_finish_failure();if(!finish_failure_.present)record_finish(ObservationState::Unknown,
+            ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult),"copy_retry.root_finish_exception");}
         read_root_finish_failure();finished_=true;
         if(finish_failure_.present)phase_=VerifiedCopyRetryState::ReviewRequired;
+        else if(phase_!=VerifiedCopyRetryState::Complete&&phase_!=VerifiedCopyRetryState::ReviewRequired&&phase_!=VerifiedCopyRetryState::Cancelled)
+            phase_=VerifiedCopyRetryState::Cancelled;
     }
     // All native owners have been consumed before any error string can allocate.
     // The C worker reads native_finish_failure() even if this construction throws.
