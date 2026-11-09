@@ -16,11 +16,19 @@ template<class T>T take(Observation<T> result){
     return std::move(result).take_value();
 }
 }
+#ifdef _WIN32
+int wmain(int argc,wchar_t**argv){
+#else
 int main(int argc,char**argv){
+#endif
     assert(argc==2);
     const auto path=take(NativeAbsolutePath::from_host(std::filesystem::path(argv[1])));
     NativeFileSystem fs;auto directory=std::shared_ptr<const DirectoryCursor>(take(fs.open_native_directory(path)));
+#ifdef _WIN32
+    const auto input=*NativeName::from_windows(u"input");
+#else
     const auto input=*NativeName::from_posix("input");
+#endif
     auto held=take(HeldChild::observe_with_access(directory,input,EntryAccess::ContentRead));
 #ifndef CK_LAYER_PLATFORM_ONLY
     auto main=take(NativeMainContentJob::begin_held(held,NativeMainContentLimits{{4},1024}));
@@ -46,5 +54,9 @@ int main(int argc,char**argv){
     const auto observed=take(read->read_content({1024}));assert(observed.complete);
     assert(std::string_view(reinterpret_cast<const char*>(observed.bytes.data()),observed.bytes.size())==bytes);
 #endif
+#ifdef __linux__
     std::puts("installed Platform/Native: real metadata capture/drain and anonymous publication PASS");
+#else
+    std::puts("installed Platform/Native: real metadata capture/drain PASS");
+#endif
 }

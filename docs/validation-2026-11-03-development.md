@@ -929,3 +929,33 @@ Fixture patch SHA-256:
 No production code was changed in this increment. Windows runtime, the later
 Session/retry changes and the final complete suite remain outside this receipt;
 those require a coherent subsequent qualification run.
+
+
+## Installed layer consumers and Windows exact-path fixture helper
+
+The qualification script now configures, builds and runs the installed Core,
+Platform, Native and C consumers after its original C consumer. It propagates
+the same configuration/instrumentation options and uses the explicit native
+fixture root, or the task temporary root when none is specified. The Windows
+clients use wide entry points, exact UTF-16 directory addresses and Windows
+NativeName values; their POSIX branches remain. The fixture helper retains
+extended DOS/UNC namespaces through validation, file creation and cleanup.
+Windows output no longer claims the Linux-only anonymous-publication branch.
+
+Against the frozen `ac03959` MSVC Debug/MDd SDK, the original C consumer passed
+1/1 and all four installed layers passed 4/4. Eighteen independent NTFS/ReFS
+controls covered Unicode, unpaired UTF-16 and paths up to 483 units. The final
+helper delta additionally passed **12 actual-helper controls** with 366–377-unit
+Unicode/raw UTF-16 parent paths and verified cleanup. Exactly two consumer
+objects and two executables rebuilt in 36.25 seconds; SDK objects, DLL/library
+hashes and all 155 installed headers remained unchanged. The archive dependency
+audit and all 171 declared exports passed.
+
+Helper receipt SHA-256:
+`d3cb2ba58c95ebcb6762d0d63efde3e01c3451a74f89690c755cd1229fd1b329`.
+The tested automatic consumer block matches the committed qualification helper.
+UNC conversion has source review but no available-share runtime proof here.
+These client checks do not establish native coverage for the model-only Core
+consumer or qualify newer Main private C++ layouts. The separate full frozen
+ReFS SDK run completed **72/84 PASS, 12 failures, zero skipped**; its failures
+remain release/qualification work and are not changed into expected passes.

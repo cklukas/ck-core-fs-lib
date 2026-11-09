@@ -187,6 +187,16 @@ if(CMAKE_HOST_WIN32)
 endif()
 run(consumer-test "${CMAKE_CTEST_COMMAND}" --test-dir "${consumer}" -C "${config}"
   --output-on-failure --no-tests=error --parallel 1 --timeout 60 -R "^installed_c_consumer$")
+set(layer_consumers "${QUALIFICATION_OUTPUT}/layer-consumers")
+set(layer_fixture_root "$ENV{TMPDIR}")
+if(DEFINED QUALIFICATION_NATIVE_TEST_ROOT)
+  set(layer_fixture_root "${QUALIFICATION_NATIVE_TEST_ROOT}")
+endif()
+run(layer-consumers-configure "${CMAKE_COMMAND}" -S "${source}/tests/installed_layers" -B "${layer_consumers}"
+  "-DCMAKE_PREFIX_PATH=${prefix}" "-DCK_LAYER_FIXTURE_ROOT=${layer_fixture_root}" ${options})
+run(layer-consumers-build "${CMAKE_COMMAND}" --build "${layer_consumers}" --config "${config}" --parallel 1 --verbose)
+run(layer-consumers-test "${CMAKE_CTEST_COMMAND}" --test-dir "${layer_consumers}" -C "${config}"
+  --output-on-failure --no-tests=error --parallel 1 --timeout 90)
 fingerprint(final)
 if(DEFINED thread_runtime)
   file(SHA256 "${thread_runtime}" final_runtime_hash)

@@ -3,11 +3,20 @@
 #include <ck_fs_tree.h>
 #include <cassert>
 #include <cstdio>
+#include <cwchar>
+#ifdef _WIN32
+int wmain(int argc,wchar_t**argv){
+#else
 int main(int argc,char**argv){
+#endif
     assert(argc==2);ckfe_engine* engine=nullptr;ckfe_directory* directory=nullptr;ckfe_entry* entry=nullptr;
     ckfe_error error{};ckfe_error_init(&error);
     assert(ckfe_engine_create(&engine)==CKFE_API_OK);
+#ifdef _WIN32
+    assert(ckfe_directory_open_utf16(engine,reinterpret_cast<const uint16_t*>(argv[1]),std::wcslen(argv[1]),0,&directory,&error)==CKFE_API_OK);
+#else
     assert(ckfe_directory_open_utf8(engine,argv[1],0,&directory,&error)==CKFE_API_OK);
+#endif
     assert(ckfe_entry_open_utf8(directory,"input",&entry,&error)==CKFE_API_OK);
     ckfe_metadata metadata{};assert(ckfe_entry_metadata(entry,&metadata,&error)==CKFE_API_OK);
     assert((metadata.available_fields&CKFE_METADATA_LOGICAL_SIZE)&&metadata.logical_size==19);
