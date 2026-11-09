@@ -14,6 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(CK_CORE_FS_BUILD_BROWSER "Build the higher-level C++ file browser models" ON)
+option(CK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS "Enable compiled failure-only Windows native close regression seams" OFF)
 
 set(CK_CORE_FS_SOURCES
   src/files/ancestor_walk_job.cpp
@@ -532,6 +533,81 @@ if(BUILD_TESTING)
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   add_executable(ck_fs_native_directory_replay_job_tests tests/native_directory_replay_job_tests.cpp)
   if(WIN32)
+    if(CK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS)
+      foreach(_close_source src/files/platform/metadata_windows.cpp
+          src/files/platform/operation_journal_file_windows.cpp src/files/action_jobs.cpp)
+        set_property(SOURCE ${_close_source} APPEND PROPERTY
+          COMPILE_DEFINITIONS CK_FS_NATIVE_CLOSE_TEST_HOOKS)
+      endforeach()
+      set_property(SOURCE src/files/action_jobs.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS CK_FS_ACTION_FINAL_DRAIN_TEST_HOOKS)
+      add_executable(ck_fs_native_rename_close_tests tests/native_rename_close_windows_tests.cpp)
+      target_compile_definitions(ck_fs_native_rename_close_tests PRIVATE
+        CK_FS_NATIVE_CLOSE_TEST_HOOKS CK_FS_ACTION_FINAL_DRAIN_TEST_HOOKS NOMINMAX)
+      target_include_directories(ck_fs_native_rename_close_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/c-api)
+      target_link_libraries(ck_fs_native_rename_close_tests PRIVATE ck_file_engine_c_test_support)
+      if(MSVC)
+        target_compile_options(ck_fs_native_rename_close_tests PRIVATE /UNDEBUG)
+        target_link_options(ck_fs_native_rename_close_tests PRIVATE /ENTRY:wmainCRTStartup)
+      endif()
+      foreach(_close_mode
+          direct-positive
+          direct-case-positive
+          worker-positive
+          worker-case-positive
+          worker-source
+          worker-published
+          worker-verify
+          worker-input
+          worker-parent
+          worker-source-oom
+          worker-published-oom
+          worker-verify-oom
+          worker-input-oom
+          worker-parent-oom
+          worker-source-oom-prior
+          direct-source
+          direct-published
+          direct-source-oom
+          direct-case-source
+          direct-case-published
+          direct-case-source-oom
+          direct-case-published-oom
+          direct-nativeparent
+          direct-nativeparent-oom
+          direct-case-nativeparent
+          direct-case-nativeparent-oom
+          worker-case-source
+          worker-case-published
+          worker-case-verify
+          worker-case-input
+          worker-case-parent
+          worker-case-source-oom
+          worker-case-published-oom
+          worker-case-verify-oom
+          worker-case-input-oom
+          worker-case-parent-oom
+          worker-case-source-oom-prior
+          worker-positive-raw
+          worker-case-positive-raw
+          worker-source-oom-raw
+          worker-case-source-oom-raw
+          direct-positive-raw
+          direct-case-positive-raw
+          worker-pending
+          worker-pending-oom
+          worker-late
+          worker-late-oom
+          worker-case-late
+          worker-case-late-oom
+          )
+        add_test(NAME native_rename_close_${_close_mode}
+          COMMAND ck_fs_native_rename_close_tests ${_close_mode})
+        set_tests_properties(native_rename_close_${_close_mode} PROPERTIES TIMEOUT 180
+          LABELS "windows;native;finalization;allocation-failure"
+          ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+      endforeach()
+    endif()
     set(CK_CORE_FS_METADATA_TARGET_NATIVE_FS "NTFS" CACHE STRING
       "Expected NTFS/ReFS provider for native metadata stream target tests")
     if(NOT CK_CORE_FS_METADATA_TARGET_NATIVE_FS MATCHES "^(NTFS|ReFS)$")

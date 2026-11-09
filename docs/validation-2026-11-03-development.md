@@ -1047,3 +1047,48 @@ evidence, not a reinterpretation of those failures. No deadline was widened.
 This combined receipt qualifies the stated Linux snapshot only. Hierarchical
 Session relay, the later Windows rename/action patch, new archive ownership
 work, Windows/macOS runtime matrices and ThreadSanitizer remain separate gates.
+
+
+## Windows rename/action consumed-close errors and late Root publication
+
+A qualified normal MSVC derivative fixes direct cursor rename and Action worker
+close-error loss. Rename source/parent and published verification views explicitly
+drain before success; worker-owned input/verification closes precede Complete
+records, and cached Verified rows wait for final drainage. Native consumed-close
+errors survive persistent allocation failure through fixed Root diagnostics,
+prevent automatic retries, and cannot become successful cached results.
+
+Independent review found a later window after the initial Root read but before
+request-Root release. The final amendment retains that same genuine owner through
+all finalizers, then performs post-drain pending-publication readback before its
+release in normal and exception paths. No extra shared Root owner changes closure
+semantics. Waiting occurs on the worker, outside callbacks/destructors and locks.
+The generic pending-result formatter now uses its existing nonempty operation tag
+to avoid MSVC Debug's allocating noexcept empty-string construction under OOM.
+
+The sealed NTFS/ReFS derivative passed **126 native cases**: all 118 earlier
+ordinary/raw UTF-16/long-path cases plus eight late-publication normal/OOM cases
+covering both rename variants. Eight matched pre-fix runs reproduced premature
+Finished/Verified while the genuine first writer was paused. The fixed worker
+stayed nonterminal, then retained the exact original Win32 CRC 23 state/code/tag.
+Journal Complete records already durable before an unrelated late Root-only
+failure remain historical evidence; public cached success is still refused.
+The consumer-close-before-Complete tests remain distinct and passed.
+
+Packet manifest SHA-256:
+`bc2426998cea9182c01475fec17b28cb210652134191116c98d7e5dc49d582f4`.
+Combined patch SHA-256:
+`905a82c6c79b664407d13b5e964a5e6e804626dd5df8d793500930c2104932bc`.
+All packet hashes and exact apply contexts were verified. Existing public v1
+headers/class layouts were unchanged in the qualified derivative. Its new Action
+objects and shared fixture compiled in 44.46 seconds; the final diagnostic-only
+fixture rebuild took 12.00 seconds. Its old matching SDK cohort is not the later
+Main private Retry/Caller/Full/Session cohort.
+
+`CK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS=ON` now registers the 49 qualified mode names
+for a selected native Windows fixture root. Compiled failure-only hooks always
+call real CloseHandle first and cannot turn a real failure into success. This
+new CMake registration still requires a fresh coherent Windows build/runtime
+check. Hooks are off by default. No import-symbol replacement, IAT manipulation
+or process-memory patching is used. Combined Linux/macOS/sanitizer qualification
+of this increment is separate from the preceding 175-case receipt.

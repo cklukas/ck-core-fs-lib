@@ -75,3 +75,10 @@ and the C facade against one freshly installed prefix. Each consumer links one
 exported target. The archive-dependency test rejects reverse implementation
 edges. Repeating archives, grouping them or forcing whole-archive linkage is not
 a substitute for the dependency boundary.
+
+For native Windows consumed-close and pending-writer regressions, configure
+`-DCK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS=ON` with `BUILD_TESTING=ON` and an explicit
+`CK_CORE_FS_NATIVE_TEST_ROOT` on the selected qualified filesystem. The option
+adds 49 native modes and compiled failure-only seams; it is off by default.
+Use a coherent dedicated SDK build for this configuration, with the same
+instrumentation and headers for its consumers.

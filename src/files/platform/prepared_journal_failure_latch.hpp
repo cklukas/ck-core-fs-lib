@@ -43,8 +43,8 @@ public:
     Observation<bool> result() const {
         PreparedJournalConsumerFailure failure;
         if(!read(failure))return Observation<bool>::available(true);
-        if(failure.pending)return Observation<bool>::unavailable(failure.state,
-            {failure.domain,failure.code,{}});
+        // The pending POD already has a nonempty operation tag. Avoid the
+        // allocating noexcept default-string constructor in MSVC Debug.
         return Observation<bool>::unavailable(failure.state,
             {failure.domain,failure.code,failure.operation.data()});
     }

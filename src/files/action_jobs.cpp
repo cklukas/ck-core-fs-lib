@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "action_jobs.hpp"
+#include "platform/action_final_drain_test_hooks.hpp"
 #include "directory_name_rules.hpp"
 #include "prepared_journal_root.hpp"
+#include "metadata_capture_job.hpp"
+#include "platform/native_close_test_faults.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
 #include <algorithm>
 #include <atomic>
@@ -28,6 +31,56 @@ ckfea_identity identity(const ObjectIdentity* id) noexcept {
         std::memcpy(out.object, id->object.bytes.data(), 16);
     }
     return out;
+}
+// Lives only on the actual worker stack. The request retains Root until ALL
+// worker-owned views are gone; this reference adds no Root consumer/refcount.
+// Failure recording/readback uses fixed POD even under persistent C++ OOM.
+class ActionCloseLatch final : public MetadataCaptureFailureLatch {
+public:
+    explicit ActionCloseLatch(const PreparedJournalRoot::Pointer& root)noexcept:root_(root){}
+    void record_first(MetadataCaptureCleanupError event)const noexcept override {
+        if(!error_)error_=event;
+        if(root_)detail::record_prepared_journal_consumer_failure(*root_,event.state,event.domain,event.code,event.operation);
+    }
+    bool read(detail::PreparedJournalConsumerFailure& out)const noexcept {
+        if(root_&&detail::read_prepared_journal_consumer_failure(*root_,out)) {
+            // Pending revokes authority without inventing a replacement tuple.
+            // A provisional cached failure may be refreshed at the next drain.
+            out.state=ObservationState::Unknown; // Native close after mutation cannot certify its outcome.
+            return true;
+        }
+        if(!error_)return false;
+        out={};out.state=ObservationState::Unknown;out.domain=error_->domain;out.code=error_->code;
+        const std::string_view tag=error_->operation;
+        std::copy_n(tag.begin(),std::min(tag.size(),out.operation.size()-1),out.operation.begin());return true;
+    }
+    bool pending_row(size_t i)const noexcept{return pending_rows_[i];}
+    void pending_row(size_t i,bool value)const noexcept{pending_rows_[i]=value;}
+    bool cached_pending()const noexcept{return cached_pending_;}
+    void cache_pending(bool value)const noexcept{cached_pending_=value;}
+    void defer_verified(size_t i)const noexcept{verified_[i]=true;}
+    bool completed(size_t i)const noexcept{return verified_[i];}
+    std::array<bool,CKFEA_MAX_ITEMS> take_completed()const noexcept {
+        const auto out=verified_;verified_.fill(false);return out;
+    }
+private:
+    mutable std::array<bool,CKFEA_MAX_ITEMS> pending_rows_{};
+    mutable bool cached_pending_=false;
+    mutable std::array<bool,CKFEA_MAX_ITEMS> verified_{};
+    const PreparedJournalRoot::Pointer& root_;
+    mutable std::optional<MetadataCaptureCleanupError> error_;
+};
+bool action_close_failure(detail::PreparedJournalConsumerFailure& out)noexcept {
+    const auto* latch=dynamic_cast<const ActionCloseLatch*>(detail::current_metadata_capture_cleanup());
+    return latch&&latch->read(out);
+}
+bool action_completed(size_t i)noexcept {
+    const auto* latch=dynamic_cast<const ActionCloseLatch*>(detail::current_metadata_capture_cleanup());
+    return latch&&latch->completed(i);
+}
+void action_defer_verified(size_t i)noexcept {
+    const auto* latch=dynamic_cast<const ActionCloseLatch*>(detail::current_metadata_capture_cleanup());
+    if(latch)latch->defer_verified(i);
 }
 class NativeBoundary final : public ActionNativeBoundary {
 public:
@@ -56,6 +109,9 @@ public:
         auto qualified=qualify(source);
         if (!qualified.value()) return qualified;
         if (!*qualified.value()) return Observation<bool>::unavailable(ObservationState::Unsupported);
+        detail::PreparedJournalConsumerFailure close_error;
+        if(action_close_failure(close_error))return Observation<bool>::unavailable(ObservationState::Unknown,
+            {close_error.domain,close_error.code,close_error.operation.data()});
         const auto* id = source.metadata().identity.value();
         if (!id) return Observation<bool>::unavailable(ObservationState::Unknown);
         return case_only ? source.parent()->rename_child_case_only(source.name(), *id, target) :
@@ -581,7 +637,7 @@ void ActionJob::perform() {
         if (row(i).state!=CKFEA_READY) continue;
         if (cancelled()) { set(i,CKFEA_ITEM_CANCELLED); event(i,CKFEA_EVIDENCE_RESULT); continue; }
         const auto d=dependencies_[i];
-        if (d>=0 && row(static_cast<size_t>(d)).state!=CKFEA_VERIFIED) {
+        if (d>=0 && row(static_cast<size_t>(d)).state!=CKFEA_VERIFIED&&!action_completed(static_cast<size_t>(d))) {
             set(i,CKFEA_COLLISION,CKFEA_REASON_DEPENDENCY); event(i,CKFEA_EVIDENCE_RESULT); continue;
         }
         if (!revalidate(i) || !destination_clear(i)) { event(i,CKFEA_EVIDENCE_RESULT); continue; }
@@ -594,9 +650,16 @@ void ActionJob::perform() {
             auto qualified=native_->qualify(*request_.items[i].source);
             if (!qualified.value()) { unavailable(i,*qualified.unavailable_detail()); break; }
             if (!*qualified.value()) { set(i,CKFEA_UNSUPPORTED,CKFEA_REASON_SOURCE_NOT_BOUND); break; }
+            detail::PreparedJournalConsumerFailure close_error;
+            if(action_close_failure(close_error)) {
+                journal_finish_failed(close_error.state,close_error.domain,close_error.code);break;
+            }
             { std::lock_guard lock(mutex_); results_[i].state=CKFEA_EXECUTING; ++results_[i].attempts; }
             const auto& a=request_.items[i];
             auto renamed=native_->rename(*a.source,*a.destination,a.case_only);
+            if(action_close_failure(close_error)) {
+                journal_finish_failed(close_error.state,close_error.domain,close_error.code);break;
+            }
             if (renamed.value() && *renamed.value()) { success=true; break; }
             if (!renamed.value() && retryable(*renamed.unavailable_detail()) && attempt<request_.retry_limit) {
                 event(i,CKFEA_EVIDENCE_RETRY); continue;
@@ -613,17 +676,28 @@ void ActionJob::perform() {
             // Adapter reports flush + identity success; independently check the
             // published membership again. Never attempt rollback or unlink.
             const auto& a=request_.items[i];
-            auto dest=a.source->parent()->open_child(*a.destination);
-            auto metadata=dest.value()?(*dest.value())->inspect_basic():Observation<BasicMetadata>{};
-            const auto* expected=a.source->metadata().identity.value();
-            if (!metadata.value() || !metadata.value()->identity.value() || !expected ||
-                compare_identity(*metadata.value()->identity.value(),*expected)!=IdentityComparison::Same) set(i,CKFEA_REVIEW_REQUIRED);
+            bool identity_matches=false;
+            {
+                detail::NativeCloseRoleScope close_role("actions.verification");
+                auto dest=a.source->parent()->open_child(*a.destination);
+                if(dest.value()) {
+                    const auto metadata=(*dest.value())->inspect_basic();
+                    const auto* expected=a.source->metadata().identity.value();
+                    identity_matches=metadata.value()&&metadata.value()->identity.value()&&expected&&
+                        compare_identity(*metadata.value()->identity.value(),*expected)==IdentityComparison::Same;
+                    // The owning observation leaves this block before the POD check.
+                }
+            }
+            detail::PreparedJournalConsumerFailure close_error;
+            if(action_close_failure(close_error))
+                journal_finish_failed(close_error.state,close_error.domain,close_error.code);
+            else if(!identity_matches)set(i,CKFEA_REVIEW_REQUIRED);
             else if (append_journal(i,OperationJournalState::DestinationCommitted) &&
                 append_journal(i,OperationJournalState::SourceRemovalIntended) &&
-                append_journal(i,OperationJournalState::SourceRetired) && append_journal(i,OperationJournalState::Complete)) {
+                append_journal(i,OperationJournalState::SourceRetired)) {
                 // The native rename already moved the source atomically. These
                 // journal transitions record its outcome; no retire API is used.
-                set(i,CKFEA_VERIFIED);
+                action_defer_verified(i); // Publish VERIFIED only after last-reference native cleanup.
             }
         } else if (row(i).state==CKFEA_EXECUTING) set(i,CKFEA_REVIEW_REQUIRED);
         event(i,CKFEA_EVIDENCE_RESULT);
@@ -637,13 +711,25 @@ void ActionJob::journal_finish_failed(ObservationState observation,ErrorDomain d
     // Emergency finalization must work even after allocation failure. Only
     // cached POD rows and already-reserved event storage may be touched here.
     std::lock_guard lock(mutex_);
-    if(journal_finish_ok_) {
+    const auto* latch=dynamic_cast<const ActionCloseLatch*>(detail::current_metadata_capture_cleanup());
+    detail::PreparedJournalConsumerFailure root_failure;
+    const bool root_failed=latch&&latch->read(root_failure);
+    const bool refresh=latch&&latch->cached_pending()&&root_failed&&!root_failure.pending;
+    if(journal_finish_ok_||refresh) {
+        if(refresh){observation=root_failure.state;domain=root_failure.domain;code=root_failure.code;}
         finish_observation_=observation;finish_domain_=domain;finish_code_=code;journal_finish_ok_=false;
+        if(latch)latch->cache_pending(root_failed&&root_failure.pending);
     } else {observation=finish_observation_;domain=finish_domain_;code=finish_code_;}
     const bool any=std::any_of(journal_affected_.begin(),journal_affected_.end(),[](bool b){return b;});
     for(size_t i=0;i<results_.size();++i) {
         auto& r=results_[i];
-        if(!journal_affected_[i]&&(any||(r.state!=CKFEA_READY&&r.state!=CKFEA_EXECUTING&&r.state!=CKFEA_VERIFIED)))continue;
+        if(refresh) {if(!latch->pending_row(i))continue;latch->pending_row(i,false);}
+        else {
+            const bool pending_refusal=root_failed&&root_failure.pending&&!any&&
+                (r.state==CKFEA_CHANGED||r.state==CKFEA_DENIED||r.state==CKFEA_FAILED||r.state==CKFEA_REVIEW_REQUIRED);
+            if(!pending_refusal&&!journal_affected_[i]&&(any||(r.state!=CKFEA_READY&&r.state!=CKFEA_EXECUTING&&r.state!=CKFEA_VERIFIED)))continue;
+        }
+        if(latch&&latch->cached_pending())latch->pending_row(i,true);
         // A delayed close failure invalidates even previously verified rows.
         r.state=CKFEA_REVIEW_REQUIRED;
         r.observation=static_cast<uint32_t>(observation);
@@ -688,19 +774,29 @@ bool ActionJob::finish_journal() noexcept {
             journal_finish_failed(failure.state,failure.error.domain,failure.error.code);
         } else journal_finish_failed(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult));
     } catch(...) {
-        journal_finish_failed(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult));
+        detail::PreparedJournalConsumerFailure failure;
+        if(action_close_failure(failure))journal_finish_failed(failure.state,failure.domain,failure.code);
+        else journal_finish_failed(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult));
     }
     return false;
 }
 void ActionJob::release_native_inputs() noexcept {
     // Public handles retain cached state only after completion. Close native
     // owners here on the worker, including the last-reference close path.
+    detail::observe_native_test_io(detail::NativeTestIo::InputDrain);
+    detail::NativeCloseRoleScope close_role("actions.inputs");
     trash_transactions_.clear(); trash_backend_.reset();
     request_.restore_items.clear();
     journal_file_.reset(); journal_.reset(); artifact_.reset();
     scope_guards_.clear();
     request_.open_journal={};
-    if(owns_private_root_) {
+    request_.items.clear(); request_.recovery_destination.reset(); request_.recovery.reset();
+    native_.reset();model_boundary_.reset();
+    detail::PreparedJournalConsumerFailure close_error;
+    if(action_close_failure(close_error))journal_finish_failed(close_error.state,close_error.domain,close_error.code);
+    // A borrowed shared Root is left to its remaining owners. If this is its
+    // last reference, consume it explicitly so destructor-only errors survive.
+    if(owns_private_root_||(request_.prepared_journal_root&&request_.prepared_journal_root.use_count()==1)) {
         owns_private_root_=false;
         const auto failed=[this](ObservationState state,ErrorDomain domain,int64_t code) noexcept {
             if(!journal_finish_ok_)return; // Preserve the first real close failure.
@@ -714,36 +810,99 @@ void ActionJob::release_native_inputs() noexcept {
                 failed(error.state,error.error.domain,error.error.code);
             } else if(!*finished.value())failed(ObservationState::Failed,ErrorDomain::Adapter,
                 static_cast<int64_t>(AdapterError::InvalidNativeResult));
-        } catch(...) {failed(ObservationState::Failed,ErrorDomain::Adapter,
-            static_cast<int64_t>(AdapterError::InvalidNativeResult));}
+        } catch(...) {
+            detail::PreparedJournalConsumerFailure failure;
+            if(request_.prepared_journal_root&&detail::read_prepared_journal_consumer_failure(*request_.prepared_journal_root,failure)&&!failure.pending)
+                failed(failure.state,failure.domain,failure.code);
+            else failed(ObservationState::Failed,ErrorDomain::Adapter,static_cast<int64_t>(AdapterError::InvalidNativeResult));
+        }
     }
-    request_.prepared_journal_root.reset();
-    request_.items.clear(); request_.recovery_destination.reset(); request_.recovery.reset();
-    native_.reset();
-    model_boundary_.reset();
+    if(action_close_failure(close_error))journal_finish_failed(close_error.state,close_error.domain,close_error.code);
+    detail::action_final_drain_checkpoint();
+    // The request owner remains alive through the post-finalizer publication
+    // readback in run(). A Root-only writer may claim its slot during this drain.
 }
 void ActionJob::run() noexcept {
+    detail::observe_native_test_io(detail::NativeTestIo::WorkerStart);
+    ActionCloseLatch close_latch(request_.prepared_journal_root);
+    detail::MetadataCaptureCleanupScope cleanup_scope(&close_latch);
+    const auto capture_close_failure=[&]()noexcept {
+        detail::PreparedJournalConsumerFailure failure;
+        if(close_latch.read(failure))journal_finish_failed(failure.state,failure.domain,failure.code);
+    };
+    // This wait is on the worker, after callbacks and native finalizers return.
+    // Retain the genuine request owner until a legitimate concurrent publisher
+    // completes. Never wait/reenter inside the Root record callback itself.
+    const auto await_root_publication=[&]() {
+        detail::PreparedJournalConsumerFailure failure;
+        while(close_latch.read(failure)&&failure.pending) {
+            detail::observe_native_test_io(detail::NativeTestIo::PendingWait);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        capture_close_failure();
+    };
+    const auto drain_rename_inputs=[&]()noexcept {
+        if(request_.operation!=CKFEA_RENAME)return;
+        // Keep only the already encoded journal evidence and genuine Root.
+        // No held input, verification view or private-scope cursor may survive
+        // into the final Complete records or cached VERIFIED publication.
+        detail::NativeCloseRoleScope close_role("actions.inputs");
+        scope_guards_.clear();request_.items.clear();request_.open_journal={};
+        request_.recovery_destination.reset();request_.recovery.reset();
+        native_.reset();model_boundary_.reset();
+    };
+    const auto complete_drained_renames=[&]() {
+        if(request_.operation!=CKFEA_RENAME||!journal_finish_ok_||!journal_||!journal_file_)return;
+        const auto pending=close_latch.take_completed();
+        for(size_t i=0;i<results_.size();++i)if(pending[i]) {
+            const auto& records=journal_->records();
+            const auto last=std::find_if(records.rbegin(),records.rend(),[&](const auto& entry){return entry.item==i;});
+            if(last==records.rend()||last->state!=OperationJournalState::SourceRetired) {
+                set(i,CKFEA_REVIEW_REQUIRED);break;
+            }
+            auto evidence=last->evidence; // Bounded value bytes; no retained native ownership.
+            auto appended=append_operation_journal_file(*journal_file_,*journal_,
+                {records.size()+1,i,OperationJournalState::Complete,std::move(evidence)},{8*1024*1024});
+            if(!appended.value()||!*appended.value()) {
+                if(!appended.value())unavailable(i,*appended.unavailable_detail(),true);
+                else set(i,CKFEA_REVIEW_REQUIRED);
+                break;
+            }
+            close_latch.defer_verified(i); // Only a flushed Complete can become cached success.
+        }
+    };
     try {
-        preview();
+        preview();capture_close_failure();
+        if(journal_finish_ok_) {
         { std::unique_lock lock(mutex_);
           if (!cancelled()) { phase_=CKFEA_AWAITING_RECEIPT; cv_.notify_all();
               cv_.wait(lock,[&]{return approved_||cancelled();}); } }
         if (!cancelled()) perform();
+        }
         if (cancelled()) for (size_t i=0;i<results_.size();++i)
             if (row(i).state==CKFEA_READY || row(i).state==CKFEA_PENDING) {
                 set(i,CKFEA_ITEM_CANCELLED); event(i,CKFEA_EVIDENCE_RESULT);
             }
-        finish_trash_transactions();finish_journal();
-        release_native_inputs();
-        { std::lock_guard lock(mutex_); phase_=!journal_finish_ok_?CKFEA_JOB_FAILED:cancelled()?CKFEA_CANCELLED:CKFEA_FINISHED; cv_.notify_all(); }
+        capture_close_failure();finish_trash_transactions();capture_close_failure();
+        drain_rename_inputs();capture_close_failure();complete_drained_renames();capture_close_failure();finish_journal();
+        capture_close_failure();await_root_publication();release_native_inputs();
+        await_root_publication();request_.prepared_journal_root.reset();capture_close_failure();
+        { std::lock_guard lock(mutex_);
+          if(journal_finish_ok_&&request_.operation==CKFEA_RENAME)for(size_t i=0;i<results_.size();++i)if(results_[i].state==CKFEA_EXECUTING) {
+              results_[i].state=close_latch.completed(i)?CKFEA_VERIFIED:CKFEA_REVIEW_REQUIRED;
+              if(events_.size()<events_.capacity())events_.push_back({CKFEA_VERSION,sizeof(ckfea_evidence),CKFEA_EVIDENCE_RESULT,
+                  static_cast<uint32_t>(i),events_.size()+1,id_,results_[i],{0,0}});
+          }
+          phase_=!journal_finish_ok_?CKFEA_JOB_FAILED:cancelled()?CKFEA_CANCELLED:CKFEA_FINISHED;cv_.notify_all(); }
     } catch (...) {
-        finish_trash_transactions();finish_journal();
+        capture_close_failure();finish_trash_transactions();capture_close_failure();finish_journal();
         detail::PreparedJournalConsumerFailure failure;
         if(request_.prepared_journal_root&&detail::read_prepared_journal_consumer_failure(*request_.prepared_journal_root,failure)&&!failure.pending) {
             std::fill(journal_affected_.begin(),journal_affected_.end(),true);
             journal_finish_failed(failure.state,failure.domain,failure.code);
         }
-        release_native_inputs();
+        await_root_publication();release_native_inputs();
+        await_root_publication();request_.prepared_journal_root.reset();capture_close_failure();
         std::lock_guard lock(mutex_);
         for (auto& r:results_) if (r.state==CKFEA_READY || r.state==CKFEA_PENDING || r.state==CKFEA_EXECUTING) {
             r.state=CKFEA_REVIEW_REQUIRED;

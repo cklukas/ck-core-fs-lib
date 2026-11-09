@@ -10,6 +10,7 @@
 #include "../windows_parent_record.hpp"
 #include "native_journal_directory_bridge.hpp"
 #include "journal_root_test_faults.hpp"
+#include "native_close_test_faults.hpp"
 #include "native_windows_journal_volume.hpp"
 #include "../windows_name.hpp"
 
@@ -208,6 +209,7 @@ public:
         LARGE_INTEGER at{}; at.QuadPart = static_cast<LONGLONG>(offset);
         if (!SetFilePointerEx(file_.get(), at, nullptr, FILE_BEGIN)) return failure<std::size_t>(GetLastError(), "journal_file.read_seek");
         DWORD count{};
+        detail::observe_native_test_io(detail::NativeTestIo::Read);
         if (!ReadFile(file_.get(), bytes.data(), static_cast<DWORD>(std::min(bytes.size(), static_cast<std::size_t>(MAXDWORD))), &count, nullptr))
             return failure<std::size_t>(GetLastError(), "journal_file.ReadFile");
         auto after=revalidate();
@@ -221,6 +223,7 @@ public:
         LARGE_INTEGER at{}; at.QuadPart = static_cast<LONGLONG>(offset);
         if (!SetFilePointerEx(file_.get(), at, nullptr, FILE_BEGIN)) return failure<std::size_t>(GetLastError(), "journal_file.write_seek");
         DWORD count{};
+        detail::observe_native_test_io(detail::NativeTestIo::Write);
         if (!WriteFile(file_.get(), bytes.data(), static_cast<DWORD>(std::min(bytes.size(), static_cast<std::size_t>(MAXDWORD))), &count, nullptr))
             return failure<std::size_t>(GetLastError(), "journal_file.WriteFile");
         auto after=revalidate();
@@ -229,7 +232,9 @@ public:
     }
     Observation<bool> flush() override {
         const auto checked=revalidate();if(!checked.value()) return checked;
+        detail::observe_native_test_io(detail::NativeTestIo::Flush);
         if (!FlushFileBuffers(file_.get())) return failure<bool>(GetLastError(), "journal_file.FlushFileBuffers");
+        detail::observe_native_test_io(detail::NativeTestIo::Flush);
         if (!FlushFileBuffers(directory_.get())) return failure<bool>(GetLastError(),"journal_file.parent_FlushFileBuffers");
         return revalidate();
     }
@@ -280,10 +285,12 @@ private:
     }
     void finish_flush() {
         if(!finish_check())return;
+        detail::observe_native_test_io(detail::NativeTestIo::Flush);
         if(!FlushFileBuffers(file_.get())) {
             const auto code=GetLastError();
             remember_finish(state(code),ErrorDomain::Win32,code,"journal_file.FlushFileBuffers");return;
         }
+        detail::observe_native_test_io(detail::NativeTestIo::Flush);
         if(!FlushFileBuffers(directory_.get())) {
             const auto code=GetLastError();
             remember_finish(state(code),ErrorDomain::Win32,code,"journal_file.parent_FlushFileBuffers");return;
@@ -577,6 +584,7 @@ Observation<Handle> open_journal_root_child(HANDLE parent,const NativeName& chil
     created=io.Information==FILE_CREATED;return Observation<Handle>::available(std::move(result));
 }
 bool flush_journal_directory(HANDLE handle,detail::PreparedJournalFailureLatch& failure) noexcept {
+    detail::observe_native_test_io(detail::NativeTestIo::Flush);
     if(!FlushFileBuffers(handle)) {const auto code=GetLastError();failure.record(state(code),ErrorDomain::Win32,code,"journal_root.directory_FlushFileBuffers");return false;}
     try {
         if(const auto fault=detail::journal_root_fault(detail::JournalRootFaultPoint::DirectoryFlush)) {

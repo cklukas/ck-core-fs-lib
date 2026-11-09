@@ -2,6 +2,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_filesystem.hpp"
+#include "native_close_test_faults.hpp"
 #include "../native_trash.hpp"
 #include "native_journal_directory_bridge.hpp"
 #include "metadata_replay.hpp"
@@ -70,9 +71,19 @@ void report_capture_close(DWORD code,const char* operation)noexcept {
     detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Win32,code,operation});
     SetLastError(code);
 }
+// Failure injection observes a real consumed close; it cannot skip the OS call.
+bool close_native_consumer_handle(HANDLE handle,const char* operation)noexcept {
+    detail::observe_native_close(handle,operation);
+    const BOOL native_ok=CloseHandle(handle);
+    const DWORD native_error=native_ok?ERROR_SUCCESS:GetLastError();
+    const auto injected=detail::inject_native_close_failure(handle,operation,native_ok!=FALSE,native_error);
+    if(!native_ok){SetLastError(native_error);return false;}
+    if(injected){SetLastError(injected);return false;}
+    return true;
+}
 struct HandleCloser {
     void operator()(void* handle) const noexcept {
-        if (handle != nullptr && handle != INVALID_HANDLE_VALUE && !CloseHandle(handle)) {
+        if (handle != nullptr && handle != INVALID_HANDLE_VALUE && !close_native_consumer_handle(handle,"metadata_capture.temporary_CloseHandle")) {
             const DWORD e=GetLastError();
             const auto observer=journal_close_observer;
             if(observer.record)observer.record(observer.context,e,"sync_session.native_cursor_close");
@@ -294,6 +305,7 @@ Observation<std::uint64_t> nonnegative(LONGLONG value, const char* operation) {
 }
 
 Observation<BasicMetadata> handle_metadata(HANDLE handle, const AdapterScope& scope) {
+    detail::observe_native_test_io(detail::NativeTestIo::Query);
     FILE_BASIC_INFO native{};
     if (!GetFileInformationByHandleEx(handle, FileBasicInfo, &native, sizeof(native)))
         return failure<BasicMetadata>(GetLastError(), "FileBasicInfo");
@@ -2871,10 +2883,58 @@ public:
         if (!writable.value()) {const auto& e=*writable.unavailable_detail();return Result::unavailable(e.state,e.error);}
         return Result::available(true);
     }
+    // Per-call native ownership, independent of any caller cleanup observer.
+    // Slots are surrendered BEFORE CloseHandle, including an ambiguous failure.
+    // Only fixed POD is touched while draining; diagnostics happen afterwards.
+    struct RenameCloseDrain final : MetadataCaptureFailureLatch {
+        struct Slot { HANDLE handle=nullptr; const char* operation=nullptr; };
+        RenameCloseDrain()noexcept=default;
+        RenameCloseDrain(const RenameCloseDrain&)=delete;
+        RenameCloseDrain& operator=(const RenameCloseDrain&)=delete;
+        std::array<Slot,5> slots{};
+        const MetadataCaptureFailureLatch* outer=detail::current_metadata_capture_cleanup();
+        mutable std::optional<MetadataCaptureCleanupError> error;
+        void record_first(MetadataCaptureCleanupError event)const noexcept override {
+            if(!error)error=event;
+            if(outer)outer->record_first(event);
+        }
+        HANDLE adopt(unsigned slot,Observation<OwnedHandle>& observation,const char* operation)noexcept {
+            // Observation exposes only a const inspection view. This overload
+            // requires the original non-const owning observation; surrendering
+            // it here avoids take_value's allocating unavailable sentinel.
+            auto& owner=const_cast<OwnedHandle&>(*observation.value());
+            slots[slot]={owner.release(),operation};return slots[slot].handle;
+        }
+        void drain()noexcept {
+            for(auto it=slots.rbegin();it!=slots.rend();++it) {
+                const auto handle=std::exchange(it->handle,nullptr);
+                if(!handle||handle==INVALID_HANDLE_VALUE)continue;
+                if(!close_native_consumer_handle(handle,it->operation)) {
+                    const auto code=GetLastError();
+                    record_first({ObservationState::Failed,ErrorDomain::Win32,code,it->operation});
+                    const auto observer=journal_close_observer;
+                    if(observer.record)observer.record(observer.context,code,it->operation);
+                    SetLastError(code);
+                }
+            }
+        }
+        Observation<bool> run(auto&& operation) {
+            try {
+                auto result=operation();drain();
+                if(error)return Observation<bool>::unavailable(ObservationState::Unknown,
+                    {error->domain,error->code,error->operation});
+                return result;
+            } catch(...) {drain();throw;}
+        }
+        ~RenameCloseDrain()override{drain();}
+    };
     Observation<bool> rename_child_noreplace(const NativeName& name, const ObjectIdentity& expected_identity,
                                               const DirectoryCursor& destination,
                                               const NativeName& destination_name) const override {
         using Result = Observation<bool>;
+        RenameCloseDrain closes;
+        detail::MetadataCaptureCleanupScope cleanup(&closes);
+        return closes.run([&]() -> Result {
         const auto* target = dynamic_cast<const WindowsDirectoryCursor*>(&destination);
         const auto* source_units = name.windows_units();
         const auto* destination_units = destination_name.windows_units();
@@ -2898,8 +2958,8 @@ public:
             const auto& error = *source_opened.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
-        auto source = std::move(source_opened).take_value();
-        const auto source_metadata = handle_metadata(source.get(), scope_);
+        const auto source=closes.adopt(0,source_opened,"rename_child_noreplace.source_CloseHandle");
+        const auto source_metadata = handle_metadata(source, scope_);
         if (!source_metadata.value() || !source_metadata.value()->identity.value() ||
             compare_identity(*source_metadata.value()->identity.value(), expected_identity) != IdentityComparison::Same)
             return Result::unavailable(ObservationState::Changed,
@@ -2907,9 +2967,11 @@ public:
 
         auto occupied = target->open_native_component(destination_name, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                                                       ChildLookupMode::NativeDefault);
-        if (occupied.value())
+        if (occupied.value()) {
+            closes.adopt(1,occupied,"rename_child_noreplace.occupied_CloseHandle");
             return Result::unavailable(ObservationState::Changed,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::PlanDecisionStale), "rename_child_noreplace.destination_occupied"});
+        }
         if (!occupied.unavailable_detail() || occupied.unavailable_detail()->state != ObservationState::Gone)
             return Result::unavailable(occupied.unavailable_detail() ? occupied.unavailable_detail()->state : ObservationState::Unknown,
                 occupied.unavailable_detail() ? occupied.unavailable_detail()->error :
@@ -2924,6 +2986,7 @@ public:
             const auto &error = *source_access.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
+        const auto source_parent=closes.adopt(2,source_access,"rename_child_noreplace.source_parent_CloseHandle");
         std::wstring spelling;
         spelling.reserve(destination_units->size());
         for (const auto unit : *destination_units) spelling.push_back(static_cast<wchar_t>(unit));
@@ -2932,6 +2995,7 @@ public:
             const auto& error = *destination_access.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
+        const auto destination_parent=closes.adopt(3,destination_access,"rename_child_noreplace.destination_parent_CloseHandle");
         const auto length = spelling.size() * sizeof(WCHAR);
         if (length > std::numeric_limits<ULONG>::max() - offsetof(FILE_RENAME_INFO, FileName))
             return Result::unavailable(ObservationState::Failed,
@@ -2939,10 +3003,11 @@ public:
         std::vector<std::byte> buffer(std::max(sizeof(FILE_RENAME_INFO),offsetof(FILE_RENAME_INFO, FileName) + length));
         auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
         info->ReplaceIfExists = FALSE;
-        info->RootDirectory = destination_access.value()->get();
+        info->RootDirectory = destination_parent;
         info->FileNameLength = static_cast<DWORD>(length);
         std::memcpy(info->FileName, spelling.data(), length);
-        if (!set_file_rename_information(source.get(), info, static_cast<ULONG>(buffer.size()))) {
+        if(closes.error)return Result::available(false); // POD failure formatted only after drain.
+        if (!set_file_rename_information(source, info, static_cast<ULONG>(buffer.size()))) {
             const DWORD code = GetLastError();
             if (code == ERROR_FILE_EXISTS || code == ERROR_ALREADY_EXISTS)
                 return Result::unavailable(ObservationState::Changed,
@@ -2960,19 +3025,24 @@ public:
         if (!published.value())
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidNativeResult), "rename_child_noreplace.destination_identity"});
-        const auto published_metadata = handle_metadata(published.value()->get(), scope_);
+        const auto published_handle=closes.adopt(4,published,"rename_child_noreplace.published_CloseHandle");
+        const auto published_metadata = handle_metadata(published_handle, scope_);
         if (!published_metadata.value() || !published_metadata.value()->identity.value() ||
             compare_identity(*published_metadata.value()->identity.value(), *source_metadata.value()->identity.value()) != IdentityComparison::Same)
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "rename_child_noreplace.destination_identity"});
-        if (!FlushFileBuffers(source_access.value()->get()) || !FlushFileBuffers(destination_access.value()->get()))
+        if (!FlushFileBuffers(source_parent) || !FlushFileBuffers(destination_parent))
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "rename_child_noreplace.directory_flush"});
         return Result::available(true);
+        });
     }
     Observation<bool> rename_child_case_only(const NativeName& name, const ObjectIdentity& expected_identity,
                                               const NativeName& destination_name) const override {
         using Result = Observation<bool>;
+        RenameCloseDrain closes;
+        detail::MetadataCaptureCleanupScope cleanup(&closes);
+        return closes.run([&]() -> Result {
         const auto* source_units = name.windows_units();
         const auto* destination_units = destination_name.windows_units();
         if (!source_units || !destination_units || !name.is_valid() || !destination_name.is_valid() ||
@@ -2988,15 +3058,15 @@ public:
             const auto& error = *source_opened.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
-        auto source = std::move(source_opened).take_value();
-        const auto source_metadata = handle_metadata(source.get(), scope_);
+        const auto source=closes.adopt(0,source_opened,"rename_child_case_only.source_CloseHandle");
+        const auto source_metadata = handle_metadata(source, scope_);
         if (!source_metadata.value() || !source_metadata.value()->identity.value() ||
             compare_identity(*source_metadata.value()->identity.value(), expected_identity) != IdentityComparison::Same)
             return Result::unavailable(ObservationState::Changed,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "rename_child_case_only.source_identity"});
         if (source_metadata.value()->kind.value() && *source_metadata.value()->kind.value() == ObjectKind::RegularFile) {
             FILE_STANDARD_INFO standard{};
-            if (!GetFileInformationByHandleEx(source.get(), FileStandardInfo, &standard, sizeof(standard)))
+            if (!GetFileInformationByHandleEx(source, FileStandardInfo, &standard, sizeof(standard)))
                 return failure<bool>(GetLastError(), "rename_child_case_only.standard_info");
             if (standard.NumberOfLinks != 1)
                 return Result::unavailable(ObservationState::Unsupported,
@@ -3012,7 +3082,8 @@ public:
             const auto& error = *destination.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
-        const auto destination_metadata = handle_metadata(destination.value()->get(), scope_);
+        const auto destination_handle=closes.adopt(1,destination,"rename_child_case_only.destination_CloseHandle");
+        const auto destination_metadata = handle_metadata(destination_handle, scope_);
         if (!destination_metadata.value() || !destination_metadata.value()->identity.value())
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidNativeResult), "rename_child_case_only.destination_identity"});
@@ -3028,6 +3099,7 @@ public:
             const auto& error = *destination_access.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
+        const auto destination_parent=closes.adopt(2,destination_access,"rename_child_case_only.parent_CloseHandle");
         const auto length = spelling.size() * sizeof(WCHAR);
         if (length > std::numeric_limits<ULONG>::max() - offsetof(FILE_RENAME_INFO, FileName))
             return Result::unavailable(ObservationState::Failed,
@@ -3035,10 +3107,11 @@ public:
         std::vector<std::byte> buffer(std::max(sizeof(FILE_RENAME_INFO),offsetof(FILE_RENAME_INFO, FileName) + length));
         auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
         info->ReplaceIfExists = FALSE;
-        info->RootDirectory = destination_access.value()->get();
+        info->RootDirectory = destination_parent;
         info->FileNameLength = static_cast<DWORD>(length);
         std::memcpy(info->FileName, spelling.data(), length);
-        if (!set_file_rename_information(source.get(), info, static_cast<ULONG>(buffer.size()))) {
+        if(closes.error)return Result::available(false); // POD failure formatted only after drain.
+        if (!set_file_rename_information(source, info, static_cast<ULONG>(buffer.size()))) {
             const DWORD code = GetLastError();
             if (code == ERROR_FILE_EXISTS || code == ERROR_ALREADY_EXISTS)
                 return Result::unavailable(ObservationState::Changed,
@@ -3055,15 +3128,17 @@ public:
         if (!renamed.value())
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidNativeResult), "rename_child_case_only.destination_identity"});
-        const auto renamed_metadata = handle_metadata(renamed.value()->get(), scope_);
+        const auto renamed_handle=closes.adopt(3,renamed,"rename_child_case_only.renamed_CloseHandle");
+        const auto renamed_metadata = handle_metadata(renamed_handle, scope_);
         if (!renamed_metadata.value() || !renamed_metadata.value()->identity.value() ||
             compare_identity(*renamed_metadata.value()->identity.value(), *source_metadata.value()->identity.value()) != IdentityComparison::Same)
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "rename_child_case_only.destination_identity"});
-        if (!FlushFileBuffers(destination_access.value()->get()))
+        if (!FlushFileBuffers(destination_parent))
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "rename_child_case_only.directory_flush"});
         return Result::available(true);
+        });
     }
     Observation<bool> publish_noreplace(HANDLE source, const NativeName& name) const {
         using Result = Observation<bool>;
