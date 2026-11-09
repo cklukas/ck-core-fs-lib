@@ -1153,3 +1153,22 @@ not a current whole-platform or sanitizer pass. Product guards are unchanged;
 legacy Windows fault-seam migration and installed-consumer startup failures
 remain open. See `qualification/windows-fixture-corrections-20261110.json` in
 the source repository for exact manifests and scope.
+
+
+## November 10 self-contained Windows close-test registration
+
+The Windows CMake block now declares and validates its configured NTFS/ReFS
+provider before registering the 49 compiled-hook close cases, and passes
+`CK_FS_EXPECT_NATIVE_FS` explicitly through each test's environment. This removes
+the previously recorded dependence on the parent shell's environment. The
+configured provider must still match the actual native fixture filesystem.
+
+An isolated registration derivative passed **49/49 NTFS and 49/49 ReFS tests,
+zero skipped**, while the parent deliberately supplied an incorrect provider.
+The fixture executable was the byte-identical qualified `94579be` binary; no
+product recompile or newer-header mixture was represented as fresh evidence.
+All packet hashes, CMake baseline/final hashes and both JUnit results were
+verified before importing the one-file change. See
+`qualification/windows-native-close-registration-20261110.json` in the source
+repository. The three installed-consumer startup timeouts remain unresolved;
+this configuration fix does not qualify that separate runtime gate.

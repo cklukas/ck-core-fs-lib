@@ -533,6 +533,11 @@ if(BUILD_TESTING)
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   add_executable(ck_fs_native_directory_replay_job_tests tests/native_directory_replay_job_tests.cpp)
   if(WIN32)
+    set(CK_CORE_FS_METADATA_TARGET_NATIVE_FS "NTFS" CACHE STRING
+      "Expected NTFS/ReFS provider for native metadata stream target tests")
+    if(NOT CK_CORE_FS_METADATA_TARGET_NATIVE_FS MATCHES "^(NTFS|ReFS)$")
+      message(FATAL_ERROR "Native metadata stream target fixture must select NTFS or ReFS")
+    endif()
     if(CK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS)
       foreach(_close_source src/files/platform/metadata_windows.cpp
           src/files/platform/operation_journal_file_windows.cpp src/files/action_jobs.cpp)
@@ -605,13 +610,8 @@ if(BUILD_TESTING)
           COMMAND ck_fs_native_rename_close_tests ${_close_mode})
         set_tests_properties(native_rename_close_${_close_mode} PROPERTIES TIMEOUT 180
           LABELS "windows;native;finalization;allocation-failure"
-          ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+          ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT};CK_FS_EXPECT_NATIVE_FS=${CK_CORE_FS_METADATA_TARGET_NATIVE_FS}")
       endforeach()
-    endif()
-    set(CK_CORE_FS_METADATA_TARGET_NATIVE_FS "NTFS" CACHE STRING
-      "Expected NTFS/ReFS provider for native metadata stream target tests")
-    if(NOT CK_CORE_FS_METADATA_TARGET_NATIVE_FS MATCHES "^(NTFS|ReFS)$")
-      message(FATAL_ERROR "Native metadata stream target fixture must select NTFS or ReFS")
     endif()
     add_executable(ck_fs_native_sync_hierarchy_windows_oom_tests tests/native_sync_hierarchy_windows_oom_tests.cpp)
     target_link_libraries(ck_fs_native_sync_hierarchy_windows_oom_tests PRIVATE ck_core_fs_native dbghelp)

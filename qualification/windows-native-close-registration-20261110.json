@@ -1,0 +1,52 @@
+{
+  "status": "QUALIFIED CMAKE REGISTRATION FIX ONLY; INSTALLED STARTUP UNRESOLVED",
+  "sealed_utc": "2026-11-09T23:35:28.304110+00:00",
+  "integration_files": [
+    "CMakeLists.txt"
+  ],
+  "patch_sha256": "8c34ad309c88df177851befb5bbf42b7c7fc8ba7a2b86cfc987e92739f33d49d",
+  "baseline_commit": "94579be1b01ebba4a8c8f8df86754510f6d389e2",
+  "baseline_source_manifest_sha256": "6c0777eb44ec770591964786969bef49a657de7982ebcfdd4cbd3aa6618d8bfb",
+  "baseline_CMakeLists_sha256": "6b8b0669dfee2e1b51953094af03a6c12fdc323d7059e061697acb8d25551c6c",
+  "patched_CMakeLists_sha256": "0adb5adc8d79b6411518869e274232112b912bcd75a1d71df69c585b12dda2ce",
+  "all_other_475_source_files_unchanged": true,
+  "change": "Declare/validate provider cache before registering49 tests; supply CK_FS_EXPECT_NATIVE_FS per test from configured provider. No added task paths or ambient-provider dependency. No product/ABI/header delta.",
+  "runtime": {
+    "NTFS_pass": 49,
+    "ReFS_pass": 49,
+    "total": 98,
+    "parent_CK_FS_EXPECT_NATIVE_FS": "WRONG_AMBIENT_PROVIDER",
+    "fixture_executable_sha256": "2f375ce78903ac12b23ab9a6667ac7b0f011b50c3f58ac4cf2129c0708de2b60",
+    "fixture_source_and_product_objects": "Exact whole945 SDK executable copied byte-for-byte into isolated registration configure output; no product recompile or object mix",
+    "mask": 4,
+    "parallelism": 1
+  },
+  "integration_check": {
+    "command": "git apply --check registration.patch",
+    "HEAD_at_check": "1a4d5d9e38837e31221ea9ef1af0007b2e89bac2",
+    "exit": 0,
+    "live_edits": false
+  },
+  "installed_diagnosis": {
+    "same_installed_headers": 157,
+    "same_library_and_DLL_hashes": 6,
+    "diagnostic_build_seconds": 21.43424081802368,
+    "four_new_executable_fingerprints_recorded_before_launch": true,
+    "original3installed90secondtimeouts": "Preserved immutable original945 packet; remain unresolved",
+    "observed_blocker": "Helper creates real long fixture/input, then own Python313 faulthandler repeatedly records subprocess.py1554 _winapi.CreateProcess; platform client has one Wait/Suspended thread before stage marker. Exact own PID/PPID/thread evidence retained. Native/kernel stack not collected.",
+    "matched_full_MSVC_core_controls": "Same blocked launch also reproduced for core helper under full MSVC environment and a no-argument core control; cause still unresolved",
+    "extra_controls_caveat": "Earlier separate controls used reduced toolchain environment, then full-MSVC comparisons were run. They are diagnostics, not a qualified fix or product failure counterexample. No helper variant is submitted for integration.",
+    "unsafe_legacy_mechanisms_executed": false
+  },
+  "CPU": {
+    "allocated": 0,
+    "explicit_return": "Windows CPU2/mask4 returned after checkpoint inventory23:32:58.5363878Z showed zero owned jobs",
+    "no_further_compiler_or_test_until_reassigned": true
+  },
+  "limits": [
+    "Only CMake registration fix qualified; no installed-consumer hang fix claimed",
+    "Original normal945 SDK and118/126 cohorts immutable",
+    "No new ASan/platform-wide gate",
+    "No live Main edits, commits, branches or GitHub operations"
+  ]
+}
