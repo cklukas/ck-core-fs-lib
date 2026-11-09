@@ -220,12 +220,22 @@ rename. It is refused rather than silently substituted for held-object
 publication. The current macOS provider has no qualified strong publication
 implementation; positive macOS copy/execution gates remain open.
 
-Complete metadata capture, application and verification currently refuse
-unproved logical-security coverage. A successful ordinary copy is not Complete
-preservation. Complete provider qualification requires every requested logical
-class, including labels/capabilities, to be known and preserved. Windows
-alternate streams, complete security coverage and directory replay remain
-active implementation work. Native two-way composition and verified prefix
-resume have development interfaces and focused native evidence; remaining
-integration qualification is separate. None is qualified merely by its
-interface or a model test.
+Complete metadata capture, application and verification refuse unproved
+logical-security coverage. A successful ordinary copy does not establish
+Complete preservation. Complete provider qualification requires every requested
+logical class, including labels/capabilities, to be known and preserved.
+Development cohorts have exercised Windows alternate streams, Full Original
+and CurrentCaller security/ownership replay, and postorder directory metadata
+on NTFS and ReFS. The later combined cohort still has native failures under
+investigation, including ReFS CurrentCaller ancestry validation. The Linux Full
+issuer is limited to the qualified no-birthtime ext4/security environment.
+These scoped results, exact revisions and open gates are recorded in the
+[development validation record](validation-2026-11-03-development.md).
+
+Native two-way composition and verified prefix resume have development
+interfaces and focused native evidence; remaining integration qualification is
+separate. A pending journal Root first-error writer revokes completion even
+before its diagnostic tuple is readable. Retry finalizers drain once without
+waiting inside callbacks. The outer worker retains the Root and waits for
+memory-only error publication before exposing final completion or worker drain.
+Neither an interface nor a model test qualifies native execution.

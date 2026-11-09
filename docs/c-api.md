@@ -207,7 +207,12 @@ The original candidate, source and journal are preserved.
 
 `ckfer_start_with_journal_roots_v1` retains two READY capabilities. Initialize
 both pathname fields to empty and supply the required exact journal names.
-Drain retry jobs before finishing their shared roots. Snapshots retain native
+Drain retry jobs before finishing their shared roots. A genuine pending Root
+failure writer prevents final completion and worker drain until its first native
+error is published. Waiting happens on the retry worker after callbacks and
+native finalizers return; UI polling remains memory-only. Repeated finalization
+reads cached diagnostics and never retries an already consumed native close.
+Snapshots retain native
 error scalars and journal finalization errors; release never joins. These
 contracts do not turn an unsupported publisher or metadata provider into a
 successful resume.
