@@ -1128,3 +1128,28 @@ preserved. Source and runtime hashes were unchanged.
 
 None of these receipts qualifies the unmerged hierarchical relay, the new
 archive writer, full Windows/macOS matrices, a newer CDE SDK pin, or Apply.
+
+
+## November 10 guarded Windows fixture corrections
+
+Four test files now use their previously native-qualified fixture corrections:
+ordinary DOS/UNC CLI addresses cross the existing wide extended-path boundary;
+already extended UTF-16 remains exact. Address-only controls cover reachable
+UNC, long names, raw UTF-16 and trailing dot/space names without granting metadata
+or publication authority. The corrected Seed derivative passed 5,912 ordinary and 5,821
+Complete checks against its immutable `ac03959` SDK.
+
+The Action containing-Root test observes the actual wrapper-nested parent and
+checks the held fixture identity, instead of assuming a volume-root child. Its
+native NTFS suite passed in 6.37 seconds. The progressive source-binding test
+advances bounded validation (at most one read and 31 bytes per advance) until the
+exact Changed result, preserving source bytes and requiring no destination or
+journal effect. It passed 7,004 checks in 89.51 seconds within the existing
+180-second deadline.
+
+Every baseline/final file hash and all 17 referenced evidence hashes were
+verified before applying the narrow patches. This is prior-SDK fixture evidence,
+not a current whole-platform or sanitizer pass. Product guards are unchanged;
+legacy Windows fault-seam migration and installed-consumer startup failures
+remain open. See `qualification/windows-fixture-corrections-20261110.json` in
+the source repository for exact manifests and scope.

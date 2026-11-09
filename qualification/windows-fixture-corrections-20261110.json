@@ -1,0 +1,145 @@
+{
+  "integrated_from": "299b3095566b2931e42b4e33832f48d8454d24d7",
+  "qualification_sdk": "ac039592efc4a5024ebb930b20734ca6395c821e",
+  "patches": [
+    {
+      "packet": "fixture-normalization-handoff-v1",
+      "manifest_sha256": "1dfd88d9a8ba175ca888d7eab31279a1e90685a61e690e81022081cbcefef8ec",
+      "patch_sha256": "e81461422bb7a2e54b9755a635e94bae0da8c527e326c8d9b1c04da06cf215e7",
+      "files": {
+        "tests/native_directory_replay_job_tests.cpp": {
+          "baseline_sha256": "891f53c56bce49a1231a2c904d5143abe30c7b9c15593944ce0023ee11d3454b",
+          "candidate_sha256": "6d8c94f2172061fa61de5774d6a9df6a0adccd8e3dd27d211ab28c15b0e6c3b9"
+        },
+        "tests/target_read_seed_tests.cpp": {
+          "baseline_sha256": "4662b85d4f7a4ca7eef6f0b4ca6dd74da05892669fb6b38ec2fd297a33c53e70",
+          "candidate_sha256": "12ea6d5f054064a612a418234b692e5a93215233f70997d91e709b7e742eb80a"
+        }
+      },
+      "qualification": {
+        "frozen_utc": "2026-11-09T22:19:34.898615+00:00",
+        "base_sdk": "ac039592efc4a5024ebb930b20734ca6395c821e",
+        "files": {
+          "tests/native_directory_replay_job_tests.cpp": {
+            "baseline_sha256": "891f53c56bce49a1231a2c904d5143abe30c7b9c15593944ce0023ee11d3454b",
+            "candidate_sha256": "6d8c94f2172061fa61de5774d6a9df6a0adccd8e3dd27d211ab28c15b0e6c3b9"
+          },
+          "tests/target_read_seed_tests.cpp": {
+            "baseline_sha256": "4662b85d4f7a4ca7eef6f0b4ca6dd74da05892669fb6b38ec2fd297a33c53e70",
+            "candidate_sha256": "12ea6d5f054064a612a418234b692e5a93215233f70997d91e709b7e742eb80a"
+          }
+        },
+        "production_or_CMake_changes": false,
+        "result": {
+          "ordinary_forward": "5903 native Seed checks PASS",
+          "Complete_forward": "5812 native Seed checks PASS",
+          "long_DOS_forward_Unicode_rawUTF16": "5903 native Seed checks PASS",
+          "extended_long_rawUTF16": "exact native units+CreateFileW+FileIdInfo+close PASS",
+          "extended_trailing_dot_space": "exact native units+CreateFileW+FileIdInfo+close PASS",
+          "invalid_extended_forward": "rejected before I/O by NativeAbsolutePath validation",
+          "ordinary_forward_UNC": "real reachable localhost V$ root opened and FileIdInfo+close PASS; exact normalized units",
+          "extended_UNC": "exact units preserved; real open/query/close PASS"
+        },
+        "scope": "Fixture CLI navigation only: NativeAbsolutePath validates exact forms; ordinary DOS/UNC converted through existing windows_extended_path; valid extended input returned untouched. Test-only --fixture-address-only mode explicitly qualifies normalization/native address IO, not metadata/publish authority. Product predicates/SDK objects unchanged.",
+        "original_failure": {
+          "malformed_extended_path_error": 3,
+          "same_source_read_write_attributes_file_id_128": "0000000000000000bb290e0000000000",
+          "source_live_correct_native_path": true,
+          "unchanged_binary_backslash_ordinary_checks": 5903,
+          "unchanged_binary_backslash_Complete_checks": 5812
+        },
+        "limits": [
+          "UNC success covers fixture root open/query/close, not Complete metadata replay/publish over remote SMB.",
+          "Exact original unmodified SDK failure cohort remains preserved.",
+          "Not a newer Main header/private retry layout or sanitizer qualification."
+        ],
+        "evidence": {
+          "focused-investigation-v1/fixture-normalization-evidence/fixture-normalization-regressions.json": "ab5f26d31eb3534c201b2b66af21a60476090b61978a5f57c76a2c667501a7a3",
+          "focused-investigation-v1/fixture-normalization-evidence/fixture-normalization-regressions.log": "a8182a61272348bb6cc263c6620b6272bff3f5c55ec1edd20e2f9a924c9ee84d",
+          "focused-investigation-v1/seed-cli-probe.json": "bae5be5a2fed7437ef0123ec4ce37ed46f8743e2011fc59fb930643ff2529d11",
+          "focused-investigation-v1/seed-cli-probe.log": "a3dc7e2f76d9d72a1776c325369facf24ac00936ae2040ef77f622d2a631e4d5"
+        }
+      }
+    },
+    {
+      "packet": "action-fixture-parent",
+      "manifest_sha256": "b7679b10e36639200381ace128b0220513dcb444fcd7585d03b80bed90484308",
+      "patch_sha256": "2511412cfa39428c2eec4aebb057c1d3dbebf38ac38f3110560b75fa7cef5037",
+      "files": {
+        "tests/action_native_scope_tests.cpp": {
+          "baseline_sha256": "9d4da999ea8492bc6d6e8e16cec2cfe9ba431ca49dbd587e146b89a35b441b16",
+          "candidate_sha256": "3477a1304aef009004da4a6370e3069a6f7cca56cb757cdcc8552f5df357b6ed"
+        }
+      },
+      "qualification": {
+        "base": "ac039592efc4a5024ebb930b20734ca6395c821e",
+        "status": "Frozen compiled and actual native qualified test-only parent correction",
+        "baseline_sha256": "9d4da999ea8492bc6d6e8e16cec2cfe9ba431ca49dbd587e146b89a35b441b16",
+        "candidate_sha256": "3477a1304aef009004da4a6370e3069a6f7cca56cb757cdcc8552f5df357b6ed",
+        "scope": "Source selected for contains-Root refusal is actual nested fixture directory, verified against genuine held base NativeID. No backend/scope predicate or mandatory isolated-volume checks changed.",
+        "frozen_utc": "2026-11-09T22:27:02.086204+00:00",
+        "result": "Native isolated NTFS actual privateRoot Trash/restore/directory-source-containing-Root scope suite PASS 6.37s using wrapper-nested fixture",
+        "build_record": "focused-investigation-v1/roomy-evidence/action-fixture-build-record.json",
+        "roomy_volume": "08d91c7d-b461-49e5-9efc-47fe09fd41b3",
+        "capacity_before_bytes": 4255625216,
+        "capacity_after_bytes": 4255596544,
+        "original_failure_retained": "STATUS_OBJECT_NAME_NOT_FOUND at original test line206: fixture assumed child of volume root; wrapper put it one level deeper",
+        "production_changed": false,
+        "evidence": {
+          "focused-investigation-v1/roomy-evidence/roomy-affected.log": "061e9c8b5636f36e5a263ae60097f976576fe35cfb8746461adb7c28f8133eb9",
+          "focused-investigation-v1/roomy-evidence/action-fixture-build-record.json": "ca971b73ccc0cd5f9a3123846da66cd5a15af7ae2bcc63856655088a5578bbd9",
+          "focused-investigation-v1/roomy-evidence/roomy-ntfs-record.json": "9d038547cca3b612fd2c7bbaf3f1d482e608e1cb95c46251581d73eb1eeccb4e",
+          "focused-investigation-v1/roomy-evidence/roomy-affected-projection.json": "ef0a99bf6a7de29c5fac440dab956aab15b3a3280cd9a3cf9015918b72e9bb21",
+          "focused-investigation-v1/roomy-evidence/roomy-affected.xml": "96a0b5965ad5f93f28cffcbccf923225a6bbd267cf1441c4b9210ba570f4d38a",
+          "focused-investigation-v1/roomy-evidence/roomy-affected-record.json": "bb8454046e9aab5462bbb4ba7dd59b35a6080525f8afcfb67dc13b1c9c7fa7a3"
+        }
+      }
+    },
+    {
+      "packet": "progressive-fixture-bounded",
+      "manifest_sha256": "c13174496dbf1793b0a748c99e1b5c8cd1a28447df9a76746aa8a0eca43ffaee",
+      "patch_sha256": "ffe179386ca2a161024c325bbfc810b58134cceba8b10882dafd345153aae974",
+      "files": {
+        "tests/reviewed_tree_plan_tests.cpp": {
+          "baseline_sha256": "55ab634d9ceae0da8c1ff9c63f6e48c23856d9b0a641e998cff0a3ef54b84832",
+          "candidate_sha256": "e704e972dc849541ed2f132f0ff6a9944a094e20f4d7e8e6670221e6d0b8bd25"
+        }
+      },
+      "qualification": {
+        "status": "Frozen actual native NTFS PASS",
+        "Main_fixture_baseline_sha256": "55ab634d9ceae0da8c1ff9c63f6e48c23856d9b0a641e998cff0a3ef54b84832",
+        "candidate_sha256": "e704e972dc849541ed2f132f0ff6a9944a094e20f4d7e8e6670221e6d0b8bd25",
+        "scope": "Preserve Changed/Failed and source/destination/journal no-effect assertions; drain bounded fresh-source proof instead of requiring one-step bulk validation; at most1contentread/31bytes each advance via existing genuine hook. No product change.",
+        "SDK": "ac039592efc4a5024ebb930b20734ca6395c821e",
+        "runtime_seconds": 89.5126477,
+        "checks": 7004,
+        "fresh_source_steps": 260,
+        "precise_rejection": "Changed / regular_source.review_metadata_changed / code19 before destination or journal effects",
+        "source_content_unchanged": true,
+        "actual_native_content_read_bound": "<=1 read /31bytes per advance, existing genuine hook",
+        "timed_out": false,
+        "exit": 0,
+        "deadline_seconds": 180,
+        "production_changed": false,
+        "null_exit_limit": "Earlier Start-Process null-exit receipt retained, NOT counted; fresh reliable ProcessStartInfo rerun exit0 is qualification",
+        "evidence": {
+          "bounded-progressive-exactexit-record.json": "c27e417b5f60767605eca98ac5a21203f175983b575df602030edbcc7e642113",
+          "bounded-progressive.stderr": "e02bcc000efcd7fe1a2e9be17e83bdfee09d33ad87aab9f795f4756007642e0c",
+          "bounded-fixture-build-record.json": "000f24cf2f79274f89e4271ecbc72cafa491fd5f2e8776a84b5b39249357c4b2",
+          "bounded-progressive.stdout": "a0d3ee46f5339f6e7e269f9f285d2b9c858b5f8c073f1389d0e19d8d7c094b1b",
+          "bounded-progressive-exactexit.stderr": "e02bcc000efcd7fe1a2e9be17e83bdfee09d33ad87aab9f795f4756007642e0c",
+          "bounded-progressive-record.json": "4de9391c73c759a58da7747f10dcf526c5102f97d74e1ce809cdbc201204edab",
+          "bounded-progressive-exactexit.stdout": "a0d3ee46f5339f6e7e269f9f285d2b9c858b5f8c073f1389d0e19d8d7c094b1b"
+        },
+        "frozen_utc": "2026-11-09T22:44:34.924827+00:00"
+      }
+    }
+  ],
+  "limits": [
+    "Test-only corrections; product capability checks and deadlines unchanged.",
+    "Exact guarded fixture bytes qualified against stated ac039 SDK; no current combined SDK or sanitizer pass inferred.",
+    "All17 referenced evidence hashes verified before import.",
+    "Legacy fault mechanism migration remains open; no old mechanism was executed by Main for this import."
+  ],
+  "count_correction": "Original freeze summaries5903/5812 predate nine added fixture assertions. Actual normalized regression stdout5912ordinary/5821Complete/5912long is authoritative; original summaries retained verbatim."
+}

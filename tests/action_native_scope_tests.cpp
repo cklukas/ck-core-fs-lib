@@ -201,9 +201,13 @@ void run(const std::filesystem::path& path) {
     auto below=prepare(nested);roundtrip(below,sources,"target-ancestor-of-root-allowed");
     CHECK(take(below->finish_io()));below.reset();
     // A directory source containing the active Root is refused before bin I/O.
-    auto physical_parent=std::shared_ptr<const DirectoryCursor>(take(fs.open_directory(std::filesystem::path(native_volume))));
+    // Initial fixture navigation only. The wrapper may nest its temporary
+    // directory below another cohort directory, not directly under the volume.
+    const auto fixture_address=take(NativeAbsolutePath::from_host(path));
+    auto physical_parent=std::shared_ptr<const DirectoryCursor>(take(fs.open_native_directory(take(fixture_address.parent_address()))));
     const auto leaf=path.filename().native();auto containing_name=*NativeName::from_windows(std::u16string(leaf.begin(),leaf.end()));
     auto containing=take(HeldChild::observe(physical_parent,containing_name));
+    CHECK(containing->metadata().identity.value()&&base->identity().value()&&compare_identity(*containing->metadata().identity.value(),*base->identity().value())==IdentityComparison::Same);
     auto rejected=native_trash_backend()->prepare_trash_scoped(containing,active,{});
     CHECK(!rejected.value()&&rejected.state()==ObservationState::Unsupported);
     auto folder=mkdir(sources,"restore-directory");file(folder,name("payload"));folder.reset();

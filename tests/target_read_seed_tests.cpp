@@ -158,7 +158,23 @@ void directory_seed(const std::filesystem::path& path,bool complete){
 }
 #ifdef _WIN32
 extern "C" {decltype(&CloseHandle) __imp_CloseHandle=&seed_budget_close;}
-int wmain(int argc,wchar_t** argv){CHECK(argc==2||argc==3);const bool complete=argc==3;CHECK(!complete||std::wstring_view(argv[2])==L"--complete");
+int wmain(int argc,wchar_t** argv){CHECK(argc==2||argc==3);
+ if(argc==3&&std::wstring_view(argv[2])==L"--fixture-address-only") {
+  const auto address=fixture_native_address(std::filesystem::path(argv[1]));
+  const auto path=extended_address(address);const auto* units=address.windows_units();CHECK(units);
+  const auto handle=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+   nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+  const auto error=handle==INVALID_HANDLE_VALUE?GetLastError():ERROR_SUCCESS;
+  std::fprintf(stderr,"fixture-address open_error=%lu normalized_utf16=",static_cast<unsigned long>(error));
+  for(const auto unit:*units)std::fprintf(stderr,"%04x",unsigned(unit));std::fputc('\n',stderr);
+  CHECK(handle!=INVALID_HANDLE_VALUE);FILE_ID_INFO id{};FILE_ATTRIBUTE_TAG_INFO tag{};
+  CHECK(GetFileInformationByHandleEx(handle,FileIdInfo,&id,sizeof(id))&&GetFileInformationByHandleEx(handle,FileAttributeTagInfo,&tag,sizeof(tag)));
+  CHECK((tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)&&!(tag.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT));
+  std::fprintf(stderr,"fixture-address volume=%llu file_id=",static_cast<unsigned long long>(id.VolumeSerialNumber));
+  for(const auto unit:id.FileId.Identifier)std::fprintf(stderr,"%02x",unsigned(unit));std::fputc('\n',stderr);
+  CHECK(CloseHandle(handle));return 0;
+ }
+ const bool complete=argc==3;CHECK(!complete||std::wstring_view(argv[2])==L"--complete");
  if(complete){SecurityPrivilege privilege;directory_clone_budget(std::filesystem::path(argv[1]),true);directory_clone_budget(std::filesystem::path(argv[1]),true,true);directory_seed(std::filesystem::path(argv[1]),true);}
  else {directory_clone_budget(std::filesystem::path(argv[1]),false);directory_clone_budget(std::filesystem::path(argv[1]),false,true);directory_seed(std::filesystem::path(argv[1]),false);}
  std::printf("target_read_seed: %u checks passed\n",checks);return 0;}

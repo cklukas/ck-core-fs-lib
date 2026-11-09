@@ -21,6 +21,7 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <winternl.h>
+#include "windows_name.hpp"
 #else
 #include <cerrno>
 #include <dlfcn.h>
@@ -183,11 +184,25 @@ void directory_permissions(const NativeAbsolutePath& address,bool readonly) {
     LocalFree(descriptor);CHECK(CloseHandle(handle));
 }
 #endif
+// CLI navigation address only. Validate before converting ordinary DOS/UNC
+// separators to the extended Win32 boundary; already extended UTF16 is exact.
+NativeAbsolutePath fixture_native_address(const std::filesystem::path& work) {
+    auto address=take(NativeAbsolutePath::from_host(work));
+#ifdef _WIN32
+    const auto* units=address.windows_units();CHECK(units);
+    if(units->starts_with(u"\\\\?\\"))return address;
+    const std::wstring spelling(units->begin(),units->end());
+    const auto native=windows_extended_path(spelling);CHECK(native);
+    return take(NativeAbsolutePath::from_host(std::filesystem::path(*native)));
+#else
+    return address;
+#endif
+}
 struct Fixture {
     NativeFileSystem fs;NativeAbsolutePath address;Cursor base,source,parent,journals;
     PreparedJournalRoot::Pointer root;NativeName target;HeldChild::Pointer source_held;
     MetadataReplaySnapshot metadata;
-    explicit Fixture(const std::filesystem::path& work,bool nested=false,bool with_ads=false,bool complete=false):address(take(NativeAbsolutePath::from_host(work))),target(name(("destination-"+std::to_string(++sequence)).c_str())) {
+    explicit Fixture(const std::filesystem::path& work,bool nested=false,bool with_ads=false,bool complete=false):address(fixture_native_address(work)),target(name(("destination-"+std::to_string(++sequence)).c_str())) {
         base=Cursor(take(fs.open_native_directory(address)));source=mkdir(base,name(("source-"+std::to_string(sequence)).c_str()));parent=base;
         const auto journal_name=name(("journal-"+std::to_string(sequence)).c_str());journals=mkdir(base,journal_name);
         const auto journal_address=take(address.child_address(journal_name));CHECK(take(prepare_native_operation_journal_root(journal_address)));

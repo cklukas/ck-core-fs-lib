@@ -1232,8 +1232,22 @@ void test_reviewed_metadata_capture_binding(){
     for(unsigned i=0;i<10000&&job->state()==ReviewedTreeState::Revalidating;++i)bounded_advance(*job,31);
     CHECK(job->state()==ReviewedTreeState::Executing);
     attribute(f.path("s/a"),'b');match_times(f.path("shadow"),f.path("s/a"));
-    job->advance();CHECK(job->state()==ReviewedTreeState::Failed);CHECK(!f.exists("d/a"));
-    CHECK(job->progress().failure&&job->progress().failure->error.operation=="reviewed_tree.source_metadata_capture_changed");
+    // Fresh execution-source validation is cooperative. Await its bounded
+    // content/metadata proof while checking that no destination exists.
+    unsigned execution_steps=0;
+    for(;execution_steps<100000&&active(job->state());++execution_steps) {
+        CHECK(!f.exists("d/a"));
+        bounded_advance(*job,31);
+    }
+    if(job->progress().failure)std::fprintf(stderr,"fresh source binding steps=%u state=%u op=%s code=%lld\n",
+        execution_steps,unsigned(job->state()),job->progress().failure->error.operation.c_str(),
+        static_cast<long long>(job->progress().failure->error.code));
+    CHECK(execution_steps>1&&job->state()==ReviewedTreeState::Failed);CHECK(!f.exists("d/a"));
+    CHECK(job->progress().failure&&job->progress().failure->state==ObservationState::Changed&&
+          job->progress().failure->error.operation=="regular_source.review_metadata_changed");
+    auto journals=take(f.parent->open_directory_child(name("journals")));
+    const auto records=journals->read(16);CHECK(records.state==DirectoryReadState::End&&records.names.empty());
+    CHECK(f.read("s/a")==std::string(2049,'p'));
     std::printf("post-revalidation ADS mutation with restored Basic times cannot supersede reviewed metadata before journal/staging effects PASS\n");
 }
 #endif
