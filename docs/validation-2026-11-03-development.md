@@ -894,3 +894,38 @@ Public C ABI v1 is unchanged; the private C++ retry layout changed again and
 requires rebuilding all dependent translation units. Windows, Darwin,
 sanitizers and the final combined Main revision remain unqualified. A separate
 source review of the Root pending-first-writer protocol is still in progress.
+
+
+## Reviewed-Tree positive fixtures use qualified native contracts
+
+The remaining six full-normal failures were obsolete fixture assumptions, not
+evidence that the production creator guard should be relaxed. Mutation-positive
+fixtures now select strict Ordinary preservation with Original ownership.
+Linux precreates destination directory skeletons, retaining every source row
+and byte/zero-length assertion; Windows keeps native-created-directory positive
+cases. Explicit-loss scenarios retain their own original policy. The permanent
+Linux native creator-refusal control remains unchanged.
+
+C stale tests require an accepted execute command before checking execution
+rejection. Their preexisting destination skeleton, including directory mtime
+and ctime, must remain unchanged. All six C++ substitution variants remain.
+The partial-progress ancestor test first completes a regular copy, substitutes
+an existing destination ancestor, then requires exact Changed/MetadataChanged
+`reviewed_tree.root_observer_changed`, NeedsReconciliation, partial/recovery
+flags, retained completed payload and no nested publication. Main's writer
+cancellation test is byte-identical to the preceding correction.
+
+The isolated fixture patch passed all **seven C API scenarios**, the full C++
+bundle (**796 checks**), changed receipts (**159**), Compare (**88**), private
+scope (**353**), progressive metadata (**3,135**), explicit loss (**1,852**) and
+cancellation (**51**). The unchanged native positive/creator-refusal binary
+passed **8,685 checks**. Two test translation units compiled/linked in 8.73
+seconds. All 158 product headers and four library hashes matched the frozen
+`2fffc30` SDK before and after; ldd verified the exact C runtime. Original and
+intermediate failures are retained.
+
+Fixture patch SHA-256:
+`bf8a3ba33a65aae3ff556007810da201c696a902960cbec9b6a7da1447d99861`.
+No production code was changed in this increment. Windows runtime, the later
+Session/retry changes and the final complete suite remain outside this receipt;
+those require a coherent subsequent qualification run.

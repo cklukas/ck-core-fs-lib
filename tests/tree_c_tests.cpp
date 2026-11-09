@@ -115,7 +115,9 @@ int main(int argc, char** argv) {
     }
     ckfet_options_v1 o{}; ckfet_options_init_v1(&o);
     assert(o.version == CKFET_VERSION && o.struct_size == sizeof(o));
-    o.profile = CKFSP_COPY; o.allow_metadata_loss = 1; o.operation_id[0] = 37;
+    o.profile = CKFSP_COPY; o.allow_metadata_loss = 0; o.operation_id[0] = 37;
+    o.metadata_scope = CKFE_METADATA_ORDINARY_CALLER_VISIBLE_V1;
+    o.metadata_ownership = CKFE_OWNERSHIP_ORIGINAL;
     if(compare) {o.profile=CKFSP_COMPARE;o.allow_metadata_loss=0;o.metadata_scope=CKFE_METADATA_COMPLETE_V1;}
 #ifdef _WIN32
     // Fixture arguments are UTF-8 from Python. Convert at the test boundary,
@@ -249,6 +251,7 @@ int main(int argc, char** argv) {
     if (mode == "stale"||prepared) { std::puts("REVIEWED"); std::fflush(stdout); assert(std::getchar() == 'x'); }
     assert(ckfet_execute_v1(job, s.plan_generation, s.receipt_id, &command) == CKFE_API_OK);
     s = wait(job, true); show(s);
+    assert(s.command_state == CKFET_COMMAND_ACCEPTED);
     if (s.command_state == CKFET_COMMAND_ACCEPTED) {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         while (s.state < CKFET_COMPLETE && std::chrono::steady_clock::now() < until) {

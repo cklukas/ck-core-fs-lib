@@ -368,6 +368,16 @@ struct Fixture {
     }
 };
 unsigned Fixture::sequence = 0;
+ReviewedTreePlanJob::Pointer positive_job(Fixture& fixture, ComparisonProfile profile = ComparisonProfile::Copy) {
+    auto request = fixture.request(profile);
+    request.copy_policy.allow_unhandled_metadata_loss = false;
+    MetadataReplayPolicy policy;
+    policy.scope = RegularMetadataScope::OrdinaryCallerVisibleV1;
+    policy.ownership = MetadataOwnership::Original;
+    request.copy_policy.metadata_scope = policy.scope;
+    request.copy_policy.metadata_policy = policy;
+    return take(ReviewedTreePlanJob::create(std::move(request)));
+}
 bool active(ReviewedTreeState s) { return s == ReviewedTreeState::Inventory || s == ReviewedTreeState::Revalidating || s == ReviewedTreeState::Executing; }
 void run(ReviewedTreePlanJob& job) {
     for (unsigned i = 0; i < 100000 && active(job.state()); ++i) job.advance();
@@ -498,7 +508,10 @@ void test_copy(bool long_path = false) {
     mkdir_new(f.path("s/folder")); mkdir_new(f.path("s/folder/empty"));
     write_file(f.path("s/folder/data"), std::string(299, 'a'));
     write_file(f.path("s/zero"), "");
-    auto job = f.job(); preview(*job);
+#ifdef __linux__
+    mkdir_new(f.path("d/folder")); mkdir_new(f.path("d/folder/empty"));
+#endif
+    auto job = positive_job(f); preview(*job);
     auto immutable = job->preview();
     CHECK(immutable->source_entries().size() == 4);
     CHECK(immutable->aggregate().source_bytes == 299);
@@ -510,7 +523,12 @@ void test_copy(bool long_path = false) {
         std::fprintf(stderr, "copy: %s state=%d\n", job->progress().failure->error.operation.c_str(), int(job->state()));
     CHECK(job->state() == ReviewedTreeState::Complete);
     CHECK(job->preview() == immutable);
+#ifdef __linux__
+    CHECK(immutable->destination_entries().size() == 2);
+    for (const auto& entry : immutable->destination_entries()) CHECK(entry.object.kind == ObjectKind::Directory);
+#else
     CHECK(immutable->destination_entries().empty());
+#endif
     CHECK(f.exists("d/folder/empty")); CHECK(f.read("d/folder/data") == std::string(299, 'a'));
     CHECK(f.read("d/zero").empty());
     auto progress = job->progress();
@@ -524,7 +542,7 @@ void test_receipts_and_rules() {
     write_file(f.path("s/folder/a"), "source"); write_file(f.path("d/folder/a"), "target");
     write_file(f.path("s/b"), "source-b"); write_file(f.path("d/b"), "target-b");
     write_file(f.path("s/new"), "fresh");
-    auto job = f.job(); preview(*job);
+    auto job = positive_job(f); preview(*job);
     CHECK(!job->review({}).value());
     auto rule = keep_rule(*job);
     auto receipt = take(job->review(std::span(&rule, 1)));
@@ -542,7 +560,7 @@ void test_receipts_and_rules() {
     CHECK(job->state() == ReviewedTreeState::Complete);
     CHECK(f.read("d/folder/a") == "target" && f.read("d/b") == "target-b" && f.read("d/new") == "fresh");
     CHECK(job->progress().skipped_items == 2);
-    auto foreign = f.job(); preview(*foreign);
+    auto foreign = positive_job(f); preview(*foreign);
     CHECK(!foreign->begin_execution(receipt).value());
     CHECK(!foreign->review(std::span(&rule, 1)).value());
     auto selected = keep_rule(*foreign, ConflictScope::Selected);
@@ -562,7 +580,7 @@ void test_receipts_and_rules() {
 void test_deletions_and_unsupported() {
     Fixture f;
     write_file(f.path("s/new"), "fresh"); write_file(f.path("d/extra"), "keep");
-    auto mirror = f.job(ComparisonProfile::Mirror); preview(*mirror);
+    auto mirror = positive_job(f, ComparisonProfile::Mirror); preview(*mirror);
     CHECK(!mirror->review({}).value());
     CHECK(!mirror->review_deletions({}).value());
     std::vector<ComparisonDecisionToken> deletions;
@@ -579,13 +597,13 @@ void test_deletions_and_unsupported() {
     CHECK(begin.state() == ObservationState::Unsupported);
     CHECK(!f.exists("d/new") && f.read("d/extra") == "keep");
 #endif
-    auto foreign = f.job(ComparisonProfile::Mirror); preview(*foreign);
+    auto foreign = positive_job(f, ComparisonProfile::Mirror); preview(*foreign);
     CHECK(!foreign->review_deletions(deletions).value());
     CHECK(!foreign->review({}, deletion).value());
     deletions.push_back(deletions.front()); CHECK(!mirror->review_deletions(deletions).value());
 
     write_file(f.path("d/new"), "old", f.exists("d/new"));
-    auto replace = f.job(ComparisonProfile::Sync); preview(*replace);
+    auto replace = positive_job(f, ComparisonProfile::Sync); preview(*replace);
     auto reviewed = replace->review({});
     if (reviewed.value()) {
         auto replace_receipt = take(std::move(reviewed));
@@ -631,7 +649,10 @@ void test_changed_receipts() {
 #endif
         if (!empty_root_swap) mkdir_new(f.path("s/folder"));
         if (!empty_directory_swap && !empty_root_swap) write_file(f.path("s/folder/a"), "original");
-        auto job = f.job(); preview(*job); auto receipt = take(job->review({}));
+#ifdef __linux__
+        mkdir_new(f.path("d/folder"));
+#endif
+        auto job = positive_job(f); preview(*job); auto receipt = take(job->review({}));
         if (variant == 0) write_file(f.path("s/folder/a"), "modified", true);
         if (variant == 1) { rename_exact(f.path("s/folder/a"), f.path("s/old")); write_file(f.path("s/folder/a"), "original"); }
         if (variant == 2) write_file(f.path("d/foreign"), "target changed");
@@ -665,7 +686,12 @@ void test_changed_receipts() {
         run(*job);
         CHECK(job->state() == ReviewedTreeState::Failed);
         CHECK(job->progress().failure.has_value());
+        CHECK(!f.exists("d/folder/a"));
+#ifdef __linux__
+        CHECK(f.exists(variant == 3 ? "old-d/folder" : "d/folder"));
+#else
         CHECK(!f.exists("d/folder"));
+#endif
     }
 }
 void test_overlap_collision_and_limits() {
@@ -714,14 +740,17 @@ void test_overlap_collision_and_limits() {
 void test_cancellation() {
     Fixture f;
     write_file(f.path("s/a"), "data");
-    auto inventory = f.job(); std::stop_source cancel; cancel.request_stop();
+    auto inventory = positive_job(f); std::stop_source cancel; cancel.request_stop();
     CHECK(inventory->advance(cancel.get_token()) == ReviewedTreeState::Cancelled);
     CHECK(!inventory->progress().counts_complete && !f.exists("d/a"));
-    auto reviewed = f.job(); preview(*reviewed);
+    auto reviewed = positive_job(f); preview(*reviewed);
     CHECK(reviewed->advance(cancel.get_token()) == ReviewedTreeState::Cancelled);
     CHECK(!f.exists("d/a"));
     mkdir_new(f.path("s/folder"));
-    auto execution = f.job(); preview(*execution); start(*execution);
+#ifdef __linux__
+    mkdir_new(f.path("d/folder"));
+#endif
+    auto execution = positive_job(f); preview(*execution); start(*execution);
     for (unsigned i = 0; i < 10000 && execution->progress().completed_items == 0 && active(execution->state()); ++i) execution->advance();
     if (!execution->progress().completed_items) {
         const auto progress = execution->progress();
@@ -739,7 +768,7 @@ void test_cancellation() {
 void test_changes_during_execution() {
     Fixture f;
     write_file(f.path("s/a"), std::string(333, 'x'));
-    auto copy = f.job(); preview(*copy); start(*copy);
+    auto copy = positive_job(f); preview(*copy); start(*copy);
     for (unsigned i = 0; i < 10000 && active(copy->state()); ++i) {
         copy->advance();
         auto item = take(copy->page(0, 1)).items.front();
@@ -755,12 +784,27 @@ void test_changes_during_execution() {
 
     Fixture g;
     mkdir_new(g.path("s/folder")); write_file(g.path("s/folder/a"), "content");
-    auto ancestor = g.job(); preview(*ancestor); start(*ancestor);
+    mkdir_new(g.path("d/folder"));
+    // Preserve the original partial-progress premise without relying on an
+    // unsupported Linux directory creation as the first completed effect.
+    write_file(g.path("s/a"), "completed before ancestor substitution");
+    auto ancestor = positive_job(g); preview(*ancestor); start(*ancestor);
     for (unsigned i = 0; i < 10000 && ancestor->progress().completed_items == 0 && active(ancestor->state()); ++i) ancestor->advance();
+    CHECK(active(ancestor->state()) && !g.exists("d/folder/a"));
     CHECK(ancestor->progress().completed_items == 1);
+    CHECK(g.exists("d/a"));
     rename_exact(g.path("d/folder"), g.path("d/old")); mkdir_new(g.path("d/folder"));
     run(*ancestor);
-    CHECK(ancestor->state() == ReviewedTreeState::Partial);
+    if (ancestor->progress().failure) std::fprintf(stderr, "ancestor mutation state=%u partial=%u op=%s\n",
+        unsigned(ancestor->state()), unsigned(ancestor->progress().partial), ancestor->progress().failure->error.operation.c_str());
+    // Strict target observation detects the foreign namespace change before
+    // admitting it as an own effect and requires reconciliation after copying.
+    CHECK(ancestor->state() == ReviewedTreeState::NeedsReconciliation);
+    CHECK(ancestor->progress().partial && ancestor->progress().recovery_required);
+    CHECK(ancestor->progress().failure->state == ObservationState::Changed);
+    CHECK(ancestor->progress().failure->error.code == static_cast<std::int64_t>(AdapterError::MetadataChanged));
+    CHECK(ancestor->progress().failure->error.operation == "reviewed_tree.root_observer_changed");
+    CHECK(g.read("d/a") == "completed before ancestor substitution");
     CHECK(!g.exists("d/folder/a"));
 }
 void test_parent_move_into_source() {
@@ -792,7 +836,7 @@ void test_parent_move_into_source() {
 }
 void test_assessment_and_receipt_revocation() {
     Fixture f; write_file(f.path("s/a"), "incoming"); write_file(f.path("d/a"), "existing");
-    auto job = f.job(); preview(*job);
+    auto job = positive_job(f); preview(*job);
     auto unresolved = take(job->assess_rules({}, 0, 1));
     CHECK(unresolved.items.front().decision.has_value());
     CHECK(unresolved.items.front().decision->state == ConflictRuleState::NeedsReview);
@@ -825,7 +869,7 @@ void test_lossless_native_names() {
     for (const std::string& native : native_names) {
         Fixture f; auto source = std::filesystem::path("s") / native;
         write_file(f.work / source, "exact native payload");
-        auto job = f.job(); preview(*job);
+        auto job = positive_job(f); preview(*job);
         const auto row = take(job->page(0, 1)).items.front();
         const auto components = take(job->native_components(row.row.id, true));
         CHECK(components.size() == 1 && *components.front().posix_bytes() == native);
@@ -838,7 +882,7 @@ void test_lossless_native_names() {
         CHECK(std::string(reinterpret_cast<const char*>(bytes.bytes.data()), bytes.bytes.size()) == "exact native payload");
     }
     Fixture f; write_file(f.work / "s" / "\xc3\xa9", "one"); write_file(f.work / "s" / "\xce\xb2", "two");
-    auto job = f.job(); preview(*job);
+    auto job = positive_job(f); preview(*job);
     auto receipt = take(job->review({}));
     const auto started = job->begin_execution(receipt);
     if (!started.value()) {
@@ -851,7 +895,7 @@ void test_lossless_native_names() {
 void test_retention_capabilities_and_incoming_copy() {
     Fixture f;
     write_file(f.path("s/a"), "incoming data"); write_file(f.path("d/a"), "existing data");
-    auto job = f.job(); preview(*job);
+    auto job = positive_job(f); preview(*job);
     const auto token = take(job->page(0, 1)).items.front().row.token;
     auto rule = keep_rule(*job); rule.choice = ConflictChoice::UseSource;
     auto replace = take(job->assess_rules(std::span(&rule, 1), 0, 1));
@@ -985,7 +1029,7 @@ void test_compare_acknowledges_descriptive_choices() {
 void test_profiles() {
     for (auto profile : {ComparisonProfile::Update, ComparisonProfile::MissingOnly, ComparisonProfile::Sync, ComparisonProfile::Mirror, ComparisonProfile::Compare}) {
         Fixture f; write_file(f.path("s/a"), "content");
-        auto job = f.job(profile); preview(*job); start(*job); run(*job);
+        auto job = positive_job(f, profile); preview(*job); start(*job); run(*job);
         CHECK(job->state() == ReviewedTreeState::Complete);
         CHECK(f.exists("d/a") == (profile != ComparisonProfile::Compare));
     }
@@ -994,7 +1038,7 @@ void test_profiles() {
 void test_exact_names_links_and_fifo() {
     Fixture f;
     write_file(f.path("s/back\\slash"), "exact");
-    auto exact = f.job(); preview(*exact); start(*exact); run(*exact);
+    auto exact = positive_job(f); preview(*exact); start(*exact); run(*exact);
     CHECK(exact->state() == ReviewedTreeState::Complete && f.read("d/back\\slash") == "exact");
     CHECK(::symlink("back\\slash", f.path("s/link").c_str()) == 0);
     auto link = f.job(); run(*link);

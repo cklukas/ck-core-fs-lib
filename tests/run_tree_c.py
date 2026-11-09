@@ -32,6 +32,13 @@ with tempfile.TemporaryDirectory(prefix="tree-c-", dir=scratch) as work:
     (source / "alpha").write_bytes(b"complete file data\0\xff" * 256)
     (source / "nested").mkdir()
     (source / "nested" / "beta").write_bytes(b"nested exact bytes\x80" * 128)
+    if sys.platform.startswith("linux") and mode != "compare":
+        # Linux qualifies replay into existing directories; its strong native
+        # new-directory creator remains unavailable. Keep both source rows.
+        (target / "nested").mkdir()
+    target_before = {p.relative_to(target): (p.is_dir(), p.stat().st_mtime_ns,
+                                           p.stat().st_ctime_ns)
+                     for p in target.rglob("*")}
     if mode in ("keepboth", "compare"):
         (target / "alpha").write_bytes(b"original target remains")
     env = dict(os.environ, TMPDIR=str(root), TEMP=str(root), TMP=str(root))
@@ -42,7 +49,10 @@ with tempfile.TemporaryDirectory(prefix="tree-c-", dir=scratch) as work:
         (source / "alpha").write_bytes(b"changed after review")
         proc.communicate("x", timeout=45)
         assert proc.returncode == 0
-        assert list(target.iterdir()) == [], "stale plan mutated destination"
+        target_after = {p.relative_to(target): (p.is_dir(), p.stat().st_mtime_ns,
+                                              p.stat().st_ctime_ns)
+                        for p in target.rglob("*")}
+        assert target_after == target_before, "stale plan mutated destination"
         if mode == "prepared_stale":
             assert list(journal.iterdir()) == [], "stale plan wrote a mutation journal"
     else:
@@ -60,4 +70,4 @@ with tempfile.TemporaryDirectory(prefix="tree-c-", dir=scratch) as work:
                 assert (target / "alpha").read_bytes() == (source / "alpha").read_bytes()
             assert (target / "nested" / "beta").read_bytes() == (source / "nested" / "beta").read_bytes()
         else:
-            assert list(target.iterdir()) == []
+            assert {p.relative_to(target) for p in target.rglob("*")} == set(target_before)
