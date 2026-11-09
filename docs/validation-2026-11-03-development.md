@@ -1092,3 +1092,39 @@ new CMake registration still requires a fresh coherent Windows build/runtime
 check. Hooks are off by default. No import-symbol replacement, IAT manipulation
 or process-memory patching is used. Combined Linux/macOS/sanitizer qualification
 of this increment is separate from the preceding 175-case receipt.
+
+
+## November 10 current combined qualification checkpoint
+
+The immutable `94579be` Linux normal snapshot passed **175/175 default tests,
+zero skipped**. All 212 configured translation units rebuilt in a fresh serial
+289-step GCC 14 Debug O1 build without NDEBUG. Configuration took 1.01 seconds,
+build 614.11 seconds and tests 121.49 seconds. The preceding comparable clean
+212-TU normal build took 773.37 seconds; actual compiled inputs and output
+fingerprints, rather than elapsed time alone, establish freshness. Source bytes
+were unchanged. This includes the late Action Root readback and generic pending
+formatter; the earlier 175-case ASan/UBSan receipt remains tied to `78c7386`.
+
+A separate coherent Windows `94579be` SDK rebuilt all 198 translation units in
+262 steps (951.71 seconds compiling). The newly registered consumed-close tests
+passed **49/49 on NTFS and 49/49 on ReFS**, with **28/28 long-path controls**.
+All 157 installed headers matched source. Four installed consumers compiled;
+only core passed at runtime. Platform, native and C API consumers each timed out
+at the original 90-second deadline. The location remains unresolved. These tests
+inherited the required filesystem name explicitly; CMake registration still
+needs a self-contained environment fix. Legacy fault mechanisms were not run;
+their replacement remains unfinished. Sealed packet manifest SHA-256:
+`d7c4ea11a225beecafe5d760c0ba8993e9a53aab52a610f5249be8cfafaeb8b8`.
+
+The current macOS backend `0fb7a09` ThreadSanitizer snapshot rebuilt all 187
+configured translation units in 188.69 seconds with the matching LLVM 23.1.4
+and previously qualified Darwin runtime. It passed **55/65 tests**, with ten
+failures and zero skips in 43.67 seconds. No race warning or sanitizer runtime
+check failure was reported; this is not a passing suite. Several native tests
+expect publication or directory-atime capabilities that the macOS provider
+explicitly refuses; each failure still requires an independently verified
+capability-specific test or product correction. The original failures remain
+preserved. Source and runtime hashes were unchanged.
+
+None of these receipts qualifies the unmerged hierarchical relay, the new
+archive writer, full Windows/macOS matrices, a newer CDE SDK pin, or Apply.
