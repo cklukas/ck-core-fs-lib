@@ -49,6 +49,39 @@ Fds snapshot(bool regular) {
     }
     CHECK(closedir(proc)==0);CHECK(read_error==0);return out;
 }
+void acquisition_diagnostic(const char* point) {
+    std::cerr<<"acquisition diagnostic "<<point
+        <<" acquiring="<<acquiring<<" invalid="<<invalid_acquisition
+        <<" tracked_size="<<files.size<<" query_fd="<<query_fd<<" held_fd="<<held_fd
+        <<" file_closes="<<file_closes<<" hits="<<hits
+        <<" consumed_calls="<<consumed_calls<<" consumed="<<consumed
+        <<" retried="<<retried<<" closed_once="<<closed_once;
+#ifdef _FORTIFY_SOURCE
+    std::cerr<<" _FORTIFY_SOURCE="<<_FORTIFY_SOURCE;
+#else
+    std::cerr<<" _FORTIFY_SOURCE=undefined";
+#endif
+#ifdef __USE_FORTIFY_LEVEL
+    std::cerr<<" __USE_FORTIFY_LEVEL="<<__USE_FORTIFY_LEVEL;
+#endif
+    std::cerr<<'\n';
+    const auto dump=[](const char* label,int fd) {
+        errno=0;const int status=fcntl(fd,F_GETFL);const int status_error=status<0?errno:0;
+        errno=0;const int flags=fcntl(fd,F_GETFD);const int flags_error=flags<0?errno:0;
+        struct stat s{};errno=0;const int stat_result=fstat(fd,&s);const int stat_error=stat_result<0?errno:0;
+        std::cerr<<label<<" fd="<<fd<<" F_GETFL="<<status<<" errno="<<status_error
+            <<" F_GETFD="<<flags<<" errno="<<flags_error
+            <<" fstat="<<stat_result<<" errno="<<stat_error;
+        if(stat_result==0)std::cerr<<" dev="<<s.st_dev<<" ino="<<s.st_ino<<" mode="<<s.st_mode<<" selected_inode="<<file(s);
+        std::cerr<<'\n';
+    };
+    for(unsigned i=0;i<files.size;++i)dump("tracked",files.values[i]);
+    dump("query",query_fd);dump("held",held_fd);
+    try {
+        const auto native=snapshot(true);std::cerr<<"native fixture inode snapshot size="<<native.size<<'\n';
+        for(unsigned i=0;i<native.size;++i)dump("native",native.values[i]);
+    }catch(const std::exception& error){std::cerr<<"diagnostic snapshot unavailable: "<<error.what()<<'\n';}
+}
 void reset(){armed=tracking=acquiring=ordered=invalid_acquisition=false;mode=Mode::None;files={};directories={};query_fd=held_fd=consumed=-1;consumed_directory=nullptr;file_closes=hits=consumed_calls=0;retried=closed_once=false;}
 void acquired(int fd,int flags)noexcept {
     if(!acquiring||fd<0||files.size==2)return;
@@ -118,6 +151,8 @@ void qualify_owners(Fixture& f) {
     NativeFileSystem filesystem;auto parent=std::shared_ptr<const DirectoryCursor>(get(filesystem.open_native_directory(f.native("left"))));
     CHECK(snapshot(true).size==0);tracking=acquiring=true;
     NativeSyncProofBudget budget;auto proof=get(observe_native_sync_file(parent,name("a"),f.request().metadata,NativeSyncProofLimits{},budget));
+    if(!(!acquiring&&!invalid_acquisition&&files.size==2&&query_fd>=0&&held_fd>=0&&query_fd!=held_fd&&file_closes==0))
+        acquisition_diagnostic("qualify_owners.before_check");
     CHECK(!acquiring&&!invalid_acquisition&&files.size==2&&query_fd>=0&&held_fd>=0&&query_fd!=held_fd&&file_closes==0);
     const auto current=snapshot(true);CHECK(current.size==2&&current.contains(query_fd)&&current.contains(held_fd));
     for(int fd:{query_fd,held_fd}){struct stat owner{};CHECK(fstat(fd,&owner)==0&&file(owner));}
