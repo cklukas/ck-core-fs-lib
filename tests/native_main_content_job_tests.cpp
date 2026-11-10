@@ -415,12 +415,23 @@ void native_pending_phase_test(){
  std::cout<<"real pending/incomplete/completion/cancel-drain phases; request counted once, no early completion action, native error pairs PASS\n";
 }
 void native_error_state_test(){
+ struct ProbeHandle final {
+  HANDLE value;
+  bool protected_from_close=false;
+  bool finish() noexcept {
+   if(value==INVALID_HANDLE_VALUE)return true;
+   if(protected_from_close&&!SetHandleInformation(value,HANDLE_FLAG_PROTECT_FROM_CLOSE,0))return false;
+   protected_from_close=false;
+   return CloseHandle(std::exchange(value,INVALID_HANDLE_VALUE))!=FALSE;
+  }
+  ~ProbeHandle(){(void)finish();}
+ };
  Fixture f;
- HANDLE readable=CreateFileW((f.root+L"\\a").c_str(),GENERIC_READ,
-  FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
- HANDLE attributes=CreateFileW((f.root+L"\\a").c_str(),FILE_READ_ATTRIBUTES,
-  FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
- check(readable!=INVALID_HANDLE_VALUE&&attributes!=INVALID_HANDLE_VALUE,"dirty observer genuine handles");
+ ProbeHandle readable{CreateFileW((f.root+L"\\a").c_str(),GENERIC_READ,
+  FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr)};
+ ProbeHandle attributes{CreateFileW((f.root+L"\\a").c_str(),FILE_READ_ATTRIBUTES,
+  FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr)};
+ check(readable.value!=INVALID_HANDLE_VALUE&&attributes.value!=INVALID_HANDLE_VALUE,"dirty observer genuine handles");
  {
   dirty_native_observer::Slots slots;
 #ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
@@ -431,7 +442,7 @@ void native_error_state_test(){
 #ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
   nested_legacy_observer::reset();
 #endif
-  const bool read=detail::probe_native_capture_read(readable,bytes,static_cast<std::uint32_t>(sizeof(bytes)),&copied);
+  const bool read=detail::probe_native_capture_read(readable.value,bytes,static_cast<std::uint32_t>(sizeof(bytes)),&copied);
   const DWORD read_error=GetLastError();const int read_errno=errno;
   check(read&&copied==sizeof(bytes)&&std::memcmp(bytes,f.main.data(),sizeof(bytes))==0,"dirty observer changed genuine read bytes/result");
   check(dirty_native_observer::matches&&dirty_native_observer::native_success&&dirty_native_observer::before_calls==1&&
@@ -446,7 +457,7 @@ void native_error_state_test(){
 #ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
   nested_legacy_observer::reset();
 #endif
-  const bool denied=detail::probe_native_capture_read(attributes,bytes,static_cast<std::uint32_t>(sizeof(bytes)),&copied);
+  const bool denied=detail::probe_native_capture_read(attributes.value,bytes,static_cast<std::uint32_t>(sizeof(bytes)),&copied);
   const DWORD denied_error=GetLastError();const int denied_errno=errno;
   check(!denied&&!dirty_native_observer::native_success&&denied_error==ERROR_ACCESS_DENIED,"real attribute-only ReadFile refusal changed");
   check(dirty_native_observer::matches&&dirty_native_observer::before_calls==1&&dirty_native_observer::after_calls==1&&
@@ -461,7 +472,9 @@ void native_error_state_test(){
 #ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
   nested_legacy_observer::reset();
 #endif
-  const bool consumed=detail::probe_native_capture_close(readable);
+  // Transfer the native owner before the adapter's consuming close.
+  const auto owned=std::exchange(readable.value,INVALID_HANDLE_VALUE);
+  const bool consumed=detail::probe_native_capture_close(owned);
   const DWORD consumed_error=GetLastError();const int consumed_errno=errno;
   check(!consumed&&consumed_error==ERROR_WRITE_FAULT&&dirty_native_observer::close_success,"post-real-close failure not surfaced");
   check(dirty_native_observer::matches&&dirty_native_observer::close_calls==1&&consumed_errno==dirty_native_observer::close_post_errno&&
@@ -472,15 +485,20 @@ void native_error_state_test(){
    nested_legacy_observer::raw_post_error==dirty_native_observer::close_post_error&&
    nested_legacy_observer::raw_post_errno==consumed_errno,"legacy close event confused raw success with effective injected failure");
 #endif
-  // The callback recorded the TRUE result of the real CloseHandle. Never
-  // query/reclose the retired numeric value: another owner could reuse it.
-  readable=INVALID_HANDLE_VALUE;
+  // INVALID_HANDLE_VALUE also denotes the current-process pseudo-handle.
+  // Use an owned file with native close protection for the real failure.
+  check(SetHandleInformation(attributes.value,HANDLE_FLAG_PROTECT_FROM_CLOSE,HANDLE_FLAG_PROTECT_FROM_CLOSE)!=0,
+   "protect genuine close probe handle");
+  attributes.protected_from_close=true;
   dirty_native_observer::reset();
 #ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
   nested_legacy_observer::reset();
 #endif
-  const bool invalid=detail::probe_native_capture_close(INVALID_HANDLE_VALUE);
+  const bool invalid=detail::probe_native_capture_close(attributes.value);
   const DWORD invalid_error=GetLastError();const int invalid_errno=errno;
+  // If native close unexpectedly succeeded, retire the value before any check
+  // or cleanup. On native refusal the fixture still owns the protected handle.
+  if(dirty_native_observer::close_success)attributes.value=INVALID_HANDLE_VALUE;
   check(!invalid&&!dirty_native_observer::close_success&&invalid_error==ERROR_INVALID_HANDLE,"real CloseHandle error did not beat injected ERROR_WRITE_FAULT");
   check(dirty_native_observer::matches&&dirty_native_observer::close_calls==1&&invalid_error==dirty_native_observer::close_post_error&&
    invalid_errno==dirty_native_observer::close_post_errno&&invalid_errno==EBUSY,"real close error pair lost to observer");
@@ -489,8 +507,11 @@ void native_error_state_test(){
    !nested_legacy_observer::raw_success&&nested_legacy_observer::semantic_error==ERROR_INVALID_HANDLE&&
    nested_legacy_observer::raw_post_error==invalid_error&&nested_legacy_observer::raw_post_errno==invalid_errno,"nested legacy observer masked real close failure");
 #endif
+  DWORD flags=0;
+  check(GetHandleInformation(attributes.value,&flags)&&(flags&HANDLE_FLAG_PROTECT_FROM_CLOSE),
+   "refused close did not leave the fixture's protected owner live");
  }
- check(CloseHandle(attributes)!=0,"dirty observer setup owner close");
+ check(attributes.finish(),"dirty observer setup owner close");
  std::cout<<"actual helper dirty-observer read/close LastError+errno pairs, native failure precedence and real-close consumption PASS\n";
 }
 #endif

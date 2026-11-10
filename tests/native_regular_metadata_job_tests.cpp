@@ -218,7 +218,11 @@ void operator delete[](void* value,std::align_val_t)noexcept{_aligned_free(value
 void operator delete(void* value,std::size_t,std::align_val_t)noexcept{_aligned_free(value);}
 void operator delete[](void* value,std::size_t,std::align_val_t)noexcept{_aligned_free(value);}
 #endif
-int main(){try{
+int main(){
+#ifdef _WIN32
+    NativeCaptureFixtureScope native_capture_scope(capture_read_after,capture_close_before,capture_close_after);
+#endif
+    try{
 #ifdef __APPLE__
     mac_staging_admission(MetadataOwnership::Original);mac_staging_admission(MetadataOwnership::CurrentCaller);
 #else

@@ -122,7 +122,11 @@ void factory_source_drain(bool patched,bool close_fault) {
  preservation.reset();
 }
 }
-int main(int argc,char** argv){try {const bool patched=argc>1&&std::string_view(argv[1])=="--patched";
+int main(int argc,char** argv){
+#ifdef _WIN32
+    NativeCaptureFixtureScope native_capture_scope(capture_read_after,capture_close_before,capture_close_after);
+#endif
+    try {const bool patched=argc>1&&std::string_view(argv[1])=="--patched";
  clean_callback_cancel(patched,false);clean_callback_cancel(patched,true);unrequested_callback_cancel();root_after_membership(patched);
  factory_source_drain(patched,false);factory_source_drain(patched,true);std::cout<<"regular_metadata_review_tests passed\n";return 0;
 }catch(const std::exception&e){frame=false;close_watch=false;close_armed=false;std::cerr<<e.what()<<'\n';return 1;}}
