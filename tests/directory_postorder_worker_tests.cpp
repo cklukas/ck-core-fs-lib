@@ -12,6 +12,7 @@
 #include "metadata_semantic_digest.hpp"
 #include "native_sync_observation.hpp"
 #include "sha256.hpp"
+#include <optional>
 namespace {
 ComparisonObject object(const BasicMetadata& basic){ComparisonObject out;out.state=ComparisonObjectState::Stable;
  out.identity=*basic.identity.value();out.kind=*basic.kind.value();out.modified=*basic.modified.value();out.timestamp_quantum_ns=1;return out;}
@@ -99,11 +100,38 @@ void bounded_finish_failure(const std::filesystem::path& path,bool writer_failur
  bounded_await(*job,DirectoryReplayPhase::ClosingWriter);
  if(writer_failure){auto held=take(HeldChild::observe(f.parent,f.target));flush_target=*held->metadata().identity.value();injected_flushes=0;inject_writer_flush=true;}
  else {allocation_failures=0;detail::journal_root_test_fault=oom?journal_close_oom:journal_close_fault;}
+#ifdef _WIN32
+ // The legacy fixture restores these slots before bounded_run starts.
+ // Install the real-first writer-flush seam only for this writer fault.
+ struct FlushObserverScope {
+     detail::NativeMetadataFlushBefore previous_before=detail::native_metadata_flush_before.exchange(
+         observe_writer_flush_before,std::memory_order_acq_rel);
+     detail::NativeMetadataFlushAfter previous_after=detail::native_metadata_flush_after.exchange(
+         observe_writer_flush_after,std::memory_order_acq_rel);
+     ~FlushObserverScope() {
+         inject_writer_flush=false;
+         detail::native_metadata_flush_before.store(previous_before,std::memory_order_release);
+         detail::native_metadata_flush_after.store(previous_after,std::memory_order_release);
+     }
+ };
+ std::optional<FlushObserverScope> flush_observers;
+ if(writer_failure){flush_selection_failed=false;flush_observers.emplace();}
+#endif
  for(unsigned i=0;i<100000&&!terminal(job->progress().phase);++i)job->advance();
+#ifdef _WIN32
+ flush_observers.reset();
+#endif
  inject_writer_flush=false;detail::journal_root_test_fault=nullptr;CHECK(!fail_next_allocation);if(oom)CHECK(allocation_failures==1);
  CHECK(job->progress().phase==DirectoryReplayPhase::ReviewRequired&&job->progress().worker_drained&&job->progress().recovery_required);
  CHECK(job->progress().finish_failure.present&&job->progress().finish_failure.code==5);CHECK(!job->verified_target_values());CHECK(proof->io_finished());
- if(writer_failure)CHECK(injected_flushes==1);source->finish_io();target_source->finish_io();
+ if(writer_failure) {
+#ifdef _WIN32
+     CHECK(injected_flushes==1&&!flush_selection_failed);
+#else
+     CHECK(injected_flushes==1);
+#endif
+ }
+ source->finish_io();target_source->finish_io();
  auto root_result=f.root->finish_io();CHECK(!root_result.value()&&root_result.unavailable_detail()->error.code==5);
  const auto count=injected_flushes.load();job->advance();job.reset();CHECK(injected_flushes==count);
 }
