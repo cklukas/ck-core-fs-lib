@@ -1,0 +1,25 @@
+{
+  "scope": "Linux hosted full normal CTest and installed C/layer consumers only",
+  "commit": "f82e648d30d2408790a674643394b33a83afdb98",
+  "run_id": 42776399166,
+  "receipt": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/github-linux-normal-f82e648-20261110/receipt.json",
+  "receipt_sha256": "a79cfc16af6f7105d797071c156f75fb23e3beb1656d8f53a2b8742f1aba435b",
+  "browser_ON": {
+    "passed": 195,
+    "failed": 0,
+    "skipped": 0,
+    "installed_consumers_passed": 5
+  },
+  "browser_OFF": {
+    "passed": 195,
+    "failed": 0,
+    "skipped": 0,
+    "installed_consumers_passed": 5
+  },
+  "whole_workflow_or_platform_matrix_complete": false,
+  "remaining": [
+    "Current matching Linux sanitizer run",
+    "Windows legacy runtime-hook fixture migration and platform qualification",
+    "Mac native publication qualification"
+  ]
+}
