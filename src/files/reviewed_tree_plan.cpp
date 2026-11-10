@@ -1978,7 +1978,10 @@ struct ReviewedTreePlanJob::Impl {
             if(fact.ownership==ComparisonMetadataOwnership::CurrentCaller){auto owner=metadata_ownership_digest(*observed);if(!owner.value()){fail(*owner.unavailable_detail(),true);return;}fact.canonical_owner_digest=*owner.value();}
             fact.bytes=*digest.value();fact.before=fact.after=node.entry.object;node.entry.metadata_digest=std::move(fact);
             node.entry.directory_metadata_contract=request.comparison.directory_metadata_contract;node.directory_payload=*payload.value();
-            if(!observed->channels.empty())node.all_stream_bytes=0;
+            // A verified Windows catalog makes an empty channel list a known
+            // zero. Keep the prior total for empty lists with unknown coverage.
+            if (observed->channel_coverage == DataChannelCoverage::WindowsFileStreamInfo || !observed->channels.empty())
+                node.all_stream_bytes = 0;
             for(const auto& channel:observed->channels){
                 if(channel.logical_size>std::numeric_limits<std::uint64_t>::max()-*node.all_stream_bytes){fail(error(AdapterError::InvalidNativeResult,"reviewed_tree.directory_verified_byte_overflow"),true);return;}
                 *node.all_stream_bytes+=channel.logical_size;
