@@ -191,6 +191,67 @@ Until those gates pass, the compatibility path remains explicitly separate and
 FS Apply remains disabled. API declarations, relation labels, focused passing
 tests, or the existence of newer C++ internals do not close this integration gap.
 
+## Proposed C atomic file writer
+
+**Integration requirement; no exports or SDK admission yet.** CDE needs to
+replace its per-directory icon-position file without truncating the previous
+valid file before the replacement is ready. Neither frozen FS 0.3 nor the
+current C action API provides an atomic replacement writer. The action API's
+no-overwrite contract and the archive writer's no-replace publication must not
+be presented as this capability.
+
+The proposed additive `ckfaw_*_v1` family uses a backend worker and a genuine
+held parent with an exact native leaf. Existing C layouts and exports remain
+unchanged. Requests copy or retain bounded inputs before returning and specify
+the destination expectation, mode/owner/ACL policy, content limits, and required
+file/parent durability. Unsupported preservation or publication requirements
+block admission instead of being silently weakened.
+
+A caller-supplied C producer runs on the worker and writes through an opaque
+bounded sink. The backend owns the actual temporary object and handles checked
+short writes, EINTR and native errors. The sink is valid only during its active
+callback on that worker. The callback performs no UI work, does not join or
+destroy its job, and returns structured status; no C++ exception crosses the
+C boundary. Exposing a writable temporary descriptor would let callers close
+or replace backend ownership, so that is not the proposed default interface.
+
+The required protocol is exclusive collision-resistant creation without
+symlink following, explicit security preparation, complete checked writing,
+requested file durability and verification, atomic publication, required parent
+durability, and all fallible finalizers. Random names are collision avoidance,
+not proof of ownership. A pathname check followed by pathname rename does not
+satisfy the stronger held-entry publication requirement.
+
+| Result boundary | Required evidence |
+| --- | --- |
+| Pre-commit failure or cancellation | Previous destination remains intact; report any temporary effect and attempt cleanup only with live native authority |
+| Publication attempted | Record confirmed, refused or uncertain publication independently from requested/achieved durability |
+| Post-publication failure | Report reconciliation or unknown durability; retain evidence and never claim that the previous file was restored |
+| Verified completion | Required content, security, publication, durability and finalization steps all succeeded |
+| Release/cancellation | Nonblocking request; caller callback/context lifetime extends until the separate drained query confirms completion |
+
+Snapshots and errors must be allocation-independent POD with version/size
+validation, stage, domain, native errno/Win32/NTSTATUS, and effect/durability
+facts. The first native error survives later callback, allocation, close and
+cancellation failures. Cancellation after publication cannot erase evidence or
+skip the required completion protocol. Persisted names, IDs and hashes never
+authorize restart cleanup or automatic mutation replay.
+
+Provider admission distinguishes atomic namespace replacement, durable
+publication and identity-bound conditional replacement. Local filesystem names
+alone do not prove those properties; remote/UNC durability and sharing semantics
+require their own qualification. This writer depends on the held-entry and
+publication guarantees described above and remains a blocking implementation
+gap where those guarantees are unavailable.
+
+Qualification must cover positive admitted providers, short writes/EINTR,
+callback failure, disk-full, cancellation at every transition, metadata failure,
+parent flush and consumed-close errors, concurrent entry/security replacement,
+symlinks/reparse points, resource bounds, exact native names and long DOS/UNC
+paths where admitted. Independently verify old/new/competing objects and
+pre-commit preservation. CDE keeps feedback and cancellation at its UI boundary
+and must not consume this proposed API with its frozen SDK.
+
 ## Metadata replay
 
 `MetadataReplayPolicy` selects the requested scope, original or current-caller
