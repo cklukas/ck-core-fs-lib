@@ -11,6 +11,7 @@
 #include <cstring>
 #include <utility>
 #include <filesystem>
+#include <memory>
 #include <source_location>
 #include <cstdlib>
 #include <new>
@@ -39,7 +40,18 @@ namespace {
 unsigned checks=0,sequence=0;
 thread_local bool fail_next_allocation=false;
 std::atomic<unsigned> allocation_failures{0};
-#define CHECK(x) do {++checks;if(!(x)){std::fprintf(stderr,"directory_executor:%u %s\n",unsigned(__LINE__),#x);std::abort();}}while(false)
+#ifdef _WIN32
+struct NestedDirectoryAssertion {};
+thread_local bool unwind_nested_directory_checks=false;
+#endif
+[[noreturn]] void directory_check_failed(unsigned line,const char* expression) {
+    std::fprintf(stderr,"directory_executor:%u %s\n",line,expression);
+#ifdef _WIN32
+    if(unwind_nested_directory_checks)throw NestedDirectoryAssertion{};
+#endif
+    std::abort();
+}
+#define CHECK(x) do {++checks;if(!(x))directory_check_failed(unsigned(__LINE__),#x);}while(false)
 template<class T>T take(Observation<T> value,const std::source_location location=std::source_location::current()) {
     if(!value.value()) {const auto& e=*value.unavailable_detail();std::fprintf(stderr,"line=%u op=%s state=%u domain=%u code=%lld\n",
         unsigned(location.line()),e.error.operation.c_str(),unsigned(e.state),unsigned(e.error.domain),static_cast<long long>(e.error.code));}
@@ -179,20 +191,115 @@ public:
     ~SecurityPrivilege(){CHECK(AdjustTokenPrivileges(token_,FALSE,&previous_,0,nullptr,nullptr));CHECK(CloseHandle(token_));}
 private:HANDLE token_=nullptr;TOKEN_PRIVILEGES previous_{};
 };
+void report_acl_error(const char* operation,const char* object,DWORD error) noexcept {
+    std::fprintf(stderr,"directory fixture %s (%s): Win32 error=%lu\n",
+                 operation,object,static_cast<unsigned long>(error));
+}
+void set_directory_permissions(HANDLE handle,bool readonly) {
+    HANDLE token=nullptr;CHECK(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token));
+    WindowsTrashHandle token_owner(token);
+    DWORD count=0;
+    GetTokenInformation(token,TokenUser,nullptr,0,&count);CHECK(count&&count<65536);std::vector<std::byte> data(count);
+    CHECK(GetTokenInformation(token,TokenUser,data.data(),count,&count));CHECK(CloseHandle(token_owner.release()));
+    wchar_t* sid=nullptr;CHECK(ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(data.data())->User.Sid,&sid));
+    std::unique_ptr<void,decltype(&LocalFree)> sid_owner(sid,&LocalFree);
+    const auto sddl=std::wstring(L"D:P(A;;")+(readonly?L"FRFX":L"FA")+L";;;"+sid+L")(A;;FA;;;SY)";
+    PSECURITY_DESCRIPTOR descriptor=nullptr;CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(),SDDL_REVISION_1,&descriptor,nullptr));
+    std::unique_ptr<void,decltype(&LocalFree)> descriptor_owner(descriptor,&LocalFree);
+    BOOL present=FALSE,defaulted=FALSE;PACL dacl=nullptr;CHECK(GetSecurityDescriptorDacl(descriptor,&present,&dacl,&defaulted)&&present);
+    const auto error=SetSecurityInfo(handle,SE_FILE_OBJECT,DACL_SECURITY_INFORMATION|PROTECTED_DACL_SECURITY_INFORMATION,
+        nullptr,nullptr,dacl,nullptr);
+    if(error!=ERROR_SUCCESS)report_acl_error("set protected DACL","directory",error);
+    CHECK(error==ERROR_SUCCESS);
+}
 void directory_permissions(const NativeAbsolutePath& address,bool readonly) {
     const auto native=extended_address(address);
     const auto handle=CreateFileW(native.c_str(),WRITE_DAC|READ_CONTROL,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);CHECK(handle!=INVALID_HANDLE_VALUE);
-    HANDLE token=nullptr;CHECK(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token));DWORD count=0;
-    GetTokenInformation(token,TokenUser,nullptr,0,&count);CHECK(count&&count<65536);std::vector<std::byte> data(count);
-    CHECK(GetTokenInformation(token,TokenUser,data.data(),count,&count));CHECK(CloseHandle(token));
-    wchar_t* sid=nullptr;CHECK(ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(data.data())->User.Sid,&sid));
-    const auto sddl=std::wstring(L"D:P(A;;")+(readonly?L"FRFX":L"FA")+L";;;"+sid+L")(A;;FA;;;SY)";LocalFree(sid);
-    PSECURITY_DESCRIPTOR descriptor=nullptr;CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(),SDDL_REVISION_1,&descriptor,nullptr));
-    BOOL present=FALSE,defaulted=FALSE;PACL dacl=nullptr;CHECK(GetSecurityDescriptorDacl(descriptor,&present,&dacl,&defaulted)&&present);
-    CHECK(SetSecurityInfo(handle,SE_FILE_OBJECT,DACL_SECURITY_INFORMATION|PROTECTED_DACL_SECURITY_INFORMATION,nullptr,nullptr,dacl,nullptr)==ERROR_SUCCESS);
-    LocalFree(descriptor);CHECK(CloseHandle(handle));
+        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    if(handle==INVALID_HANDLE_VALUE)report_acl_error("open ACL owner","directory",GetLastError());
+    CHECK(handle!=INVALID_HANDLE_VALUE);
+    WindowsTrashHandle owner(handle);
+    set_directory_permissions(handle,readonly);
+    CHECK(CloseHandle(owner.release()));
 }
+struct DirectoryAclRestore {
+    const char* label;
+    WindowsTrashHandle handle;
+    PSECURITY_DESCRIPTOR descriptor=nullptr;
+    PACL original_acl=nullptr;
+    SECURITY_INFORMATION restore_flags=0;
+    bool changed=false;
+
+    explicit DirectoryAclRestore(const char* object):label(object){}
+    ~DirectoryAclRestore(){restore();close();}
+    void bind(const DirectoryCursor& parent,const NativeName& leaf,const DirectoryCursor& expected) {
+        CHECK(!handle.get());
+        auto directory=take(duplicate_windows_trash_parent(parent));
+        const auto* units=leaf.windows_units();CHECK(units&&!units->empty()&&units->size()<32768);
+        std::wstring spelling(units->begin(),units->end());
+        UNICODE_STRING native{};native.Buffer=spelling.data();
+        native.Length=static_cast<USHORT>(spelling.size()*sizeof(wchar_t));native.MaximumLength=native.Length;
+        OBJECT_ATTRIBUTES attributes{};InitializeObjectAttributes(&attributes,&native,0,directory.get(),nullptr);
+        IO_STATUS_BLOCK io{};HANDLE opened=nullptr;
+        const auto status=NtCreateFile(&opened,READ_CONTROL|WRITE_DAC|FILE_READ_ATTRIBUTES|SYNCHRONIZE,&attributes,&io,
+            nullptr,0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT|FILE_SYNCHRONOUS_IO_NONALERT,nullptr,0);
+        if(status!=0)std::fprintf(stderr,"directory fixture open ACL owner (%s): NTSTATUS=0x%08lx\n",
+            label,static_cast<unsigned long>(status));
+        handle=WindowsTrashHandle(opened);
+        CHECK(status==0&&opened&&opened!=INVALID_HANDLE_VALUE);
+        FILE_ID_INFO id{};FILE_ATTRIBUTE_TAG_INFO tag{};
+        const auto queried=GetFileInformationByHandleEx(opened,FileIdInfo,&id,sizeof(id))&&
+            GetFileInformationByHandleEx(opened,FileAttributeTagInfo,&tag,sizeof(tag));
+        if(!queried)report_acl_error("query ACL owner identity",label,GetLastError());
+        CHECK(queried);
+        const auto& observation=expected.identity();
+        const ObjectIdentity* identity=observation.value();
+        CHECK(identity&&identity->scheme==IdentityScheme::WindowsFileId128);
+        CHECK((tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)&&!(tag.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT));
+        CHECK(identity->volume==NativeIdentifier::from_u64(id.VolumeSerialNumber));
+        CHECK(std::memcmp(identity->object.bytes.data(),id.FileId.Identifier,sizeof(id.FileId.Identifier))==0);
+        const auto saved=GetSecurityInfo(opened,SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,
+            nullptr,nullptr,&original_acl,nullptr,&descriptor);
+        if(saved!=ERROR_SUCCESS)report_acl_error("save DACL",label,saved);
+        CHECK(saved==ERROR_SUCCESS);
+        SECURITY_DESCRIPTOR_CONTROL control{};DWORD revision=0;
+        const auto control_ok=GetSecurityDescriptorControl(descriptor,&control,&revision);
+        if(!control_ok)report_acl_error("query DACL protection",label,GetLastError());
+        CHECK(control_ok&&(control&SE_DACL_PRESENT));
+        restore_flags=DACL_SECURITY_INFORMATION|((control&SE_DACL_PROTECTED)?
+            PROTECTED_DACL_SECURITY_INFORMATION:UNPROTECTED_DACL_SECURITY_INFORMATION);
+    }
+    bool restore() noexcept {
+        if(!std::exchange(changed,false))return true;
+        const auto error=SetSecurityInfo(handle.get(),SE_FILE_OBJECT,restore_flags,nullptr,nullptr,original_acl,nullptr);
+        if(error!=ERROR_SUCCESS)report_acl_error("restore DACL",label,error);
+        return error==ERROR_SUCCESS;
+    }
+    bool close() noexcept {
+        bool ok=true;
+        if(const auto saved=std::exchange(descriptor,nullptr);saved&&LocalFree(saved)) {
+            report_acl_error("free saved DACL",label,GetLastError());ok=false;
+        }
+        if(const auto opened=handle.release();opened&&opened!=INVALID_HANDLE_VALUE&&!CloseHandle(opened)) {
+            report_acl_error("close ACL owner",label,GetLastError());ok=false;
+        }
+        return ok;
+    }
+};
+struct NestedDirectoryAcls {
+    DirectoryAclRestore source{"source parent"},source_child{"source child"};
+    DirectoryAclRestore target{"target parent"},target_child{"target child"};
+
+    ~NestedDirectoryAcls(){finish();}
+    bool finish() noexcept {
+        bool ok=true;
+        // Restore the exact child after any inheritance change from restoring its parent.
+        for(auto* owner:{&source,&source_child,&target,&target_child})if(!owner->restore())ok=false;
+        for(auto* owner:{&source,&source_child,&target,&target_child})if(!owner->close())ok=false;
+        return ok;
+    }
+};
 #endif
 // CLI navigation address only. Validate before converting ordinary DOS/UNC
 // separators to the extended Win32 boundary; already extended UTF16 is exact.
@@ -212,12 +319,17 @@ struct Fixture {
     NativeFileSystem fs;NativeAbsolutePath address;Cursor base,source,parent,journals;
     PreparedJournalRoot::Pointer root;NativeName target;HeldChild::Pointer source_held;
     MetadataReplaySnapshot metadata;
-    explicit Fixture(const std::filesystem::path& work,bool nested=false,bool with_ads=false,bool complete=false):address(fixture_native_address(work)),target(name(("destination-"+std::to_string(++sequence)).c_str())) {
+    explicit Fixture(const std::filesystem::path& work,bool nested=false,bool with_ads=false,bool complete=false
+#ifdef _WIN32
+                     ,NestedDirectoryAcls* nested_acls=nullptr
+#endif
+                     ):address(fixture_native_address(work)),target(name(("destination-"+std::to_string(++sequence)).c_str())) {
         base=Cursor(take(fs.open_native_directory(address)));source=mkdir(base,name(("source-"+std::to_string(sequence)).c_str()));parent=base;
         const auto journal_name=name(("journal-"+std::to_string(sequence)).c_str());journals=mkdir(base,journal_name);
         const auto journal_address=take(address.child_address(journal_name));CHECK(take(prepare_native_operation_journal_root(journal_address)));
         root=take(acquire_native_journal_root(journal_address));
-        if(nested) {auto folder=mkdir(source,name("nested"));file(folder,name("payload"));}
+        Cursor nested_source;
+        if(nested) {nested_source=mkdir(source,name("nested"));file(nested_source,name("payload"));}
         else file(source,name("payload"));
         binary_attribute(base,name(("source-"+std::to_string(sequence)).c_str()));
         // Test setup only. No production creator authority is inferred from
@@ -225,8 +337,20 @@ struct Fixture {
 #ifdef _WIN32
         if(with_ads)ads(source,std::u16string(u":metadata-猫-\xd800:$DATA"));
         auto source_address=take(address.child_address(name(("source-"+std::to_string(sequence)).c_str())));
-        old_times(source_address);directory_permissions(source_address,true);
-        if(nested)directory_permissions(take(take(address.child_address(name(("source-"+std::to_string(sequence)).c_str()))).child_address(name("nested"))),true);
+        old_times(source_address);
+        if(nested) {
+            CHECK(nested_acls&&nested_source);
+            auto& acls=*nested_acls;
+            const auto source_name=name(("source-"+std::to_string(sequence)).c_str());
+            acls.source.bind(*base,source_name,*source);
+            acls.source_child.bind(*source,name("nested"),*nested_source);
+            // Protect the child's DACL before tightening the parent. Both
+            // restore owners already refer to the exact native directories.
+            acls.source_child.changed=true;
+            set_directory_permissions(acls.source_child.handle.get(),true);
+            acls.source.changed=true;
+            set_directory_permissions(acls.source.handle.get(),true);
+        } else directory_permissions(source_address,true);
 #else
         (void)with_ads;(void)complete;
         auto source_address=take(address.child_address(name(("source-"+std::to_string(sequence)).c_str())));
@@ -321,8 +445,8 @@ void positive(const std::filesystem::path& path,bool existing,bool exact_name=fa
     CHECK(take(f.root->finish_io()));CHECK(job->advance().phase==DirectoryReplayPhase::Complete);
 }
 #ifdef _WIN32
-void nested_tree(const std::filesystem::path& path) {
-    Fixture f(path,true);HeldChild::Pointer nested_binding,payload_binding;bool child_complete=false,payload_complete=false;
+void nested_tree_body(const std::filesystem::path& path,NestedDirectoryAcls& acls) {
+    Fixture f(path,true,false,false,&acls);HeldChild::Pointer nested_binding,payload_binding;bool child_complete=false,payload_complete=false;
     auto parent_request=f.request(false,[&](std::stop_token stop) {
         if(!child_complete)return Observation<bool>::available(false);
         auto refreshed=nested_binding->refresh(stop);if(!refreshed.value())return Observation<bool>::unavailable(refreshed.state(),refreshed.unavailable_detail()->error);
@@ -330,6 +454,7 @@ void nested_tree(const std::filesystem::path& path) {
     });
     auto parent=take(NativeDirectoryReplayJob::create(std::move(parent_request)));parent->advance();
     CHECK(parent->progress().phase==DirectoryReplayPhase::AwaitingChildren);auto parent_cursor=take(parent->child_cursor());
+    acls.target.bind(*f.parent,f.target,*parent_cursor);
     auto source_nested=child(f.source,name("nested"));
     NativeDirectoryReplayRequest request;request.source=take(HeldChild::observe_with_access(f.source,name("nested"),EntryAccess::MetadataAndAttributes|EntryAccess::MetadataAndSecurity));
     request.reviewed_metadata=take(request.source->capture_metadata(f.metadata.policy));request.destination_parent=parent_cursor;request.destination_name=name("nested");
@@ -344,11 +469,32 @@ void nested_tree(const std::filesystem::path& path) {
     };
     auto nested=take(NativeDirectoryReplayJob::create(std::move(request)));nested->advance();
     CHECK(nested->progress().phase==DirectoryReplayPhase::AwaitingChildren);auto nested_cursor=take(nested->child_cursor());
+    acls.target_child.bind(*parent_cursor,name("nested"),*nested_cursor);
     nested_binding=take(HeldChild::observe(parent_cursor,name("nested")));
     copy_payload(f,nested_cursor,source_nested);payload_binding=take(HeldChild::observe_with_access(nested_cursor,name("payload"),EntryAccess::ContentRead));payload_complete=true;
+    acls.target_child.changed=true;
     CHECK(take(nested->children_finished()));await(*nested,DirectoryReplayPhase::Complete);child_complete=true;
-    CHECK(!parent->progress().metadata_attempted);CHECK(take(parent->children_finished()));await(*parent,DirectoryReplayPhase::Complete);
+    CHECK(!parent->progress().metadata_attempted);
+    acls.target.changed=true;
+    CHECK(take(parent->children_finished()));await(*parent,DirectoryReplayPhase::Complete);
     CHECK(take(payload_matches(*payload_binding,{})));CHECK(take(f.root->finish_io()));
+}
+void nested_tree(const std::filesystem::path& path) {
+    NestedDirectoryAcls acls;
+    CHECK(!unwind_nested_directory_checks);
+    unwind_nested_directory_checks=true;
+    bool passed=false;
+    try {
+        nested_tree_body(path,acls);
+        passed=true;
+    } catch(const NestedDirectoryAssertion&) {
+        // CHECK already reported the failure. Jobs unwind before restoration.
+    } catch(...) {
+        std::fprintf(stderr,"directory fixture nested case threw before completion\n");
+    }
+    unwind_nested_directory_checks=false;
+    const auto cleaned=acls.finish();
+    if(!passed||!cleaned)std::abort();
 }
 #endif
 std::optional<std::int64_t> journal_close_fault(detail::JournalRootFaultPoint point) {
