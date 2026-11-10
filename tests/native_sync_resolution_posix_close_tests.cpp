@@ -14,6 +14,10 @@
 #include <array>
 #include <climits>
 #include <cstdarg>
+#include <chrono>
+#include <thread>
+#include <csignal>
+#include <sys/resource.h>
 
 #ifndef __linux__
 #error This native injected-consumed-close qualification requires Linux.
@@ -143,7 +147,52 @@ extern "C" int openat64(int parent,const char* path,int flags,...) {
     mode_t permissions=0;if((flags&O_CREAT)||((flags&O_TMPFILE)==O_TMPFILE)){va_list args;va_start(args,flags);permissions=va_arg(args,mode_t);va_end(args);}
     return close_watch::opened_at(parent,path,flags,permissions);
 }
+// Exact ABI labels avoid glibc _FILE_OFFSET_BITS declaration redirection.
+extern "C" int fixture_checked_openat(int,const char*,int) __asm__("__openat_2");
+extern "C" int fixture_checked_openat64(int,const char*,int) __asm__("__openat64_2");
+extern "C" int fixture_checked_openat(int parent,const char* path,int flags) {
+    using Fn=int(*)(int,const char*,int);
+    static const auto real=std::bit_cast<Fn>(dlsym(RTLD_NEXT,"__openat_2"));
+    if(!real)std::abort();
+    const int fd=real(parent,path,flags);const int saved=errno;
+    close_watch::acquired(fd,flags);errno=saved;return fd;
+}
+extern "C" int fixture_checked_openat64(int parent,const char* path,int flags) {
+    using Fn=int(*)(int,const char*,int);
+    static const auto real=std::bit_cast<Fn>(dlsym(RTLD_NEXT,"__openat64_2"));
+    if(!real)std::abort();
+    const int fd=real(parent,path,flags);const int saved=errno;
+    close_watch::acquired(fd,flags);errno=saved;return fd;
+}
 namespace {
+void checked_abi_controls() {
+    using namespace close_watch;
+    Fixture f;f.write("left","a","checked ABI");
+    const auto path=(f.root/"left"/"a").string();const auto absent=(f.root/"left"/"checked-absent").string();
+    struct stat s{};CHECK(lstat(path.c_str(),&s)==0);device=s.st_dev;file_inode=s.st_ino;
+    using Fn=int(*)(int,const char*,int);
+    for(const auto fn:std::array<Fn,2>{fixture_checked_openat,fixture_checked_openat64}) {
+        reset();tracking=acquiring=true;
+        const int first=fn(AT_FDCWD,path.c_str(),O_RDONLY|O_NOFOLLOW|O_CLOEXEC);CHECK(first>=0);
+        const int second=fn(AT_FDCWD,path.c_str(),O_RDONLY|O_NOFOLLOW|O_CLOEXEC);CHECK(second>=0&&second!=first);
+        CHECK(!acquiring&&!invalid_acquisition&&files.size==2&&held_fd==first&&query_fd==second&&file_closes==0);
+        for(int fd:{first,second}){struct stat actual{};CHECK(fstat(fd,&actual)==0&&file(actual));const auto flags=fcntl(fd,F_GETFL);CHECK(flags>=0&&(flags&O_ACCMODE)==O_RDONLY&&!(flags&O_PATH));const auto fd_flags=fcntl(fd,F_GETFD);CHECK(fd_flags>=0&&(fd_flags&FD_CLOEXEC));}
+        CHECK(close(second)==0);CHECK(file_closes==1&&fcntl(second,F_GETFD)==-1&&errno==EBADF);
+        CHECK(close(first)==0);CHECK(file_closes==2&&snapshot(true).size==0);reset();
+        errno=0;const auto failed=fn(AT_FDCWD,absent.c_str(),O_RDONLY|O_NOFOLLOW|O_CLOEXEC);const int native_error=errno;
+        CHECK(failed==-1&&native_error==ENOENT);
+        for(const int flags:{O_CREAT|O_WRONLY,O_TMPFILE|O_RDWR}) {
+            const auto pid=fork();CHECK(pid>=0);
+            if(pid==0){rlimit core{0,0};if(setrlimit(RLIMIT_CORE,&core)!=0)_Exit(96);alarm(2);(void)fn(AT_FDCWD,path.c_str(),flags);_Exit(97);}
+            int status=0;pid_t waited=0;const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+            do {waited=waitpid(pid,&status,WNOHANG);if(waited<0&&errno==EINTR){waited=0;continue;}if(waited!=0)break;std::this_thread::sleep_for(std::chrono::milliseconds(1));}while(std::chrono::steady_clock::now()<deadline);
+            const bool bounded=waited==pid;
+            if(!bounded&&waited==0){(void)kill(pid,SIGKILL);while(waitpid(pid,&status,0)<0&&errno==EINTR){}}
+            CHECK(bounded);CHECK(WIFSIGNALED(status)&&WTERMSIG(status)==SIGABRT);
+        }
+    }
+    reset();std::cout<<"checked libc openat ABI acquisition + native errno + missing-mode SIGABRT controls PASS\n";
+}
 void qualify_owners(Fixture& f) {
     using namespace close_watch;reset();
     struct stat s{};CHECK(lstat((f.root/"left"/"a").c_str(),&s)==0);device=s.st_dev;file_inode=s.st_ino;
@@ -219,6 +268,7 @@ void injected_recovery() {
 }
 int main(){try{
     CHECK(existing_resolution_regressions()==0);
+    checked_abi_controls();
     injected_commit(close_watch::Mode::Query);
     injected_commit(close_watch::Mode::HeldChild);
     injected_commit(close_watch::Mode::Directory);

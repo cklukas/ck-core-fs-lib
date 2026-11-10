@@ -1,0 +1,43 @@
+{
+  "scope": "Checked-libc entry-point coverage for the native close observer; no product/ABI changes",
+  "problem": "Actual fortified GitHub build retained two real read-only CLOEXEC owners while fixture recorded zero acquisitions",
+  "fix": "Observe __openat_2 and __openat64_2 through real checked libc delegation; preserve all ownership, error, close and recovery assertions",
+  "receipt": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/checked-open-abi-consumer-20261110-9MMc8zzp/receipt.json",
+  "receipt_sha256": "d92c3a7e8a786899eee08216d672456fde15450b5d10e162c6fa871d32b39b10",
+  "source_sha256": "5a8b7b969784b3dd9e4f896df20fb47b529bd96dc4236df72a22f0d835301fac",
+  "controls": {
+    "0": {
+      "base_checks": 371,
+      "checks": 729,
+      "ctest": {
+        "disabled": 0,
+        "errors": 0,
+        "failures": 0,
+        "skipped": 0,
+        "tests": 1
+      },
+      "expected_missing_mode_SIGABRT_children": 4,
+      "seconds": 16.35649316199124
+    },
+    "3": {
+      "base_checks": 371,
+      "checks": 729,
+      "ctest": {
+        "disabled": 0,
+        "errors": 0,
+        "failures": 0,
+        "skipped": 0,
+        "tests": 1
+      },
+      "expected_missing_mode_SIGABRT_children": 4,
+      "seconds": 17.024340770207345
+    }
+  },
+  "source_and_sdk_unchanged": true,
+  "sanitizer_findings": [],
+  "remaining": [
+    "Full GH x86 original-toolchain/backend+fixture fortification end-to-end",
+    "No Windows/TSan/retention qualification from this fixture"
+  ],
+  "boundary": "Retained SDK was compiled WITHOUT fortify. Explicit FORTIFY0/3 consumers plus forced checked ABI calls qualify the fixture mechanisms, NOT the full GCC13 x86 fortified backend path. Full GH end-to-end confirmation remains required."
+}
