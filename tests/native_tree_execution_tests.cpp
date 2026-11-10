@@ -72,15 +72,31 @@ void cancel_created_directory(){
 thread_local bool tree_journal_oom=false;thread_local unsigned tree_journal_faults=0;
 std::optional<std::int64_t> tree_journal_close_fault(detail::JournalRootFaultPoint point){
  if(point==detail::JournalRootFaultPoint::JournalClose&&!tree_journal_faults){++tree_journal_faults;
-  if(tree_journal_oom){tree_capture_test::fail_alloc=true;tree_capture_test::defer_debug_proxy=true;}return 5;}
+  if(tree_journal_oom)tree_capture_test::fail_alloc=true;return 5;}
  return std::nullopt;
 }
 void close_failure_no_token(bool oom){
  Fixture f;write_file(f.path("s/a"),"reviewed main retained through close failure");auto r=strict_request(f);auto root=r.prepared_journal_root;
  auto job=take(ReviewedTreePlanJob::create(std::move(r)));bounded_preview(*job,4096);auto receipt=take(job->review({}));auto rows=take(job->reviewed_page(receipt,0,128));CHECK(take(job->begin_execution(receipt)));
- tree_journal_faults=0;tree_journal_oom=oom;detail::journal_root_test_fault=tree_journal_close_fault;
- try{for(unsigned i=0;i<200000&&active(job->state());++i)bounded_advance(*job,4096);}catch(const std::bad_alloc&){}
- detail::journal_root_test_fault=nullptr;tree_journal_oom=false;CHECK(!tree_capture_test::fail_alloc);CHECK(tree_journal_faults==1);
+ tree_journal_faults=0;tree_capture_test::ordinary_new_denials=0;
+ tree_capture_test::ordinary_new_in_job=0;tree_capture_test::ordinary_new_outside_job=0;
+ bool armed=false,threw=false;
+ {
+  struct ResetFault final {
+   ~ResetFault()noexcept {
+    detail::journal_root_test_fault=nullptr;tree_journal_oom=false;tree_capture_test::fail_alloc=false;
+   }
+  } reset;
+  tree_journal_oom=oom;detail::journal_root_test_fault=tree_journal_close_fault;
+  try{for(unsigned i=0;i<200000&&active(job->state());++i)bounded_advance(*job,4096);}catch(const std::bad_alloc&){threw=true;}
+  armed=tree_capture_test::fail_alloc;
+ }
+ check_advance_bounds();
+ CHECK(!tree_capture_test::fail_alloc);CHECK(tree_journal_faults==1);
+ CHECK(!tree_capture_test::inside_job_advance&&tree_capture_test::ordinary_new_outside_job==0);
+ CHECK(tree_capture_test::ordinary_new_denials==tree_capture_test::ordinary_new_in_job);
+ CHECK(armed==oom&&(!threw||oom));
+ CHECK(oom?tree_capture_test::ordinary_new_in_job>0:tree_capture_test::ordinary_new_in_job==0);
  CHECK(job->state()==ReviewedTreeState::NeedsReconciliation&&job->progress().recovery_required);
  CHECK(job->progress().failure&&job->progress().failure->error.code==5);CHECK(f.read("s/a")=="reviewed main retained through close failure");
  for(const auto& row:rows.items)CHECK(!job->completed_effect(row.row.token).value());detail::PreparedJournalConsumerFailure error;
