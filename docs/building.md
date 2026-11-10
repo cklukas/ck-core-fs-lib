@@ -108,3 +108,22 @@ For native Windows consumed-close and pending-writer regressions, configure
 adds 49 native modes and compiled failure-only seams; it is off by default.
 Use a coherent dedicated SDK build for this configuration, with the same
 instrumentation and headers for its consumers.
+
+## rpi4 qualification and documentation CI
+
+`.ckgit/ci.yml` runs on the server's primary Linux ARM64 runner. Its version-1
+workflow runs browser-ON and browser-OFF normal qualification, ASan/UBSan,
+shared-runtime TSan, then the strict ckdocs site, sequentially. Every nested
+build and CTest invocation uses one job, including ckdocs' vendored archive
+build. Each qualification lane uses a unique runner-local temporary directory,
+requires ext4 and an ordinary-user namespace bootstrap, and runs the full native
+CTest and installed-consumer gates. Prerequisite probes do not establish native
+capability qualification. Missing prerequisites and failing tests fail the run.
+
+The site uses the same pinned ckdocs source as GitHub Pages and publishes only
+after the entire run succeeds. Failed jobs remain failed; the current runner
+only packages artifacts for successful jobs. The lane driver prints bounded
+failure-log excerpts and stages compiler, source, timing and CTest records;
+failed-lane staging is not a downloadable failure bundle. Inspect the retained
+server log when a lane fails. Configuration/parser checks alone are not a
+successful platform run.

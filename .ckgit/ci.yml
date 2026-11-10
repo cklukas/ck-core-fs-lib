@@ -1,0 +1,66 @@
+# One primary-runner job at a time; no distributed runner prerequisite.
+version: 1
+runs_on: primary
+on:
+  branches: [master]
+auto_cancel: false
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 1
+  CTEST_PARALLEL_LEVEL: 1
+sisters:
+  - name: ck-git-hosting
+    ref: 7e3ee5eb57a2cef2e07f9e9fe5c4e2822502d322
+jobs:
+  - name: linux-normal-on
+    steps:
+      - name: full normal-on qualification and installed consumers
+        run: [sh, tools/ckgit_qualification.sh, normal-on]
+    artifacts:
+      name: linux-normal-on-qualification
+      paths:
+        - ci-normal-on
+
+  - name: linux-normal-off
+    steps:
+      - name: full normal-off qualification and installed consumers
+        run: [sh, tools/ckgit_qualification.sh, normal-off]
+    artifacts:
+      name: linux-normal-off-qualification
+      paths:
+        - ci-normal-off
+
+  - name: linux-asan-ubsan
+    steps:
+      - name: full asan-ubsan qualification and installed consumers
+        run: [sh, tools/ckgit_qualification.sh, asan-ubsan]
+    artifacts:
+      name: linux-asan-ubsan-qualification
+      paths:
+        - ci-asan-ubsan
+
+  - name: linux-tsan
+    steps:
+      - name: full tsan qualification and installed consumers
+        run: [sh, tools/ckgit_qualification.sh, tsan]
+    artifacts:
+      name: linux-tsan-qualification
+      paths:
+        - ci-tsan
+
+  - name: docs
+    steps:
+      - name: build pinned ckdocs and strict site
+        script: |
+          set -eu
+          test "$(uname -s)" = Linux
+          : "${TMPDIR:?runner must provide an explicit temporary directory}"
+          task=$(mktemp -d "$TMPDIR/ckfs-docs.XXXXXXXX")
+          mkdir "$task/tmp"
+          export TMPDIR="$task/tmp" TMP="$task/tmp" TEMP="$task/tmp"
+          export CMAKE_BUILD_PARALLEL_LEVEL=1 MAKEFLAGS=-j1
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          make -j1 -C ../ck-git-hosting BUILD_ROOT="$task" BUILD_DIR="$task/build"             ARCHIVE_BUILD_JOBS=1 CKGIT_BUILD_VERSION=0.10.1+g7e3ee5eb57a2 "$task/build/bin/ckdocs"
+          "$task/build/bin/ckdocs" --version
+          "$task/build/bin/ckdocs" build --root "$PWD" --out "$PWD/public" --strict
+pages:
+  path: public

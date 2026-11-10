@@ -1,0 +1,22 @@
+{
+  "scope": "Serial rpi4 CI configuration and static admission; runtime qualification pending",
+  "workflow_version": 1,
+  "runner": "primary",
+  "lanes": [
+    "normal-on",
+    "normal-off",
+    "asan-ubsan",
+    "tsan",
+    "docs"
+  ],
+  "nested_jobs": 1,
+  "ckdocs_pin": "7e3ee5eb57a2cef2e07f9e9fe5c4e2822502d322",
+  "validation": [
+    "Mac ckGit0.9 parser PASS",
+    "rpi4 ckGit0.8.2 parser PASS before bounded diagnostic amendment; current local parser PASS",
+    "Linux sh syntax PASS; independent source review"
+  ],
+  "review": "/Volumes/S8T/tmp/ckfs-ckgit-ci-review-0y__ae1u/independent-review.json",
+  "failure_artifact_limitation": "Runner packages only successful-job artifacts; failed qualification retains failure status and emits bounded console excerpts",
+  "native_qualification": "Not established by parser or namespace prerequisite checks"
+}
