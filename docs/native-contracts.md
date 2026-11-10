@@ -338,6 +338,55 @@ are refusals. The proof is neither a cached inode set nor a namespace lease.
 Its native duplicates are consumed once; close errors reach the Root's fixed
 failure latch before error-message allocation.
 
+### Windows journal temporary close errors
+
+Temporary Windows journal handles now preserve a real `CloseHandle` failure in
+an active `MetadataCaptureCleanupScope` before diagnostic allocation. The first
+native error wins over later injected or cleanup failures. A consumed handle
+is never closed again: a reused numeric value must not become cleanup authority.
+This deleter does not invent a Root binding outside an active cleanup scope.
+
+The dedicated regression configuration rebuilds the SDK and client with one
+uniform `CK_FS_NATIVE_CLOSE_TEST_HOOKS` definition. From an MSVC developer
+PowerShell 7 shell, with source and all temporary outputs on `V:`, select a
+fresh task directory and the actual provider explicitly:
+
+```powershell
+if (-not [IO.Directory]::Exists('V:\')) { throw 'V: unavailable' }
+$task = Join-Path 'V:\tmp' ('journal-close-' + [Guid]::NewGuid().ToString('N'))
+foreach ($name in 'TEMP','TMP','TMPDIR') {
+    [Environment]::SetEnvironmentVariable($name, $task, 'Process')
+}
+[IO.Directory]::CreateDirectory($task) | Out-Null
+$fixture = Join-Path $task 'fixtures'
+[IO.Directory]::CreateDirectory($fixture) | Out-Null
+$provider = [IO.DriveInfo]::new('V:\').DriveFormat
+if ($provider -cnotin @('NTFS','ReFS')) { throw 'Unsupported fixture provider' }
+$env:CK_FS_REQUIRE_V_DEV_DRIVE = '1'
+cmake -S . -B (Join-Path $task 'build') -G Ninja `
+  -DCMAKE_BUILD_TYPE=Debug '-DCMAKE_CXX_FLAGS=/GR /EHsc /utf-8' `
+  -DBUILD_TESTING=ON -DCK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS=OFF `
+  -DCK_CORE_FS_TEST_JOURNAL_TEMPORARY_CLEANUP=ON `
+  "-DCK_CORE_FS_NATIVE_TEST_ROOT=$fixture" "-DCK_CORE_FS_ARCHIVE_TEST_FS=$provider" `
+  "-DCK_CORE_FS_METADATA_TARGET_NATIVE_FS=$provider"
+if ($LASTEXITCODE -ne 0) { throw 'Configure failed' }
+cmake --build (Join-Path $task 'build') `
+  --target ck_fs_journal_temporary_cleanup_windows_tests --parallel 1
+if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+ctest --test-dir (Join-Path $task 'build') `
+  -R '^journal_temporary_cleanup_windows_' --parallel 1 --output-on-failure --no-tests=error
+```
+
+Every native case independently checks its held provider. Ordinary and data-long
+variants cover control, real protected-handle failure, consumed-close failure,
+and both failure modes under persistent C++ allocation denial. The qualified
+NTFS and ReFS configurations passed 10 cases each, 624 checks in total. Data
+parents exceeded 340 UTF-16 units; their child temporary environments were
+shorter. These are local journal-close regressions, not whole-suite, UNC, raw
+UTF-16-name, sanitizer, resource-graph or inherited-long-environment qualification.
+The separate native-close suite switch stays off; no legacy IAT fixture is
+executed by this dedicated target.
+
 ## Action jobs and qualification
 
 `ck_fs_actions.h` defines worker-owned batch rename, native Trash/restore, and

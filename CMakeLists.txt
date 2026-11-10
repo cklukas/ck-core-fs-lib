@@ -15,6 +15,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(CK_CORE_FS_BUILD_BROWSER "Build the higher-level C++ file browser models" ON)
 option(CK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS "Enable compiled failure-only Windows native close regression seams" OFF)
+option(CK_CORE_FS_TEST_JOURNAL_TEMPORARY_CLEANUP
+  "Build the standalone Windows journal temporary-close regression with uniform safe hooks" OFF)
 
 set(CK_CORE_FS_SOURCES
   src/files/ancestor_walk_job.cpp
@@ -261,6 +263,18 @@ if(WIN32)
 endif()
 
 include(CTest)
+if(CK_CORE_FS_TEST_JOURNAL_TEMPORARY_CLEANUP)
+  if(NOT BUILD_TESTING OR NOT WIN32)
+    message(FATAL_ERROR "Journal temporary cleanup regression requires BUILD_TESTING on Windows")
+  endif()
+  if(CK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS)
+    message(FATAL_ERROR "Standalone journal cleanup registration must not enable the separate native-close suite switch")
+  endif()
+  # This directory definition covers existing SDK targets and subsequent tests,
+  # including C wrapper objects/browser models. Do not instrument only the new
+  # client or a few provider sources: safe-hook inline definitions must agree.
+  add_compile_definitions(CK_FS_NATIVE_CLOSE_TEST_HOOKS)
+endif()
 if(BUILD_TESTING)
   if(CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF")
     add_executable(ck_fs_elf_session_interposition_tests
@@ -1084,4 +1098,10 @@ if(BUILD_TESTING AND WIN32)
     NATIVE_TARGET ck_core_fs_native SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}"
     SCRATCH_ROOT "${CK_CORE_FS_NATIVE_TEST_ROOT}" EXPECTED_FS "${CK_CORE_FS_ARCHIVE_TEST_FS}"
     UNC_ROOT "${CK_CORE_FS_ARCHIVE_UNC_TEST_ROOT}")
+  if(CK_CORE_FS_TEST_JOURNAL_TEMPORARY_CLEANUP)
+    include(cmake/JournalTemporaryCleanupWindowsTests.cmake)
+    ck_fs_add_journal_temporary_cleanup_windows_tests(
+      NATIVE_TARGET ck_core_fs_native SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}"
+      SCRATCH_ROOT "${CK_CORE_FS_NATIVE_TEST_ROOT}" EXPECTED_FS "${CK_CORE_FS_ARCHIVE_TEST_FS}")
+  endif()
 endif()

@@ -1,0 +1,29 @@
+{
+  "state": "Windows journal temporary handle CloseHandle error propagation fixed only in active metadata cleanup scope; qualified normal CMake/CTest both NTFS/ReFS20cases624checks. No broader resource/UNC/sanitizer claim.",
+  "minimal_packet": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/windows-journal-temporary-cleanup-589-20261110-a8hox9y9-qualified-v4",
+  "registration_packet": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/windows-journal-cleanup-ctest-qualified-20261110-eCTi1S",
+  "verified_packet_file_counts": [
+    50,
+    60
+  ],
+  "code_sha256": {
+    "CMakeLists.txt": "0bebbebe538f18c6ecc3b33d12639e63ebbe8d723d31863d6ba7016ed3c6d315",
+    "src/files/platform/operation_journal_file_windows.cpp": "2394681f5ca0709b6246b8559a1fd3b9fbec530c7343b3bdc77786eaf3be97b4",
+    "cmake/JournalTemporaryCleanupWindowsTests.cmake": "19080fe5ecd73f3923c7d84ecd208f30116323b38654d4636906e98bb5caea04",
+    "tests/journal_temporary_cleanup_windows_tests.cpp": "d9ce30bc59a4f34b737fee5fe21ba3d7bd40a777511114a64d2264584925668e"
+  },
+  "docs_strict": {
+    "exit": 0,
+    "seconds": 0.06023487506899983,
+    "tool_version": "0.10.1+g7e3ee5eb57a2",
+    "tool_sha256": "78a61c7afc6b25ed0fe097d0babfde21186e5e7e9c7dc7733600d63ad7127630",
+    "log": "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/journal-close-docs-jfyti94b/docs.log",
+    "guide_sha256": "f45b29dfddf0e2eb59d2d2654fefe355236012974707ca708a249ecd422fce06"
+  },
+  "scope": "First real native close failure preserved before allocation and later failure injection; consumed numeric handles never retried. Legacy IAT fixtures not executed by dedicated target. No source/header layout/vtable/CABI changes.",
+  "remaining": [
+    "Broader Windows hierarchy/resource qualifications",
+    "Long-environment CreateProcessW stall",
+    "UNC/raw-name/sanitizer supplemental qualification; fullWindowsgate remainsopen"
+  ]
+}

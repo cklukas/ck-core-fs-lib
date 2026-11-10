@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "../operation_journal_file.hpp"
+#include "../metadata_capture_job.hpp"
 #include "../prepared_journal_root.hpp"
 #include "../prepared_journal_directory.hpp"
 #include "../windows_directory_record.hpp"
@@ -34,7 +35,17 @@ namespace ck::files {
 namespace {
 struct Close {
     void operator()(void* value) const noexcept {
-        if (value && value != INVALID_HANDLE_VALUE) CloseHandle(value);
+        if(value&&value!=INVALID_HANDLE_VALUE){
+            constexpr const char* operation="journal_file.temporary_CloseHandle";
+            detail::observe_native_close(value,operation);
+            const BOOL native_ok=CloseHandle(value);
+            const DWORD saved=GetLastError();
+            const DWORD native_error=native_ok?ERROR_SUCCESS:saved;
+            const auto injected=detail::inject_native_close_failure(value,operation,native_ok!=FALSE,native_error);
+            const DWORD error=native_ok?injected:native_error;
+            if(error)detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Win32,error,operation});
+            SetLastError(error?error:saved);
+        }
     }
 };
 using Handle = std::unique_ptr<void, Close>;
