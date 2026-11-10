@@ -276,9 +276,14 @@ if(CK_CORE_FS_TEST_JOURNAL_TEMPORARY_CLEANUP)
   if(CK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS)
     message(FATAL_ERROR "Standalone journal cleanup registration must not enable the separate native-close suite switch")
   endif()
-  # This directory definition covers existing SDK targets and subsequent tests,
-  # including C wrapper objects/browser models. Do not instrument only the new
-  # client or a few provider sources: safe-hook inline definitions must agree.
+endif()
+if(WIN32 AND BUILD_TESTING)
+  # The always-registered hierarchy OOM fixture uses the compiled close seam.
+  # Directory scope covers every existing SDK target and later C wrapper,
+  # Browser and fixture TU, keeping inline hook definitions uniform. Never
+  # link this fixture against a prebuilt SDK with different hook/CRT flags.
+  # CK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS still controls the separate rename suite;
+  # production builds (BUILD_TESTING=OFF) retain the callback-free definitions.
   add_compile_definitions(CK_FS_NATIVE_CLOSE_TEST_HOOKS)
 endif()
 if(BUILD_TESTING)

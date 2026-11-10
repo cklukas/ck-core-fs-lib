@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+#error This fixture and its complete SDK closure require matching compiled native-close hooks.
+#endif
+#include "platform/native_close_test_faults.hpp"
+#include "platform/journal_root_test_faults.hpp"
 #include "native_sync_hierarchy_binding.hpp"
 #include "native_sync_coordinator.hpp"
 #include "native_sync_resolution.hpp"
@@ -34,14 +39,55 @@ void* operator new(std::size_t n,std::align_val_t a){heap_fault::before();if(voi
 void* operator new[](std::size_t n,std::align_val_t a){return ::operator new(n,a);}
 void operator delete(void* p,std::align_val_t)noexcept{_aligned_free(p);}void operator delete(void* p,std::size_t,std::align_val_t)noexcept{_aligned_free(p);}
 void operator delete[](void* p,std::align_val_t)noexcept{_aligned_free(p);}void operator delete[](void* p,std::size_t,std::align_val_t)noexcept{_aligned_free(p);}
-using CloseFn=BOOL(WINAPI*)(HANDLE);
-extern "C" CloseFn __imp_CloseHandle;
 namespace close_fault {
-CloseFn real=nullptr;bool armed=false;FILE_ID_INFO target{};unsigned hits=0,calls=0;HANDLE consumed=nullptr;
-BOOL WINAPI watched(HANDLE handle){++calls;FILE_ID_INFO id{};const bool selected=armed&&GetFileInformationByHandleEx(handle,FileIdInfo,&id,sizeof(id))&&id.VolumeSerialNumber==target.VolumeSerialNumber&&std::memcmp(id.FileId.Identifier,target.FileId.Identifier,16)==0;const BOOL result=real(handle);const DWORD code=GetLastError();if(selected&&result){armed=false;consumed=handle;++hits;heap_fault::persistent=true;SetLastError(ERROR_WRITE_FAULT);return FALSE;}SetLastError(code);return result;}
-struct Patch {
- Patch(){real=__imp_CloseHandle;DWORD old=0;if(!VirtualProtect(&__imp_CloseHandle,sizeof(__imp_CloseHandle),PAGE_READWRITE,&old))throw std::runtime_error("IAT protection");__imp_CloseHandle=watched;DWORD ignored=0;if(!VirtualProtect(&__imp_CloseHandle,sizeof(__imp_CloseHandle),old,&ignored))throw std::runtime_error("IAT restore protection");}
- ~Patch(){DWORD old=0;if(VirtualProtect(&__imp_CloseHandle,sizeof(__imp_CloseHandle),PAGE_READWRITE,&old)){__imp_CloseHandle=real;DWORD ignored=0;VirtualProtect(&__imp_CloseHandle,sizeof(__imp_CloseHandle),old,&ignored);}}
+// The hierarchy and its finalizers run on the arming thread. Independent native
+// lock-worker closes cannot select this fault or arm OOM on the wrong thread.
+thread_local bool armed=false,selected=false,native_selected_ok=false;
+thread_local FILE_ID_INFO target{};
+thread_local unsigned hits=0,calls=0,root_closes=0;
+thread_local HANDLE pending=nullptr,consumed=nullptr;
+thread_local std::uint32_t native_selected_error=0;
+void before(void* handle,const char*,const char*)noexcept {
+ ++calls;pending=nullptr;selected=false;
+ FILE_ID_INFO id{};
+ if(armed&&GetFileInformationByHandleEx(handle,FileIdInfo,&id,sizeof(id))&&
+    id.VolumeSerialNumber==target.VolumeSerialNumber&&
+    std::memcmp(id.FileId.Identifier,target.FileId.Identifier,16)==0){pending=handle;selected=true;}
+}
+std::uint32_t after(void* handle,const char*,bool native_ok,std::uint32_t native_error)noexcept {
+ const bool match=selected&&pending==handle;selected=false;pending=nullptr;
+ if(!match)return 0;
+ native_selected_ok=native_ok;native_selected_error=native_error;
+ // The adapter has already consumed the real native handle. Only a successful
+ // native close may acquire this later failure; its own error always wins.
+ if(!native_ok)return 0;
+ armed=false;consumed=handle;++hits;
+ heap_fault::persistent=true; // no allocation or intervening native operation
+ return ERROR_WRITE_FAULT;
+}
+std::optional<std::int64_t> root_close(detail::JournalRootFaultPoint point)noexcept {
+ // Root's direct chain closes use their existing post-native observation seam,
+ // not the temporary-handle seam. Count both, retaining the repeated-finalizer
+ // no-close checks without replacing any system import or dropping Root I/O.
+ if(point==detail::JournalRootFaultPoint::DirectoryClose||point==detail::JournalRootFaultPoint::JournalClose){++root_closes;++calls;}
+ return std::nullopt; // observation only: never inject or suppress a Root error
+}
+struct ScopedObservers final {
+ ScopedObservers(){
+  if(detail::native_close_test_before.load()||detail::native_close_test_after.load()||detail::journal_root_test_fault)
+   throw std::runtime_error("native close observer already installed");
+  detail::native_close_test_before.store(before);
+  detail::native_close_test_after.store(after);
+  detail::journal_root_test_fault=root_close;
+ }
+ ~ScopedObservers(){
+  armed=false;heap_fault::persistent=false;
+  detail::native_close_test_after.store(nullptr);
+  detail::native_close_test_before.store(nullptr);
+  detail::journal_root_test_fault=nullptr;
+ }
+ ScopedObservers(const ScopedObservers&)=delete;
+ ScopedObservers& operator=(const ScopedObservers&)=delete;
 };
 }
 namespace {
@@ -61,20 +107,22 @@ struct Fixture {
  void add_nested(){mkdir(root/L"left/d");mkdir(root/L"left/d/e");write(root/L"left/d/e/file");nested=true;}
  NativeAbsolutePath address(const wchar_t* p){return get(NativeAbsolutePath::from_host(ext(root/p)));}
  std::vector<NativeName> components(){return {name(L"d"),name(L"e"),name(L"file")};}
- void arm(){HANDLE h=CreateFileW(ext(root/L"left/d/e/file").c_str(),FILE_READ_ATTRIBUTES,7,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);CHECK(h!=INVALID_HANDLE_VALUE);CHECK(GetFileInformationByHandleEx(h,FileIdInfo,&close_fault::target,sizeof(close_fault::target)));CHECK(CloseHandle(h));close_fault::hits=0;close_fault::consumed=nullptr;heap_fault::failures=0;heap_fault::allow=0;close_fault::armed=true;}
+ void arm(){HANDLE h=CreateFileW(ext(root/L"left/d/e/file").c_str(),FILE_READ_ATTRIBUTES,7,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);CHECK(h!=INVALID_HANDLE_VALUE);CHECK(GetFileInformationByHandleEx(h,FileIdInfo,&close_fault::target,sizeof(close_fault::target)));CHECK(CloseHandle(h));close_fault::hits=0;close_fault::consumed=nullptr;close_fault::pending=nullptr;close_fault::selected=false;close_fault::native_selected_ok=false;close_fault::native_selected_error=0;heap_fault::failures=0;heap_fault::allow=0;close_fault::armed=true;}
  ~Fixture(){close_fault::armed=false;heap_fault::persistent=false;detail::session_epoch_before_construct_test=nullptr;if(journal)try{(void)journal->finish_io();}catch(...){ }journal.reset();for(auto p:{root/L"left/d/e/file",root/L"left/a",root/L"right/a"})DeleteFileW(ext(p).c_str());for(auto p=dirs.rbegin();p!=dirs.rend();++p)RemoveDirectoryW(ext(*p).c_str());}
 };
 std::unique_ptr<SyncSession> session(Fixture& f){return get(SyncSession::open(get(open_native_sync_session_backend(f.journal,f.address(L"left"),f.address(L"right"))),SyncDigest{}));}
 NativeSyncCoordinatorRequest request(Fixture& f){NativeSyncCoordinatorRequest r{f.address(L"store"),f.address(L"left"),f.address(L"right"),{},{},{},{},{},{},{}};r.prepared_journal_root=f.journal;r.metadata.scope=RegularMetadataScope::OrdinaryCallerVisibleV1;r.metadata.ownership=MetadataOwnership::CurrentCaller;return r;}
-void verify_raw(const NativeHierarchyFailure& helper,const detail::SessionReaderFailure& reader,bool caught,DWORD before,DWORD after){CHECK(caught&&heap_fault::failures>0&&close_fault::hits==1);CHECK(helper.present&&helper.domain==ErrorDomain::Win32&&helper.code==ERROR_WRITE_FAULT);if(reader.failed)CHECK(reader.domain==ErrorDomain::Win32&&reader.code==ERROR_WRITE_FAULT);CHECK(before==after);}
+void verify_raw(const NativeHierarchyFailure& helper,const detail::SessionReaderFailure& reader,bool caught,DWORD before,DWORD after){CHECK(caught&&heap_fault::failures>0&&close_fault::hits==1);CHECK(close_fault::native_selected_ok&&close_fault::native_selected_error==ERROR_SUCCESS&&close_fault::consumed);CHECK(helper.present&&helper.domain==ErrorDomain::Win32&&helper.code==ERROR_WRITE_FAULT);if(reader.failed)CHECK(reader.domain==ErrorDomain::Win32&&reader.code==ERROR_WRITE_FAULT);CHECK(before==after);}
 void root_sticky_finalization(Fixture& f) {
  detail::PreparedJournalConsumerFailure initial{};
  CHECK(detail::read_prepared_journal_consumer_failure(*f.journal,initial)&&!initial.pending&&initial.domain==ErrorDomain::Win32&&initial.code==ERROR_WRITE_FAULT);
  CHECK(f.journal.use_count()==1);
  bool first_caught=false,second_caught=false;
+ const auto initial_root_closes=close_fault::root_closes;
  heap_fault::allow=0;heap_fault::persistent=true;
  try{(void)f.journal->finish_io();}catch(const std::bad_alloc&){first_caught=true;}
  const auto consumed_calls=close_fault::calls;
+ const auto consumed_root_closes=close_fault::root_closes;
  const DWORD after_first=handles();
  try{(void)f.journal->finish_io();}catch(const std::bad_alloc&){second_caught=true;}
  const auto repeated_calls=close_fault::calls;
@@ -83,17 +131,18 @@ void root_sticky_finalization(Fixture& f) {
  heap_fault::persistent=false;
  CHECK(first_caught&&second_caught&&present&&!sticky.pending&&sticky.domain==initial.domain&&sticky.code==initial.code&&sticky.operation==initial.operation);
  CHECK(consumed_calls==repeated_calls&&after_first==after_second&&close_fault::hits==1);
+ CHECK(consumed_root_closes>initial_root_closes&&close_fault::root_closes==consumed_root_closes);
  auto repeated=f.journal->finish_io();CHECK(!repeated.value()&&repeated.unavailable_detail()->error.domain==initial.domain&&repeated.unavailable_detail()->error.code==initial.code&&close_fault::calls==repeated_calls);
  std::puts("PASS genuine Root sticky + persistentOOM finalizer drain + repeated no native retry");
 }
 void session_failure(bool commit){Fixture f;const auto before=handles();auto s=session(f);auto c=get(NativeHierarchyContext::borrow(*s));auto b=get(c->bind(false,f.components()));f.arm();bool caught=false;NativeHierarchyFailure pod{};detail::SessionReaderFailure reader{};DWORD after=0;
  try{if(commit)(void)s->commit(s->snapshot().generation,{},true);else (void)s->finish_io();}
  catch(const std::bad_alloc&){pod=c->drain();reader=s->reader_failure();if(s->root_handle(false)!=-1)try{(void)s->finish_io();}catch(...){ }after=handles();caught=true;}
- const bool persistent=heap_fault::persistent;heap_fault::persistent=false;CHECK(persistent);verify_raw(pod,reader,caught,before,after);CHECK(reader.failed&&s->snapshot().generation==0&&s->root_handle(false)==-1);auto repeated=s->finish_io();CHECK(!repeated.value()&&repeated.unavailable_detail()->error.code==ERROR_WRITE_FAULT&&close_fault::hits==1);std::printf("PASS native session persistentOOM commit=%d actualClose=%u\n",commit,close_fault::hits);b.reset();c.reset();s.reset();root_sticky_finalization(f);}
+ const bool persistent=heap_fault::persistent;heap_fault::persistent=false;CHECK(persistent);verify_raw(pod,reader,caught,before,after);CHECK(reader.failed&&s->snapshot().generation==0&&s->root_handle(false)==-1);const auto finished_calls=close_fault::calls;auto repeated=s->finish_io();CHECK(!repeated.value()&&repeated.unavailable_detail()->error.code==ERROR_WRITE_FAULT&&close_fault::hits==1&&close_fault::calls==finished_calls);CHECK(handles()==after);std::printf("PASS native session persistentOOM commit=%d actualClose=%u\n",commit,close_fault::hits);b.reset();c.reset();s.reset();root_sticky_finalization(f);}
 void context_failure(bool transient){Fixture f;const auto before=handles();auto c=get(NativeHierarchyContext::open(f.journal,f.address(L"left"),f.address(L"right")));NativeHierarchyBinding::Pointer b;if(!transient)b=get(c->bind(false,f.components()));f.arm();bool caught=false;NativeHierarchyFailure pod{};DWORD after=0;
  try{if(transient)(void)c->bind(false,f.components());else (void)b->finish_io();}
  catch(const std::bad_alloc&){pod=c->drain();after=handles();caught=true;}
- heap_fault::persistent=false;verify_raw(pod,{},caught,before,after);auto repeated=c->finish_io();CHECK(!repeated.value()&&repeated.unavailable_detail()->error.code==ERROR_WRITE_FAULT&&close_fault::hits==1);std::printf("PASS context persistentOOM transient=%d\n",transient);b.reset();c.reset();root_sticky_finalization(f);}
+ heap_fault::persistent=false;verify_raw(pod,{},caught,before,after);const auto finished_calls=close_fault::calls;auto repeated=c->finish_io();CHECK(!repeated.value()&&repeated.unavailable_detail()->error.code==ERROR_WRITE_FAULT&&close_fault::hits==1&&close_fault::calls==finished_calls);CHECK(handles()==after);std::printf("PASS context persistentOOM transient=%d\n",transient);b.reset();c.reset();root_sticky_finalization(f);}
 template<class Worker>void worker_failure(){Fixture f(false);const auto before=handles();auto w=get(Worker::open(request(f)));auto c=get(NativeHierarchyContext::borrow(*w));f.add_nested();auto b=get(c->bind(false,f.components()));f.arm();bool caught=false;NativeHierarchyFailure pod{};DWORD after=0;
  try{(void)b->revalidate();}catch(const std::bad_alloc&){pod=c->drain();try{(void)w->finish_io();}catch(...){ }after=handles();caught=true;}
  heap_fault::persistent=false;verify_raw(pod,{},caught,before,after);auto closed=NativeHierarchyContext::borrow(*w);CHECK(!closed.value()&&closed.unavailable_detail()->error.operation=="hierarchy.worker_closed");std::puts("PASS actual worker borrow persistentOOM drain");b.reset();c.reset();w.reset();root_sticky_finalization(f);}
@@ -110,7 +159,7 @@ void terminate_stack()noexcept {
  for(USHORT i=0;i<count;++i){std::uintptr_t value=reinterpret_cast<std::uintptr_t>(frames[i]);if(value>=base)value-=base;char line[20]="0x0000000000000000\n";for(unsigned n=0;n<16;++n){const auto x=static_cast<unsigned>(value&15);line[17-n]="0123456789abcdef"[x];value>>=4;}DWORD wrote=0;WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,19,&wrote,nullptr);}
  ExitProcess(91);
 }
-int main(){std::set_terminate(terminate_stack);try{close_fault::Patch patch;
+int main(){std::set_terminate(terminate_stack);try{close_fault::ScopedObservers observers;
  raw_text("BEGIN epoch_constructor\n");epoch_constructor();
  raw_text("BEGIN session_finish\n");session_failure(false);
  raw_text("BEGIN session_commit\n");session_failure(true);

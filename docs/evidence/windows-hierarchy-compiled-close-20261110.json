@@ -1,0 +1,45 @@
+{
+  "scope": "QUALIFIED_FOCUSED_WINDOWS_NORMAL_AND_MATCHING_MSVC_ASAN_ONLY",
+  "qualified_source_base": "f82e648d30d2408790a674643394b33a83afdb98",
+  "source_patch_sha256": "6bf092613ccb26fadbced2051b034e650ee0ef4451cb040b915d3d0f239da608",
+  "receipt": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/windows-hierarchy-compiled-close-20261110/terminal-receipt.json",
+  "receipt_sha256": "44c4417bdec0d32f633132f6eb70346e1f9bd73c3bab32c9b547eaf35c589173",
+  "durable_packet_files_verified": 94,
+  "CTests_passed": 12,
+  "failures": 0,
+  "skips": 0,
+  "totals": {
+    "CTest_executions": 12,
+    "failures": 0,
+    "skips": 0,
+    "hierarchy_scenarios": 28,
+    "existing_control_scenarios": 8,
+    "assertions": 1688
+  },
+  "providers": [
+    "NTFS",
+    "ReFS"
+  ],
+  "modes": [
+    "normal",
+    "matching MSVC ASan"
+  ],
+  "uniform_rebuilt_translation_units_per_mode": 141,
+  "deadline_seconds": 180,
+  "legacy_gate_findings_before": 48,
+  "legacy_gate_findings_after": 32,
+  "remaining_13_fixture_findings_byte_identical": true,
+  "all_14_source_inventory_entries_retained": true,
+  "integration": {
+    "base_master": "a0301c1133d09e08d90eaee975e773c5d27857d7",
+    "CMake_rebase": "Only the qualified native-hook block applied; existing ELF fix/regression retained",
+    "CMake_sha256": "4e6826b92b142b04f076d0ff0efaae400f38812cd8aab008a18fb5b97ae7e247",
+    "fixture_sha256": "8a31b802f0ede52184bf370c347c84136c92d6ce2232d17152f6ed48edc3a61f",
+    "whole_current_revision_or_Windows_matrix_qualified": false
+  },
+  "production": "BUILD_TESTING=OFF keeps callback-free native-close definitions",
+  "remaining": [
+    "13 legacy fixture migrations and full Windows matrix",
+    "Combined latest-source validation after remaining integrations"
+  ]
+}
