@@ -43,6 +43,65 @@ if(NOT DEFINED QUALIFICATION_SANITIZER)
   set(QUALIFICATION_SANITIZER none)
 endif()
 set(config RelWithDebInfo)
+if(CMAKE_HOST_WIN32)
+  if(NOT DEFINED QUALIFICATION_WINDOWS_TEST_FS OR
+      NOT QUALIFICATION_WINDOWS_TEST_FS MATCHES "^(NTFS|ReFS)$")
+    message(FATAL_ERROR "Windows qualification requires explicit QUALIFICATION_WINDOWS_TEST_FS=NTFS or ReFS; no default provider")
+  endif()
+  if(NOT DEFINED QUALIFICATION_NATIVE_TEST_ROOT OR NOT IS_ABSOLUTE "${QUALIFICATION_NATIVE_TEST_ROOT}")
+    message(FATAL_ERROR "Select the actual Windows fixture root explicitly with QUALIFICATION_NATIVE_TEST_ROOT")
+  endif()
+  # Workstation launchers opt into the mandatory development-drive policy.
+  # Hosted Windows uses its controlled absolute runner temporary storage.
+  if("$ENV{CK_FS_REQUIRE_V_DEV_DRIVE}" STREQUAL "1")
+    if(NOT EXISTS "V:/")
+      message(FATAL_ERROR "Windows workstation development drive V: is unavailable")
+    endif()
+    foreach(key QUALIFICATION_OUTPUT QUALIFICATION_NATIVE_TEST_ROOT)
+      # Lexical policy key only: retain ${key}'s native spelling for I/O.
+      string(REPLACE "\\" "/" native_path "${${key}}")
+      if(native_path MATCHES "^//[?]/[A-Za-z]:/")
+        string(SUBSTRING "${native_path}" 4 -1 native_path)
+      endif()
+      if(NOT native_path MATCHES "^[A-Za-z]:/" OR
+          native_path MATCHES "(^|/)[.][.]?(/|$)" OR
+          native_path MATCHES ";")
+        message(FATAL_ERROR "${key} must be an unambiguous absolute DOS address beneath V:/tmp")
+      endif()
+      string(SUBSTRING "${native_path}" 3 -1 native_tail)
+      if(native_tail MATCHES ":")
+        message(FATAL_ERROR "${key} must not contain an alternate-stream component")
+      endif()
+      string(TOLOWER "${native_path}" native_path)
+      cmake_path(NORMAL_PATH native_path)
+      set(dev_tmp "v:/tmp")
+      cmake_path(IS_PREFIX dev_tmp "${native_path}" NORMALIZE on_dev_tmp)
+      if(NOT on_dev_tmp OR native_path MATCHES "^v:/tmp/?$")
+        message(FATAL_ERROR "Workstation qualification outputs and fixtures must be under V:/tmp")
+      endif()
+    endforeach()
+  endif()
+  foreach(key CK_CORE_FS_ARCHIVE_TEST_FS CK_CORE_FS_METADATA_TARGET_NATIVE_FS)
+    if(DEFINED ${key} AND NOT "${${key}}" STREQUAL "${QUALIFICATION_WINDOWS_TEST_FS}")
+      message(FATAL_ERROR "Conflicting ${key}; select one actual Windows fixture provider")
+    endif()
+  endforeach()
+endif()
+if(CMAKE_HOST_WIN32)
+  # Admit output ancestry before any output write, including fresh leaves.
+  # Explicit fixture addresses may name mounted volumes; they are not provider
+  # authority. Native fixtures independently acquire/qualify their held root.
+  find_program(qualification_pwsh NAMES pwsh REQUIRED)
+  execute_process(COMMAND "${qualification_pwsh}" -NoLogo -NoProfile -NonInteractive
+    -File "${CMAKE_CURRENT_LIST_DIR}/windows_fixture_provider.ps1"
+    -FixtureRoot "${QUALIFICATION_NATIVE_TEST_ROOT}" -Report "${QUALIFICATION_OUTPUT}"
+    -ValidatePathsOnly RESULT_VARIABLE path_guard_result
+    OUTPUT_VARIABLE path_guard_output ERROR_VARIABLE path_guard_error)
+  if(NOT path_guard_result EQUAL 0)
+    message(FATAL_ERROR "Windows qualification path admission failed: ${path_guard_error}")
+  endif()
+endif()
+
 file(MAKE_DIRECTORY "${QUALIFICATION_OUTPUT}/tmp")
 set(ENV{TMPDIR} "${QUALIFICATION_OUTPUT}/tmp")
 set(ENV{TMP} "$ENV{TMPDIR}")
@@ -151,6 +210,14 @@ if(flags)
   # Global flags reach engine, platform, browser, C ABI, and test translation units.
   list(APPEND options "-DCMAKE_C_FLAGS=${flags}" "-DCMAKE_CXX_FLAGS=${flags}"
     "-DCMAKE_EXE_LINKER_FLAGS=${flags}" "-DCMAKE_SHARED_LINKER_FLAGS=${flags}")
+endif()
+if(CMAKE_HOST_WIN32)
+  find_program(qualification_python NAMES python python3 REQUIRED)
+  run(windows-source-preflight "${qualification_python}" "${source}/tools/check_windows_runtime_hooks.py"
+    --source "${source}" --report "${QUALIFICATION_OUTPUT}/windows-hook-preflight.json")
+  list(APPEND options "-DCK_CORE_FS_ARCHIVE_TEST_FS=${QUALIFICATION_WINDOWS_TEST_FS}"
+    "-DCK_CORE_FS_METADATA_TARGET_NATIVE_FS=${QUALIFICATION_WINDOWS_TEST_FS}")
+  record("Windows expected fixture provider=${QUALIFICATION_WINDOWS_TEST_FS}; archive and metadata targets receive the same explicit value; native held-provider preflight remains independent.")
 endif()
 set(build "${QUALIFICATION_OUTPUT}/build")
 run(configure "${CMAKE_COMMAND}" -S "${source}" -B "${build}"

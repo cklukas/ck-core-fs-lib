@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "purpose": "Required legacy fixture source retention during compiled-hook migration. Not a skip/allow list or qualification receipt. Any legitimate source/target rename needs reviewed inventory and coverage evidence.",
+  "required_sources": [
+    "tests/metadata_capture_job_tests.cpp",
+    "tests/metadata_replay_tests.cpp",
+    "tests/native_copy_source_close_windows_tests.cpp",
+    "tests/native_directory_replay_job_tests.cpp",
+    "tests/native_legacy_batch_drain_windows_tests.cpp",
+    "tests/native_main_content_job_tests.cpp",
+    "tests/native_metadata_stream_target_windows_tests.cpp",
+    "tests/native_sync_channels_tests.cpp",
+    "tests/native_sync_hierarchy_windows_oom_tests.cpp",
+    "tests/regular_execution_source_tests.cpp",
+    "tests/reviewed_tree_plan_tests.cpp",
+    "tests/reviewed_tree_root_cancel_tests.cpp",
+    "tests/sync_session_native_close_tests.cpp",
+    "tests/target_read_seed_tests.cpp"
+  ]
+}

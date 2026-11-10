@@ -11,6 +11,10 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: ck-core-fs-native-qualification
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -35,6 +39,29 @@ jobs:
           - os: ubuntu-24.04
             browser: 'OFF'
     steps:
+      - name: Require controlled Windows runner storage
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tempRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          if (-not [IO.Path]::IsPathFullyQualified($env:RUNNER_TEMP) -or -not [IO.Directory]::Exists($tempRoot)) { throw 'Existing absolute runner temporary root required' }
+          if ($env:CK_FS_REQUIRE_V_DEV_DRIVE -ceq '1') {
+            if (-not [IO.Directory]::Exists('V:\')) { throw 'Workstation requires development drive V:' }
+            foreach ($path in @($tempRoot, $env:GITHUB_WORKSPACE)) {
+              if (-not [IO.Path]::GetFullPath($path).StartsWith('V:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Workstation scratch and checkout must be on V:' }
+            }
+            if (-not $tempRoot.StartsWith('V:\tmp\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Workstation temporary root must be under V:\tmp' }
+          }
+          # Discovery below is drive-based; do not guess through reparse aliases.
+          $ancestor = [IO.DirectoryInfo]::new($tempRoot)
+          while ($null -ne $ancestor) {
+            if (([IO.File]::GetAttributes($ancestor.FullName) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Controlled runner temporary ancestry must not redirect' }
+            $ancestor = $ancestor.Parent
+          }
+          $bootstrap = Join-Path $tempRoot ('ckfs-bootstrap-' + [guid]::NewGuid().ToString('N'))
+          [IO.Directory]::CreateDirectory($bootstrap) | Out-Null
+          foreach ($key in @('TMPDIR', 'TEMP', 'TMP')) { "$key=$bootstrap" >> $env:GITHUB_ENV }
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
@@ -50,12 +77,26 @@ jobs:
       - name: Build, test, install, and run installed C consumer
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $task = Join-Path '${{ runner.temp }}' 'ck-core-fs-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.browser }}'
-          $env:TMPDIR = Join-Path $task 'tmp'
-          $env:TEMP = $env:TMPDIR
-          $env:TMP = $env:TMPDIR
-          # The helper owns creation and refuses stale output directories.
-          cmake "-DQUALIFICATION_OUTPUT=$task" "-DQUALIFICATION_BROWSER=${{ matrix.browser }}" -P tools/qualification.cmake
+          $callerTmp = Join-Path '${{ runner.temp }}' ('ckfs-caller-' + [guid]::NewGuid().ToString('N'))
+          [IO.Directory]::CreateDirectory($callerTmp) | Out-Null
+          $env:TMPDIR = $callerTmp
+          $env:TEMP = $callerTmp
+          $env:TMP = $callerTmp
+          $qualification = @("-DQUALIFICATION_OUTPUT=$task", "-DQUALIFICATION_BROWSER=${{ matrix.browser }}")
+          if ($IsWindows) {
+            # Mandatory source-only admission BEFORE any backend configure/build/test.
+            python tools/check_windows_runtime_hooks.py --source "$PWD" --report (Join-Path $callerTmp 'windows-hook-preflight.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Windows runtime-hook fixture migration remains incomplete' }
+            [IO.Directory]::CreateDirectory($env:TMPDIR) | Out-Null
+            $fixture = Join-Path $env:TMPDIR 'native-fixture'
+            [IO.Directory]::CreateDirectory($fixture) | Out-Null
+            $provider = & ./tools/windows_fixture_provider.ps1 -FixtureRoot $fixture -Report (Join-Path $env:TMPDIR 'windows-provider.json')
+            $qualification += "-DQUALIFICATION_WINDOWS_TEST_FS=$provider", "-DQUALIFICATION_NATIVE_TEST_ROOT=$fixture"
+          }
+          # The helper refuses stale output directories; bootstrap/preflight lives separately.
+          cmake @qualification -P tools/qualification.cmake
           exit $LASTEXITCODE
 
   sanitizers:
@@ -124,16 +165,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          allowed=false
+          actual_temp=$(cd -P "$RUNNER_TEMP" && pwd -P)
+          actual_workspace=$(cd -P "$GITHUB_WORKSPACE" && pwd -P)
+          allowed_temp=false
+          allowed_workspace=false
           for volume in S8T PRO-BLADE; do
             if /sbin/mount | /usr/bin/grep -F " on /Volumes/$volume " >/dev/null; then
-              case "$RUNNER_TEMP/" in
-                "/Volumes/$volume/tmp/"*) allowed=true ;;
-              esac
+              case "$actual_temp/" in "/Volumes/$volume/tmp/"*) allowed_temp=true ;; esac
+              case "$actual_workspace/" in "/Volumes/$volume/tmp/"*) allowed_workspace=true ;; esac
             fi
           done
-          if [ "$allowed" != true ]; then
-            echo '::error::Mac runner needs mounted S8T or PRO-BLADE and runner temporary storage on that volume. No system-temp fallback.'
+          if [ "$allowed_temp" != true ] || [ "$allowed_workspace" != true ]; then
+            echo '::error::Mac runner needs mounted S8T or PRO-BLADE and temporary storage and checkout under the permitted mounted volumes. No system-temp fallback.'
             exit 1
           fi
           task=$(mktemp -d "$RUNNER_TEMP/ck-core-fs-bootstrap.XXXXXXXX")

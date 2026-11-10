@@ -1,0 +1,27 @@
+{
+  "state": "CI source/admission hardening complete and39WindowscontrolsPASS; native Windows fullqualification still BLOCKED by48legacy runtime-hook findings/14retained fixtures",
+  "source_sha256": {
+    ".github/workflows/ci.yml": "58588adc3ab391813beaaf1dc88b1ebd1caf8868d76408962c32d3b4bb63e74e",
+    "tools/qualification.cmake": "04ec279119ff94311c488c7eaa73a975968ac1410f469b48eb1821cd4ae2bea8",
+    "tools/check_windows_runtime_hooks.py": "073be13918fb23f6206deba9201a421cd40359fdf7f22c642895d6f555824c22",
+    "tools/windows_fixture_provider.ps1": "de2a095176a57671cbaa7ad802a089ff2e03031ddfddfaa4cf0c21341a2c5f3a",
+    "tools/windows_legacy_fixture_inventory.json": "95ade8d343a7ec8bcb95d2cebc94155228dd27001f162f57071a07203279f617"
+  },
+  "runtime_controls": 39,
+  "passed": 39,
+  "runtime_evidence": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/windows-ci-admission-v5-20261110",
+  "control_freeze_sha256": "700a30ebc4d5b6d24b391e23608dc49a934e91932291c3c0e0a095985c114af7",
+  "scope": "Mandatory explicitNTFS/ReFS; ordinary/slash/extendedV consistency; no C report/outsideV/dot/ADS/relative writes; output/reportreparse ancestryrefused beforewriting. Explicitmountedinput isinitialaddress only and needsindependentheldnativeprovider qualification. Sourcegate precedesconfigure/native jobs; no testsremoved/skipped.",
+  "source_guard": {
+    "exit": 1,
+    "findings": 48,
+    "files": 14,
+    "retained_entrypoints": 14
+  },
+  "workflow": "oneworkflow concurrency, matrixmaxparallel1, build/testparallel1; self-hosted Mac allowedvolume guard; hostedWindowscontrolledrunnerstorage, workstationVopt-inmandatory",
+  "limits": [
+    "No native capability authority from DriveInfo or path admission",
+    "No full native Windows/UNC/sanitizer/source-migration pass",
+    "GitHub runner execution not dispatched/qualified by local controls"
+  ]
+}
