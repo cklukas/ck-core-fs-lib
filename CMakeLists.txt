@@ -13,6 +13,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(MSVC)
+  # Decode Unicode path literals consistently across Windows code pages.
+  add_compile_options(/utf-8)
+endif()
+
 option(CK_CORE_FS_BUILD_BROWSER "Build the higher-level C++ file browser models" ON)
 option(CK_CORE_FS_TEST_NATIVE_CLOSE_HOOKS "Enable compiled failure-only Windows native close regression seams" OFF)
 option(CK_CORE_FS_TEST_JOURNAL_TEMPORARY_CLEANUP
