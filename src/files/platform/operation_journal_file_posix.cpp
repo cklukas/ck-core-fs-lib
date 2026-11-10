@@ -91,11 +91,13 @@ Observation<bool> private_regular(int fd,bool newly_created) {
     return Observation<bool>::available(true);
 }
 
+Observation<bool> journal_storage(int,bool);
+
 class PosixOperationJournalFile final : public OperationJournalFile {
 public:
     PosixOperationJournalFile(int fd,int directory, std::optional<NativeName> name = {},
-        PreparedJournalRoot::Pointer root = {}) noexcept
-        : fd_(fd),directory_(directory),name_(std::move(name)),root_(std::move(root)) {}
+        PreparedJournalRoot::Pointer root = {}, bool read_only = false) noexcept
+        : fd_(fd),directory_(directory),name_(std::move(name)),root_(std::move(root)),read_only_(read_only) {}
     ~PosixOperationJournalFile() override {
         if(!finished_) {
             try {(void)finish_io();}catch(...) {
@@ -107,46 +109,60 @@ public:
     }
     Observation<std::uint64_t> size() override {
         auto checked=revalidate();
-        if(!checked.value()) return Observation<std::uint64_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
+        if(!checked.value()) return unavailable_read<std::uint64_t>(checked);
         struct stat info{};
-        if (fstat(fd_.value(), &info) != 0) return failure<std::uint64_t>(errno, "journal_file.fstat");
+        if (fstat(fd_.value(), &info) != 0) return io_failure<std::uint64_t>(errno, "journal_file.fstat");
         if (!S_ISREG(info.st_mode) || info.st_size < 0 || info.st_nlink != 1)
             return rejected<std::uint64_t>(AdapterError::InvalidNativeResult, "journal_file.size");
+        if(read_only_) {auto after=revalidate();if(!after.value())return unavailable_read<std::uint64_t>(after);}
         return Observation<std::uint64_t>::available(static_cast<std::uint64_t>(info.st_size));
     }
     Observation<std::size_t> read_at(std::uint64_t offset, std::span<std::byte> bytes) override {
         if (!valid_io(offset, bytes.size())) return rejected<std::size_t>(AdapterError::InvalidLimit, "journal_file.read_range");
         auto checked=revalidate();
-        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
+        if(!checked.value()) return unavailable_read<std::size_t>(checked);
         const auto count = std::min(bytes.size(), static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
         const auto result = pread(fd_.value(), bytes.data(), count, static_cast<off_t>(offset));
-        if (result < 0) return failure<std::size_t>(errno, "journal_file.pread");
+        if (result < 0) return io_failure<std::size_t>(errno, "journal_file.pread");
         checked=revalidate();
-        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
+        if(!checked.value()) return unavailable_read<std::size_t>(checked);
         return Observation<std::size_t>::available(static_cast<std::size_t>(result));
     }
     Observation<std::size_t> write_at(std::uint64_t offset, std::span<const std::byte> bytes) override {
+        if(read_only_)return rejected<std::size_t>(AdapterError::InvalidAccess,"journal_reader.read_only_write",ObservationState::Denied);
         if (!valid_io(offset, bytes.size())) return rejected<std::size_t>(AdapterError::InvalidLimit, "journal_file.write_range");
         auto checked=revalidate();
-        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
+        if(!checked.value()) return unavailable_read<std::size_t>(checked);
         const auto count = std::min(bytes.size(), static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
         const auto result = pwrite(fd_.value(), bytes.data(), count, static_cast<off_t>(offset));
-        if (result < 0) return failure<std::size_t>(errno, "journal_file.pwrite");
+        if (result < 0) return io_failure<std::size_t>(errno, "journal_file.pwrite");
         checked=revalidate();
-        if(!checked.value()) return Observation<std::size_t>::unavailable(checked.state(),checked.unavailable_detail()->error);
+        if(!checked.value()) return unavailable_read<std::size_t>(checked);
         return Observation<std::size_t>::available(static_cast<std::size_t>(result));
     }
     Observation<bool> flush() override {
+        if(read_only_)return rejected<bool>(AdapterError::InvalidAccess,"journal_reader.read_only_flush",ObservationState::Denied);
         auto checked=revalidate();if(!checked.value()) return checked;
-        if (fsync(fd_.value()) != 0) return failure<bool>(errno, "journal_file.fsync");
-        if (fsync(directory_.value()) != 0) return failure<bool>(errno,"journal_file.parent_fsync");
+        if (fsync(fd_.value()) != 0) return io_failure<bool>(errno, "journal_file.fsync");
+        if (fsync(directory_.value()) != 0) return io_failure<bool>(errno,"journal_file.parent_fsync");
 #ifdef __APPLE__
-        if (fcntl(fd_.value(),F_FULLFSYNC) != 0) return failure<bool>(errno,"journal_file.fullsync");
+        if (fcntl(fd_.value(),F_FULLFSYNC) != 0) return io_failure<bool>(errno,"journal_file.fullsync");
 #endif
         return revalidate();
     }
     Observation<bool> finish_io() override {
         if(finished_)return finish_result();
+        if(read_only_) {
+            bool exceptional=false;
+            try {(void)finish_check();}catch(...) {exceptional=true;}
+            close_read_only_handles();finished_=true;
+            if(exceptional && !close_operation_) {
+                detail::PreparedJournalConsumerFailure prior{};
+                if(!finish_failure_.read(prior))remember_finish(ObservationState::Unknown,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_reader.finalizer_exception");
+            }
+            return finish_result();
+        }
         if(finish_started_) {
             record_failure(ObservationState::Unknown,ErrorDomain::Adapter,
                 static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_file.finalizer_incomplete");
@@ -169,12 +185,25 @@ public:
         }
         close_handles();finished_=true;return finish_result();
     }
+    Observation<bool> bind_read_only() {
+        if(fstat(fd_.value(),&reader_file_) || fstat(directory_.value(),&reader_directory_))return io_failure<bool>(errno,"journal_reader.bind_identity");
+        reader_bound_=true;return revalidate();
+    }
     bool record_consumer_failure(ObservationState observed,ErrorDomain domain,
         std::int64_t code,std::string_view operation) noexcept {
         return root_ && detail::record_prepared_journal_consumer_failure(*root_,observed,domain,code,operation);
     }
 private:
 
+    template<class T> Observation<T> io_failure(int code,const char* operation) {
+        if(read_only_)remember_finish(state(code),ErrorDomain::Posix,code,operation);
+        return failure<T>(code,operation);
+    }
+    template<class T> Observation<T> unavailable_read(const Observation<bool>& checked) {
+        const auto& e=*checked.unavailable_detail();
+        if(read_only_)remember_finish(e.state,e.error.domain,e.error.code,e.error.operation);
+        return Observation<T>::unavailable(e.state,e.error);
+    }
     void remember_finish(ObservationState observed,ErrorDomain domain,std::int64_t code,
         std::string_view operation) noexcept {
         finish_failure_.record(observed,domain,code,operation);
@@ -223,6 +252,12 @@ private:
                 close_operation_="journal_file.close_fault_exception";close_exception_=true;}
         }
     }
+    void close_read_only_handles() noexcept {
+        const int file=fd_.release();
+        if(file>=0) {if(::close(file))remember_close(errno,"journal_reader.close");observe_close_fault();}
+        const int directory=directory_.release();
+        if(directory>=0&&::close(directory))remember_close(errno,"journal_reader.parent_close");
+    }
     void close_handles() noexcept {
         const int file=fd_.release();
         if(file>=0) {if(::close(file))remember_close(errno,"journal_file.close");observe_close_fault();}
@@ -237,13 +272,31 @@ private:
         return Observation<bool>::available(true);
     }
     Observation<bool> revalidate() {
+        if(read_only_ && finished_)return rejected<bool>(AdapterError::InvalidAccess,"journal_reader.finished",ObservationState::Denied);
         if(root_) {auto checked=root_->revalidate();if(!checked.value())return checked;}
+        if(read_only_) {
+            auto provider=journal_storage(directory_.value(),false);if(!provider.value())return provider;
+            struct stat file{},directory{};
+            if(fstat(fd_.value(),&file)||fstat(directory_.value(),&directory))return io_failure<bool>(errno,"journal_reader.identity");
+            bool same=reader_bound_ && directory.st_nlink && file.st_dev==reader_file_.st_dev && file.st_ino==reader_file_.st_ino &&
+                directory.st_dev==reader_directory_.st_dev && directory.st_ino==reader_directory_.st_ino &&
+                file.st_dev==directory.st_dev && file.st_size==reader_file_.st_size && file.st_nlink==1 &&
+                file.st_mode==reader_file_.st_mode && file.st_uid==reader_file_.st_uid && file.st_gid==reader_file_.st_gid;
+#ifdef __APPLE__
+            same=same && file.st_mtimespec.tv_sec==reader_file_.st_mtimespec.tv_sec && file.st_mtimespec.tv_nsec==reader_file_.st_mtimespec.tv_nsec &&
+                file.st_ctimespec.tv_sec==reader_file_.st_ctimespec.tv_sec && file.st_ctimespec.tv_nsec==reader_file_.st_ctimespec.tv_nsec;
+#else
+            same=same && file.st_mtim.tv_sec==reader_file_.st_mtim.tv_sec && file.st_mtim.tv_nsec==reader_file_.st_mtim.tv_nsec &&
+                file.st_ctim.tv_sec==reader_file_.st_ctim.tv_sec && file.st_ctim.tv_nsec==reader_file_.st_ctim.tv_nsec;
+#endif
+            if(!same)return rejected<bool>(AdapterError::MetadataChanged,"journal_reader.identity_or_version_changed",ObservationState::Changed);
+        }
         auto root=private_directory(directory_.value());if(!root.value()) return root;
         auto file=private_regular(fd_.value(),false);if(!file.value())return file;
         if(name_) {
             struct stat held{},named{};
             if(fstat(fd_.value(),&held) || fstatat(directory_.value(),name_->posix_bytes()->c_str(),&named,AT_SYMLINK_NOFOLLOW))
-                return failure<bool>(errno,"journal_file.membership");
+                return io_failure<bool>(errno,"journal_file.membership");
             if(held.st_dev!=named.st_dev || held.st_ino!=named.st_ino || !S_ISREG(named.st_mode))
                 return rejected<bool>(AdapterError::MetadataChanged,"journal_file.membership_changed",ObservationState::Changed);
         }
@@ -252,6 +305,9 @@ private:
     Fd fd_,directory_;
     std::optional<NativeName> name_;
     PreparedJournalRoot::Pointer root_;
+    struct stat reader_file_{},reader_directory_{};
+    bool reader_bound_=false;
+    bool read_only_=false;
     bool finished_=false,finish_started_=false;
     std::int64_t close_error_=0;const char* close_operation_=nullptr;bool close_exception_=false;
     detail::PreparedJournalFailureLatch finish_failure_;
@@ -271,6 +327,51 @@ Observation<bool> prepare_native_operation_journal_root(const NativeAbsolutePath
     if (fchmod(directory.value(), 0700) != 0)
         return failure<bool>(errno, "journal_file.prepare_root.mode");
     return private_directory(directory.value());
+}
+
+Observation<bool> detail::qualify_operation_journal_directory(const DirectoryCursor& cursor) {
+    auto duplicate=duplicate_posix_journal_directory(cursor);
+    if(!duplicate.value())return Observation<bool>::unavailable(duplicate.state(),duplicate.unavailable_detail()->error);
+    Fd directory(*duplicate.value());
+    auto checked=[&]() -> Observation<bool> {
+        auto provider=journal_storage(directory.value(),false);if(!provider.value())return provider;
+        struct stat native{};if(fstat(directory.value(),&native))return failure<bool>(errno,"journal_reader.root_identity");
+        const auto* old=cursor.identity().value();
+        if(!native.st_nlink || !old || old->scheme!=IdentityScheme::PosixDeviceInode || old->volume!=NativeIdentifier::from_u64(native.st_dev) || old->object!=NativeIdentifier::from_u64(native.st_ino))
+            return rejected<bool>(AdapterError::MetadataChanged,"journal_reader.root_identity_changed",ObservationState::Changed);
+        return private_directory(directory.value());
+    }();
+    const int raw=directory.release();
+    if(close(raw))return failure<bool>(errno,"journal_reader.validation_duplicate_close"); // consumed, never retry EINTR
+    return checked;
+}
+Observation<std::unique_ptr<OperationJournalFile>> open_held_operation_journal_file(
+    const DirectoryCursor& cursor,const NativeName& basename) {
+    using Pointer=std::unique_ptr<OperationJournalFile>;
+    if(!basename.is_valid()||!basename.posix_bytes())return rejected<Pointer>(AdapterError::InvalidIdentifier,"journal_reader.basename");
+    auto checked=detail::qualify_operation_journal_directory(cursor);
+    if(!checked.value())return Observation<Pointer>::unavailable(checked.state(),checked.unavailable_detail()->error);
+    if(!*checked.value())return rejected<Pointer>(AdapterError::InvalidNativeResult,"journal_reader.root_false");
+    auto duplicate=detail::duplicate_posix_journal_directory(cursor);
+    if(!duplicate.value())return Observation<Pointer>::unavailable(duplicate.state(),duplicate.unavailable_detail()->error);
+    Fd directory(*duplicate.value());
+    struct stat named{};
+    if(fstatat(directory.value(),basename.posix_bytes()->c_str(),&named,AT_SYMLINK_NOFOLLOW))return failure<Pointer>(errno,"journal_reader.named_stat");
+    if(!S_ISREG(named.st_mode)||named.st_nlink!=1)return rejected<Pointer>(AdapterError::InvalidAccess,"journal_reader.named_kind",ObservationState::Denied);
+    Fd file(openat(directory.value(),basename.posix_bytes()->c_str(),O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC));
+    if(file.value()<0)return failure<Pointer>(errno,"journal_reader.openat");
+    struct stat opened{};
+    if(fstat(file.value(),&opened))return failure<Pointer>(errno,"journal_reader.opened_stat");
+    if(opened.st_dev!=named.st_dev||opened.st_ino!=named.st_ino)return rejected<Pointer>(AdapterError::MetadataChanged,"journal_reader.open_changed",ObservationState::Changed);
+    auto result=std::make_unique<PosixOperationJournalFile>(file.value(),directory.value(),basename,PreparedJournalRoot::Pointer{},true);
+    file.release();directory.release();
+    checked=result->bind_read_only();
+    if(!checked.value()||!*checked.value()) {
+        (void)result->finish_io();
+        if(!checked.value())return Observation<Pointer>::unavailable(checked.state(),checked.unavailable_detail()->error);
+        return rejected<Pointer>(AdapterError::InvalidNativeResult,"journal_reader.bind_false");
+    }
+    return Observation<Pointer>::available(std::move(result));
 }
 
 Observation<std::unique_ptr<OperationJournalFile>> open_native_operation_journal_file(

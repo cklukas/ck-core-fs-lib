@@ -1,0 +1,44 @@
+{
+  "date": "2026-11-10",
+  "scope": "Focused native held-journal-reader APIs plus actual recovery clients; not the complete platform/application matrix",
+  "API_patch_sha256": "b7ff50eb74eccdc5c9f3620c1dc6544d07d12f6489a58d7cd48da1c6fe4b4547",
+  "packets": [
+    {
+      "manifest": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/held-journal-reader-a0301c1-mac-20261110-6cf4nctp/manifest.json",
+      "sha256": "5aee5acd5dd4a8aef37db231357112a3c81d022963d0282d3e0afb30db9cbfd1",
+      "scope": "See qualified receipt and actual source guards in this packet"
+    },
+    {
+      "manifest": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/held-journal-reader-515819c-linux-20261110-o1912123/manifest.json",
+      "sha256": "b79e4754f36b393c1ab2f84462052214442cae9b122e115f35710e9d1f1b73dc",
+      "scope": "See qualified receipt and actual source guards in this packet"
+    },
+    {
+      "manifest": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/windows-native-recovery-20261110/manifest.json",
+      "sha256": "45cbe119a29f84c148164dabd0473b8bc538e7492d240b3f8a69d3bbc979302f",
+      "scope": "See qualified receipt and actual source guards in this packet"
+    }
+  ],
+  "C_ABI_changed": false,
+  "public_Cpp_vtable_changed": false,
+  "platforms": {
+    "macOS": "Complete matching normal/TSan SDKs and333native assertions each; actual12controller cases+OOMpositive/old86control each",
+    "Linux": "Complete matching normal/ASanUBSan SDKs140TUs and333native assertions each; actual12controller cases+OOMpositive/old86control each",
+    "Windows": "Complete matching normal/ASan SDKs139TUs; actualNTFS/ReFS56individualcontrollercaseexecutions plus4OOMpositives, old86normalReFS"
+  },
+  "unclosed": [
+    "Full current application/platform suite",
+    "Native-window acceptance",
+    "UNC/provider qualification",
+    "Injected Windows OS-close failures for the reader",
+    "Remaining unsafe legacy Windows fixture migrations"
+  ],
+  "permanent_UNIX_registration": {
+    "receipt": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/held-journal-reader-unix-registration-qualified-20261110-ddsfgi1m/receipt.json",
+    "receipt_sha256": "fe01362898be6d7ff40810d27c7c18b3ea5fb9ab3f998ec804f9e0517a579f50",
+    "manifest_sha256": "3230f8e765221bb214efc142ea8161a78d175ad5fc884610690d67fd0f31f42d",
+    "manifest_entries_verified": 79,
+    "Mac_normal_TSan_and_Linux_normal_ASan": "Each actual CTest passed333nativechecks withmatchingimmutableSDK; exact module/runner qualified, no SDK rebuild",
+    "timeout_controls": "Both verified native child removal and fixture cleanup; native deadline45 below CTest60"
+  }
+}

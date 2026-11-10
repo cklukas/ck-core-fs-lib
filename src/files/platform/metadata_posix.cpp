@@ -14,6 +14,8 @@
 #include "native_metadata_stream_target.hpp"
 #include "linux_anonymous_staging.hpp"
 #include "native_journal_directory_bridge.hpp"
+#include "../operation_journal_file.hpp"
+#include "prepared_journal_failure_latch.hpp"
 #include "native_directory_reader.hpp"
 
 #include <algorithm>
@@ -2245,6 +2247,34 @@ public:
         return R::available(std::move(clone));
     }
 
+    void mark_journal_scan() noexcept {journal_scan_=true;}
+    Observation<bool> finish_journal_scan() {
+        if(!journal_scan_)return Observation<bool>::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"journal_reader.factory_cursor_required"});
+        if(!journal_scan_finished_) {
+            bool exceptional=false;
+            try {
+                auto checked=detail::qualify_operation_journal_directory(*this);
+                if(const auto* error=checked.unavailable_detail())journal_scan_failure_.record(error->state,error->error.domain,error->error.code,error->error.operation);
+                else if(!*checked.value())journal_scan_failure_.record(ObservationState::Failed,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_reader.root_false");
+            }catch(...){exceptional=true;}
+            journal_scan_finished_=true;
+            DIR* raw=directory_.release();
+            if(raw && closedir(raw)) {
+                journal_scan_close_error_=errno;
+                journal_scan_failure_.record(errno_state(journal_scan_close_error_),ErrorDomain::Posix,journal_scan_close_error_,"journal_reader.root_closedir");
+                detail::record_metadata_capture_close({errno_state(journal_scan_close_error_),ErrorDomain::Posix,journal_scan_close_error_,"journal_reader.root_closedir"});
+            }
+            if(exceptional)journal_scan_failure_.record(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_reader.root_finalizer_exception");
+        }
+        // Formatting may allocate only AFTER the consumed root close is cached.
+        return journal_scan_failure_.result();
+    }
+    detail::PreparedJournalFailureLatch journal_scan_failure_;
+    bool journal_scan_=false,journal_scan_finished_=false;
+    int journal_scan_close_error_=0;
     PosixDirectoryCursor(OwnedDirectory directory, Observation<ObjectIdentity> identity, AdapterScope scope)
         : DirectoryCursor(std::move(identity)), directory_(std::move(directory)), scope_(std::move(scope)) {}
     Observation<AdapterScope> source_scope() const override { return Observation<AdapterScope>::available(scope_); }
@@ -2260,6 +2290,7 @@ public:
         return Observation<int>::available(duplicate);
     }
     Observation<BasicMetadata> inspect_basic() const override {
+        if(journal_scan_finished_)return Observation<BasicMetadata>::unavailable(ObservationState::Denied,{ErrorDomain::Posix,EBADF,"journal_reader.root_finished"});
 #if defined(__linux__)
         return statx_metadata(dirfd(directory_.get()), "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, scope_);
 #else
@@ -3089,6 +3120,7 @@ public:
 private:
     friend class PosixTargetReadSeed;
     Observation<DirectoryStep> next_step() override {
+        if(journal_scan_finished_)return Observation<DirectoryStep>::unavailable(ObservationState::Denied,{ErrorDomain::Posix,EBADF,"journal_reader.root_finished"});
         using Result = Observation<DirectoryStep>;
         errno = 0;
         const auto* entry = readdir(directory_.get());
@@ -3494,6 +3526,28 @@ std::optional<MetadataCaptureCleanupError> detail::finish_native_archive_file(Op
     return native->finish_archive();
 }
 
+Observation<std::unique_ptr<DirectoryCursor>> open_native_operation_journal_directory(const NativeAbsolutePath& address) {
+    using R=Observation<std::unique_ptr<DirectoryCursor>>;
+    NativeFileSystem filesystem;
+    auto opened=filesystem.open_native_directory(address,DirectoryLinkPolicy::RejectFinalLink);
+    if(!opened.value())return R::unavailable(opened.state(),opened.unavailable_detail()->error);
+    auto cursor=std::move(opened).take_value();
+    auto* native=dynamic_cast<PosixDirectoryCursor*>(cursor.get());
+    if(!native)return R::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::UnsupportedQuery,"journal_reader.native_cursor_required"));
+    native->mark_journal_scan();
+    auto checked=detail::qualify_operation_journal_directory(*cursor);
+    if(!checked.value()||!*checked.value()) {
+        (void)native->finish_journal_scan();
+        if(!checked.value())return R::unavailable(checked.state(),checked.unavailable_detail()->error);
+        return R::unavailable(ObservationState::Failed,adapter_error(AdapterError::InvalidNativeResult,"journal_reader.root_false"));
+    }
+    return R::available(std::move(cursor));
+}
+Observation<bool> finish_operation_journal_directory(DirectoryCursor& directory) {
+    auto* native=dynamic_cast<PosixDirectoryCursor*>(&directory);
+    if(!native)return Observation<bool>::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::UnsupportedQuery,"journal_reader.factory_cursor_required"));
+    return native->finish_journal_scan();
+}
 Observation<int> detail::duplicate_posix_journal_directory(const DirectoryCursor& cursor) {
     const auto* native=dynamic_cast<const PosixDirectoryCursor*>(&cursor);
     if(!native)return Observation<int>::unavailable(ObservationState::Unsupported,

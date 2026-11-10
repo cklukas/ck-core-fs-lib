@@ -5,6 +5,8 @@
 namespace ck::files {
 class DirectoryCursor;
 namespace detail {
+// Read-only privacy/provider/identity qualification; consumes its own duplicate.
+Observation<bool> qualify_operation_journal_directory(const DirectoryCursor&);
 // Provider-only bridge. Available transfers one native owning duplicate of
 // the genuine cursor's current held directory. No path/procfd reopen, access
 // upgrade, caller-supplied integer, or injected cursor fallback is permitted.

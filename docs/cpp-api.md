@@ -46,3 +46,35 @@ supports equality checks when a CurrentCaller preservation policy omits actual
 owners from its cross-object metadata digest. It authenticates no native issuer
 and grants no replay or mutation authority; native producers must qualify their
 snapshots separately.
+
+## Held journal inspection
+
+`operation_journal_file.hpp` provides worker-only observation of existing
+private journals through the platform target:
+
+- `open_native_operation_journal_directory` acquires and qualifies the initial
+  native directory once. Windows requests list/attribute access and
+  `READ_CONTROL`; ordinary directory browsing keeps its existing access rights.
+- `open_held_operation_journal_file` opens an existing private, regular,
+  single-link file relative to that retained directory. Keep its `NativeName`
+  unchanged; display text and the directory's former pathname are not reopening
+  authority. The file's `write_at` and `flush` return Denied without issuing I/O.
+- The file's `finish_io` and `finish_operation_journal_directory` explicitly
+  consume their native owners and cache completion, including native failures.
+  Finish every acquired owner on returned-error and exception paths. Repeating
+  completion must not close a reused descriptor. After directory completion,
+  only repeated completion and destruction are permitted.
+
+The directory is a generic `DirectoryCursor`, not a restricted authority type.
+Its caller must follow the observation-only scan protocol and must not invoke
+mutators or access upgrades. These factories issue no `PreparedJournalRoot`,
+review receipt, publication capability, or retention guarantee. They never
+prepare a public directory to make it private. Windows sharing excludes live
+data writers; POSIX identity/version bookends remain observations rather than
+a writer-exclusion lease or immutable snapshot.
+
+The native UNIX regression covers held-root replacement, ordinary and long
+paths, write/flush refusal, private ownership, symlink/hardlink refusal, and
+consumed and repeated completion. Matching frontend qualification also covers
+Windows NTFS/ReFS long roots and raw UTF-16 names. Those focused results do
+not close full-application, UNC/provider, or Windows close-fault qualification.

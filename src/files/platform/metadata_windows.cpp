@@ -5,6 +5,8 @@
 #include "native_close_test_faults.hpp"
 #include "../native_trash.hpp"
 #include "native_journal_directory_bridge.hpp"
+#include "../operation_journal_file.hpp"
+#include "prepared_journal_failure_latch.hpp"
 #include "metadata_replay.hpp"
 #include "metadata_capture_job.hpp"
 #include "native_archive_file.hpp"
@@ -2380,6 +2382,34 @@ public:
     ~WindowsDirectoryCursor()override {
         if(target_read_consumer_){detail::MetadataCaptureCleanupScope scope(target_read_consumer_->latch());handle_.reset();target_read_consumer_.reset();}
     }
+    void mark_journal_scan() noexcept {journal_scan_=true;}
+    Observation<bool> finish_journal_scan() {
+        if(!journal_scan_)return Observation<bool>::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"journal_reader.factory_cursor_required"});
+        if(!journal_scan_finished_) {
+            bool exceptional=false;
+            try {
+                auto checked=detail::qualify_operation_journal_directory(*this);
+                if(const auto* error=checked.unavailable_detail())journal_scan_failure_.record(error->state,error->error.domain,error->error.code,error->error.operation);
+                else if(!*checked.value())journal_scan_failure_.record(ObservationState::Failed,ErrorDomain::Adapter,
+                    static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_reader.root_false");
+            }catch(...){exceptional=true;}
+            journal_scan_finished_=true;
+            const auto raw=handle_.release();
+            if(raw && raw!=INVALID_HANDLE_VALUE && !close_native_consumer_handle(raw,"journal_reader.root_CloseHandle")) {
+                journal_scan_close_error_=GetLastError();
+                journal_scan_failure_.record(error_state(journal_scan_close_error_),ErrorDomain::Win32,journal_scan_close_error_,"journal_reader.root_CloseHandle");
+                report_capture_close(journal_scan_close_error_,"journal_reader.root_CloseHandle");
+            }
+            if(exceptional)journal_scan_failure_.record(ObservationState::Unknown,ErrorDomain::Adapter,
+                static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_reader.root_finalizer_exception");
+        }
+        // Formatting may allocate only AFTER the consumed root close is cached.
+        return journal_scan_failure_.result();
+    }
+    detail::PreparedJournalFailureLatch journal_scan_failure_;
+    bool journal_scan_=false,journal_scan_finished_=false;
+    DWORD journal_scan_close_error_=0;
     WindowsDirectoryCursor(OwnedHandle handle, Observation<ObjectIdentity> native_identity, AdapterScope scope)
         : DirectoryCursor(std::move(native_identity)), handle_(std::move(handle)), scope_(std::move(scope)) {}
     Observation<AdapterScope> source_scope() const override { return Observation<AdapterScope>::available(scope_); }
@@ -2390,7 +2420,10 @@ public:
                 {ErrorDomain::Win32,GetLastError(),"trash.duplicate_parent"});
         return Observation<WindowsTrashHandle>::available(WindowsTrashHandle(raw));
     }
-    Observation<BasicMetadata> inspect_basic() const override { return handle_metadata(handle_.get(), scope_); }
+    Observation<BasicMetadata> inspect_basic() const override {
+        if(journal_scan_finished_)return failure<BasicMetadata>(ERROR_INVALID_HANDLE,"journal_reader.root_finished");
+        return handle_metadata(handle_.get(), scope_);
+    }
     Observation<std::unique_ptr<OpenedEntry>> open_parent_directory() const override { return open_windows_parent(handle_.get(), scope_); }
     Observation<CreatedStagingFile> create_staging_file(const NativeName& recovery_hint) const override {
         using Result=Observation<CreatedStagingFile>;
@@ -3505,6 +3538,7 @@ private:
 private:
     Observation<DirectoryStep> next_step() override {
         using Result = Observation<DirectoryStep>;
+        if(journal_scan_finished_)return failure<DirectoryStep>(ERROR_INVALID_HANDLE,"journal_reader.root_finished");
         static_assert(offsetof(FILE_ID_BOTH_DIR_INFO, FileName) == detail::windows_directory_name_offset);
         static_assert(offsetof(FILE_ID_BOTH_DIR_INFO, FileNameLength) == detail::windows_directory_name_length_offset);
         if(target_read_enumeration_finished_)return Result::available(DirectoryEnd{});
@@ -4340,6 +4374,36 @@ Observation<std::unique_ptr<DirectoryCursor>> NativeFileSystem::open_directory(
             {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::NotDirectory), "open_directory.kind"});
     auto native_identity = identity(handle.get(), scope_);
     return Result::available(std::make_unique<WindowsDirectoryCursor>(std::move(handle), std::move(native_identity), scope_));
+}
+Observation<std::unique_ptr<DirectoryCursor>> open_native_operation_journal_directory(const NativeAbsolutePath& address) {
+    using R=Observation<std::unique_ptr<DirectoryCursor>>;
+    auto host=address.host_path();
+    if(!host.value())return R::unavailable(host.state(),host.unavailable_detail()->error);
+    const auto path=windows_extended_path(host.value()->native());
+    if(!path)return failure<std::unique_ptr<DirectoryCursor>>(ERROR_INVALID_NAME,"journal_reader.root_path");
+    // Initial acquisition, never an upgrade through the same-access bridge.
+    OwnedHandle handle(CreateFileW(path->c_str(),FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL|SYNCHRONIZE,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL,nullptr));
+    if(handle.get()==INVALID_HANDLE_VALUE)return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"journal_reader.open_root");
+    AdapterScope scope;
+    auto id=identity(handle.get(),scope);
+    if(!id.value())return R::unavailable(id.state(),id.unavailable_detail()->error);
+    auto cursor=std::make_unique<WindowsDirectoryCursor>(std::move(handle),std::move(id),scope);
+    cursor->mark_journal_scan();
+    auto checked=detail::qualify_operation_journal_directory(*cursor);
+    if(!checked.value()||!*checked.value()) {
+        (void)cursor->finish_journal_scan();
+        if(!checked.value())return R::unavailable(checked.state(),checked.unavailable_detail()->error);
+        return R::unavailable(ObservationState::Failed,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_reader.root_false"});
+    }
+    return R::available(std::move(cursor));
+}
+Observation<bool> finish_operation_journal_directory(DirectoryCursor& directory) {
+    auto* native=dynamic_cast<WindowsDirectoryCursor*>(&directory);
+    if(!native)return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnsupportedQuery),"journal_reader.factory_cursor_required"});
+    return native->finish_journal_scan();
 }
 Observation<void*> detail::duplicate_windows_journal_directory(const DirectoryCursor& cursor) {
     const auto* native=dynamic_cast<const WindowsDirectoryCursor*>(&cursor);
