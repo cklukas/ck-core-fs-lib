@@ -34,13 +34,14 @@ void root_control(const std::filesystem::path& parent,bool long_path,bool workst
  const auto exact=extended(root);native_environment(exact);
  {
   FixtureHandle root_owner;
-  const auto identity=open_fixture_root(root,root_owner);
-  CHECK(identity.VolumeSerialNumber==parent_identity.VolumeSerialNumber);
+  const auto root_identity=open_fixture_root(root,root_owner);
+  CHECK(root_identity.VolumeSerialNumber==parent_identity.VolumeSerialNumber);
   Fixture fixture;CHECK(fixture.root.native().starts_with(exact+L"\\"));CHECK(!long_path||fixture.root.native().size()>260);
   auto actual=take(NativeAbsolutePath::from_host(fixture.root));const auto* units=actual.windows_units();CHECK(units);
   CHECK(std::find(units->begin(),units->end(),char16_t(0xd800))!=units->end());
   write_file(fixture.path("s/raw-root-file"),"exact UTF16 root data");CHECK(fixture.read("s/raw-root-file")=="exact UTF16 root data");
-  auto identity=fixture.parent->identity();CHECK(identity.value()&&identity.value()->scheme==IdentityScheme::WindowsFileId128);
+  const auto fixture_identity=fixture.parent->identity();
+  CHECK(fixture_identity.value()&&fixture_identity.value()->scheme==IdentityScheme::WindowsFileId128);
  }
  native_environment(original);
  // Restore/cleanup only this exact fixture-owned branch, using wide APIs.
