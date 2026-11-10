@@ -235,17 +235,23 @@ foreach(_ck_private_target ck_core_fs_engine ck_files_platform ck_core_fs_native
 endforeach()
 if(CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF")
   include(CheckLinkerFlag)
-  check_linker_flag(CXX "LINKER:-Bsymbolic-functions" CK_FS_HAS_BIND_INTERNAL_FUNCTIONS)
-  check_linker_flag(CXX "LINKER:--exclude-libs,ALL" CK_FS_HAS_HIDE_PRIVATE_ARCHIVES)
+  # An embedding project may use STATIC_LIBRARY compiler probes. Linker flags
+  # must still be checked by a real link, never passed to the archiver. Keep
+  # the caller's setting intact and use fresh cache keys after older probes.
   set(_ck_c_exports "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ck_core_fs_exports.map")
-  check_linker_flag(CXX "LINKER:--version-script,${_ck_c_exports}" CK_FS_HAS_C_EXPORT_BOUNDARY)
-  if(NOT CK_FS_HAS_BIND_INTERNAL_FUNCTIONS)
+  block()
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
+    check_linker_flag(CXX "LINKER:-Bsymbolic-functions" CK_FS_LINKER_HAS_BSYMBOLIC_FUNCTIONS)
+    check_linker_flag(CXX "LINKER:--exclude-libs,ALL" CK_FS_LINKER_HAS_EXCLUDE_LIBS_ALL)
+    check_linker_flag(CXX "LINKER:--version-script,${_ck_c_exports}" CK_FS_LINKER_HAS_C_EXPORT_MAP)
+  endblock()
+  if(NOT CK_FS_LINKER_HAS_BSYMBOLIC_FUNCTIONS)
     message(FATAL_ERROR "ELF packaging requires local binding of internal SDK function calls")
   endif()
-  if(NOT CK_FS_HAS_HIDE_PRIVATE_ARCHIVES)
+  if(NOT CK_FS_LINKER_HAS_EXCLUDE_LIBS_ALL)
     message(FATAL_ERROR "ELF packaging requires hiding private archive symbols")
   endif()
-  if(NOT CK_FS_HAS_C_EXPORT_BOUNDARY)
+  if(NOT CK_FS_LINKER_HAS_C_EXPORT_MAP)
     message(FATAL_ERROR "ELF packaging requires an explicit public C export boundary")
   endif()
   target_link_options(ck_file_engine_c PRIVATE "LINKER:-Bsymbolic-functions"
@@ -292,6 +298,15 @@ if(BUILD_TESTING)
     add_test(NAME elf_export_surface COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_elf_exports.py
       ${CMAKE_NM} $<TARGET_FILE:ck_file_engine_c> ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME elf_embedded_linker_probes COMMAND ${CMAKE_COMMAND}
+      -S ${CMAKE_CURRENT_SOURCE_DIR}/tests/elf_linker_probe
+      -B ${CMAKE_CURRENT_BINARY_DIR}/elf-linker-probe
+      "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+      "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+      "-DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}"
+      "-DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}"
+      "-DCMAKE_EXE_LINKER_FLAGS=${CMAKE_EXE_LINKER_FLAGS}")
+    set_tests_properties(elf_embedded_linker_probes PROPERTIES TIMEOUT 60)
   endif()
   set(CK_CORE_FS_SHARED_TSAN_RUNTIME "" CACHE FILEPATH "Exact shared TSan runtime selected by qualification")
   if(CK_CORE_FS_SHARED_TSAN_RUNTIME)

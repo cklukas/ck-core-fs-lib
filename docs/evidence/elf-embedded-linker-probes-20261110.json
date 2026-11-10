@@ -1,0 +1,41 @@
+{
+  "scope": "Linux GNU14/CMake configure-time linker regression, not full SDK build/runtime qualification",
+  "base_commit": "0888b66e200e5eb40285b51b72a33cf54870ce8a",
+  "CMakeLists_sha256": "650fc40a9136197cdc8b0f1bbd1174df95caf8df825a728bee82079337dff5d0",
+  "fixture_sha256": "e08618d9249c4c47f95ed1c6504172edbd25139c7e6f5e5e468b5094bf13df4e",
+  "tool_versions": {
+    "cmake": "cmake version 3.31.6",
+    "ar": "GNU ar (GNU Binutils for Debian) 2.44",
+    "c++": "c++ (Debian 14.2.0-19) 14.2.0"
+  },
+  "old_static_library_link_probes": {
+    "fixed": "OFF",
+    "exit": 1,
+    "seconds": 0.5406113127246499
+  },
+  "scoped_executable_link_probes": {
+    "fixed": "ON",
+    "exit": 0,
+    "seconds": 0.5832586036995053
+  },
+  "permanent_fixture_old_source": {
+    "mode": "old",
+    "exit": 1,
+    "seconds": 0.6009023957885802,
+    "cmake_sha256": "0bebbebe538f18c6ecc3b33d12639e63ebbe8d723d31863d6ba7016ed3c6d315"
+  },
+  "permanent_fixture_fixed_source": {
+    "mode": "fixed",
+    "exit": 0,
+    "seconds": 0.5094364508986473,
+    "cmake_sha256": "650fc40a9136197cdc8b0f1bbd1174df95caf8df825a728bee82079337dff5d0"
+  },
+  "invalid_linker_option_rejected": true,
+  "legacy_failed_cache_does_not_mask_new_probes": true,
+  "caller_STATIC_LIBRARY_setting_preserved": true,
+  "parallel": 1,
+  "affinity_cpu": 0,
+  "receipt": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/elf-embedded-linker-probes-20261110/qualification.json",
+  "receipt_sha256": "395f31e351bf3b3ef21377d75bc032a224528bca44089b3b678c94c503aa5f79",
+  "whole_platform_or_runtime_matrix_complete": false
+}
