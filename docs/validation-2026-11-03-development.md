@@ -3,6 +3,43 @@
 These results describe frozen development snapshots. They do not establish a
 0.5 release, a frontend dependency pin, or permission to enable Apply.
 
+## 2026-11-10 — Windows native close and worker batch
+
+The focused Copy, target-read Seed, Sync, hierarchy, held-journal-reader and
+real ckUtilities recovery-worker batch passes **80/80 CTests in normal mode
+and 80/80 with matching MSVC ASan**, with no failures or skips. Both modes
+exercise genuine NTFS/ReFS objects, long paths, exact UTF-16 names, native
+close failures and first-error/allocation-denial behavior. The SDK and fixtures
+use matching static CRT, exception, RTTI and compiled native-close-hook profiles.
+
+Each of the 160 invocations records its actual native process ID and executable
+path before testing; the ASan invocations also record the loaded runtime module.
+All reports are checked from complete CTest output against the reviewed images
+and pinned runtime. This replaces an unreliable polling observer that missed
+short-lived processes; its earlier incomplete result remains retained.
+
+Seed setup formerly reused fixed child names in the shared scratch parent.
+Normal execution left those names occupied, so subsequent ASan setup correctly
+reported native AlreadyExists and aborted. Seed now uses an exclusively created
+workspace below the held parent and cleans only that owned workspace after
+confirmed child exit. The shared native helper retains the reader's 45-second
+child limit; Seed uses 285 seconds within its unchanged 300-second CTest limit.
+Twelve standalone native controls separately qualify success, nonzero exit and
+real timeout cleanup on both providers, including populated paths beyond 420
+UTF-16 units and raw surrogate names.
+
+The final incremental builds recompiled six fixture translation units and
+preserved all 145 other objects, installed SDK headers, libraries and DLLs in
+each mode. The [source-bound record](evidence/windows-native-close-runtime-20261110.json)
+contains the exact tested input and evidence hashes.
+
+This is a focused checkpoint. The unchanged whole-Windows source preflight still
+reports **26 findings across ten legacy fixture files**, with all 14 required
+fixture entrypoints retained. No findings were excluded or checks disabled.
+Production callback-free configuration, remaining filesystem/consumer coverage,
+whole Tree integration and frontend native-window acceptance retain their own
+qualification gates. This result does not authorize release or enable Apply.
+
 ## Windows combined snapshot
 
 The 347-file snapshot has input manifest SHA-256

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "../sync_session.hpp"
 #include "native_sync_session_lease.hpp"
+#include "native_windows_checked_close.hpp"
 #include "../sha256.hpp"
 #include "../windows_name.hpp"
 #include "native_windows_journal_volume.hpp"
@@ -85,7 +86,7 @@ PreparedJournalRoot::Pointer close_owner() noexcept {
 struct Close {
     PreparedJournalRoot::Pointer owner=close_owner();
     void operator()(void* h) const noexcept {
-        if(h&&h!=INVALID_HANDLE_VALUE&&!CloseHandle(h)) {
+        if(h&&h!=INVALID_HANDLE_VALUE&&!detail::close_windows_handle_once(h,"sync_session.directory_CloseHandle")) {
             const auto code=GetLastError();
             if(active_close_context&&(!owner||owner.get()==active_close_context->owner.get()))active_close_context->record(code,"sync_session.directory_CloseHandle");
             else if(owner)detail::record_prepared_journal_consumer_failure(*owner,
@@ -96,7 +97,7 @@ struct Close {
 using Handle=std::unique_ptr<void,Close>;
 bool consume_transient(Handle& handle,const char* operation,CloseContext& context) noexcept {
     const auto raw=handle.release();
-    if(CloseHandle(raw))return true;
+    if(detail::close_windows_handle_once(raw,operation))return true;
     const auto code=GetLastError();
     context.record(code,operation);
     return false;
@@ -578,7 +579,7 @@ public:
         if(release_&&!SetEvent(release_.get()))remember(GetLastError(),"sync_session.lock_event_signal");
         if(worker_.joinable())worker_.join();
         const auto event=release_.release();
-        if(event&&event!=INVALID_HANDLE_VALUE&&!CloseHandle(event))remember(GetLastError(),"sync_session.lock_event_close");
+        if(event&&event!=INVALID_HANDLE_VALUE&&!detail::close_windows_handle_once(event,"sync_session.lock_event_close"))remember(GetLastError(),"sync_session.lock_event_close");
         return failure_.load();
     }
     const char* finish_operation() const noexcept {return operation_;}
@@ -588,7 +589,7 @@ public:
         worker_=std::thread([this,name=L"Global\\ck-core-fs-sync-volume-v1-"+hex(volume),ready=std::move(ready)]() mutable {
             Handle mutex(CreateMutexW(nullptr,FALSE,name.c_str()));
             if(!mutex) { ready.set_value(GetLastError()); return; }
-            auto close=[&]{const auto raw=mutex.release();if(raw&&!CloseHandle(raw))remember(GetLastError(),"sync_session.volume_mutex_close");};
+            auto close=[&]{const auto raw=mutex.release();if(raw&&!detail::close_windows_handle_once(raw,"sync_session.volume_mutex_close"))remember(GetLastError(),"sync_session.volume_mutex_close");};
             const auto status=WaitForSingleObject(mutex.get(),0);
             if(status!=WAIT_OBJECT_0 && status!=WAIT_ABANDONED) {
                 ready.set_value(status==WAIT_TIMEOUT ? ERROR_LOCK_VIOLATION : GetLastError());close();return;
@@ -635,7 +636,7 @@ public:
         if(closed)return;closed=true;
         for(auto* chain:{&store,&left,&right})for(auto& node:*chain) {
             const auto handle=node.handle.release();if(!handle||handle==INVALID_HANDLE_VALUE)continue;
-            if(!CloseHandle(handle))remember_close(GetLastError(),"sync_session.directory_CloseHandle");
+            if(!detail::close_windows_handle_once(handle,"sync_session.directory_CloseHandle"))remember_close(GetLastError(),"sync_session.directory_CloseHandle");
             node.handle.get_deleter().owner.reset();
             try {if(faults.before&&!faults.before(SyncSessionIo::NativeHandleClose))remember_close(ERROR_WRITE_FAULT,"sync_session.directory_CloseHandle");}
             catch(...) {remember_close(ERROR_WRITE_FAULT,"sync_session.directory_CloseHandle");}

@@ -16,6 +16,8 @@
 #endif
 #include <windows.h>
 #include <sddl.h>
+#include "platform/native_windows_checked_close.hpp"
+#include "windows_test_runtime_self_report.hpp"
 #else
 #include <cerrno>
 #include <dirent.h>
@@ -86,7 +88,8 @@ struct Fixture {
         };
         const auto temp_path=normalized(std::wstring(temp,temp_length)),tmp_path=normalized(std::wstring(tmp,tmp_length));
         CHECK(temp_path==tmp_path && windows_extended_path(temp_path).has_value());
-        if(const auto* require_v=std::getenv("CK_FS_REQUIRE_V_DEV_DRIVE"); require_v && std::string_view(require_v)=="1") {
+        wchar_t require_v[2]{};
+        if(GetEnvironmentVariableW(L"CK_FS_REQUIRE_V_DEV_DRIVE",require_v,2)==1 && require_v[0]==L'1') {
             const auto drive=GetFileAttributesW(L"V:\\");
             CHECK(drive!=INVALID_FILE_ATTRIBUTES && (drive&FILE_ATTRIBUTE_DIRECTORY));
             CHECK(std::wstring_view(temp_path).starts_with(L"V:\\tmp\\"));
@@ -129,20 +132,42 @@ thread_local detail::PreparedJournalConsumerFailure first_allocation;
 #ifdef _WIN32
 FILE_ID_INFO selected{};
 std::atomic<bool> arm_mutex=false;
-std::atomic<HANDLE> closing_mutex=nullptr;
 std::atomic<unsigned> mutex_closes=0;
-BOOL WINAPI release_mutex(HANDLE h){using F=BOOL(WINAPI*)(HANDLE);static auto real=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"ReleaseMutex"));const auto ok=real(h);if(ok&&arm_mutex.exchange(false))closing_mutex=h;return ok;}
 thread_local HANDLE consumed=nullptr;
+thread_local bool selected_before_close=false;
 constexpr auto native_error=ERROR_READ_FAULT;
-auto real_close(){using F=BOOL(WINAPI*)(HANDLE);static auto f=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"CloseHandle"));return f;}
-BOOL WINAPI close_handle(HANDLE h){
+auto real_close(){return &::CloseHandle;}
+unsigned control_before=0,control_after=0;
+bool control_native_failed=false;
+DWORD control_native_error=0;
+bool control(const char* operation)noexcept{return !std::strncmp(operation,"test.sync.close.",16);}
+void before_close(void* raw,const char* operation,const char*)noexcept {
+ if(control(operation)){++control_before;SetLastError(ERROR_ACCESS_DENIED);return;}
+ const auto h=static_cast<HANDLE>(raw);
  if(h==consumed&&consumed){retried=true;++close_calls;}
- FILE_ID_INFO id{};const bool selected_handle=armed&&GetFileInformationByHandleEx(h,FileIdInfo,&id,sizeof(id))&&id.VolumeSerialNumber==selected.VolumeSerialNumber&&!std::memcmp(&id.FileId,&selected.FileId,sizeof(id.FileId));
- const auto ok=real_close()(h);const auto error=GetLastError();
- if(h==closing_mutex.load()&&ok){++mutex_closes;closing_mutex=nullptr;SetLastError(native_error);return FALSE;}
- if(selected_handle&&ok){armed=false;consumed=h;++hits;close_calls=1;oom=oom_on_close;SetLastError(native_error);return FALSE;}
- SetLastError(error);return ok;
+ FILE_ID_INFO id{};
+ selected_before_close=armed&&GetFileInformationByHandleEx(h,FileIdInfo,&id,sizeof(id))&&
+     id.VolumeSerialNumber==selected.VolumeSerialNumber&&!std::memcmp(&id.FileId,&selected.FileId,sizeof(id.FileId));
 }
+std::uint32_t after_close(void* raw,const char* operation,bool closed,std::uint32_t error)noexcept {
+ if(control(operation)){
+     ++control_after;control_native_failed=!closed;control_native_error=error;
+     SetLastError(ERROR_INVALID_DATA);
+     return closed?0:ERROR_CRC; // A real error must win over this attempted replacement.
+ }
+ if(!closed)return 0;
+ const auto h=static_cast<HANDLE>(raw);
+ if(!std::strcmp(operation,"sync_session.volume_mutex_close")&&arm_mutex.exchange(false)){
+     ++mutex_closes;return native_error;
+ }
+ if(selected_before_close){armed=false;consumed=h;++hits;close_calls=1;oom=oom_on_close;return native_error;}
+ return 0;
+}
+struct Hooks final {
+ detail::NativeCloseBefore previous_before=detail::native_close_test_before.exchange(before_close);
+ detail::NativeCloseAfter previous_after=detail::native_close_test_after.exchange(after_close);
+ ~Hooks(){detail::native_close_test_after.store(previous_after);detail::native_close_test_before.store(previous_before);}
+};
 void pin(const std::wstring& p){auto h=CreateFileW(Fixture::extended(p).c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);CHECK(h!=INVALID_HANDLE_VALUE);CHECK(GetFileInformationByHandleEx(h,FileIdInfo,&selected,sizeof(selected)));CHECK(real_close()(h));}
 #else
 struct stat selected{};
@@ -182,7 +207,7 @@ void operator delete[](void* p)noexcept{std::free(p);}
 void operator delete(void* p,std::size_t)noexcept{std::free(p);}
 void operator delete[](void* p,std::size_t)noexcept{std::free(p);}
 #ifdef _WIN32
-extern "C" {decltype(&CloseHandle) __imp_CloseHandle=&watch::close_handle;decltype(&ReleaseMutex) __imp_ReleaseMutex=&watch::release_mutex;}
+// Windows native calls use compiled observers; no imported-system-symbol override.
 #else
 extern "C" int close(int fd) noexcept(noexcept(::close(fd)))
 {return watch::close_file(fd);}
@@ -212,7 +237,9 @@ void read_case(bool allocation_failure,bool oversized){
  const auto baseline=stored(f,".baseline");watch::reset(root.get(),allocation_failure);watch::pin(baseline);watch::armed=true;bool threw=false,accepted=false;
  try{if(oversized){
 #ifdef _WIN32
- auto units=baseline.substr(baseline.find_last_of(L'\\')+1);std::string name(units.begin(),units.end());
+ auto units=baseline.substr(baseline.find_last_of(L'\\')+1);
+ std::string name;name.reserve(units.size());
+ for(const auto unit:units){CHECK(unit>0&&unit<=0x7f);name.push_back(static_cast<char>(unit));}
 #else
  auto name=baseline.substr(baseline.find_last_of('/')+1);
 #endif
@@ -241,6 +268,18 @@ void stage_case(bool allocation_failure){
  std::printf("PASS native flushed writer close consumed once oom=%d Root-first publication blocked\n",allocation_failure);
 }
 #ifdef _WIN32
+void native_close_controls(){
+ watch::control_before=watch::control_after=0;
+ CHECK(!detail::close_windows_handle_once(nullptr,"test.sync.close.real-error"));
+ CHECK(GetLastError()==ERROR_INVALID_HANDLE&&watch::control_native_failed&&watch::control_native_error==ERROR_INVALID_HANDLE);
+ CHECK(watch::control_before==1&&watch::control_after==1);
+ const auto owned=CreateEventW(nullptr,TRUE,FALSE,nullptr);CHECK(owned);
+ SetLastError(ERROR_BUSY);CHECK(detail::close_windows_handle_once(owned,"test.sync.close.success"));
+ CHECK(GetLastError()==watch::control_native_error&&!watch::control_native_failed);
+ CHECK(watch::control_before==2&&watch::control_after==2);
+ CHECK(WaitForSingleObject(owned,0)==WAIT_FAILED&&GetLastError()==ERROR_INVALID_HANDLE);
+ std::puts("PASS compiled close controls real-error precedence real-consumption observer-error-state isolation");
+}
 void lock_case(){
  Fixture f;auto root=take(acquire_native_sync_storage_root(address(f.store)));auto backend=take(open_native_sync_session_backend(root,address(f.left),address(f.right)));
  watch::reset(root.get(),false);watch::mutex_closes=0;watch::arm_mutex=true;
@@ -255,7 +294,12 @@ void terminal_case(){
  Fixture other;auto next=take(open_native_sync_session_backend(address(other.store),address(f.left),address(f.right)));CHECK(next->finish_io().value());std::puts("PASS native directory close Root-first before throwing callback and locks released");
 }
 }
-int main(){try{read_case(false,false);read_case(true,false);read_case(false,true);read_case(true,true);stage_case(false);stage_case(true);terminal_case();
+int main(){try{
+#ifdef _WIN32
+if(!ckfs_test::report_runtime_self("sync-session"))return 1;
+watch::Hooks hooks;native_close_controls();
+#endif
+read_case(false,false);read_case(true,false);read_case(false,true);read_case(true,true);stage_case(false);stage_case(true);terminal_case();
 #ifdef _WIN32
 lock_case();
 #endif

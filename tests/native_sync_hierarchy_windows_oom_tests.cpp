@@ -15,6 +15,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "windows_test_runtime_self_report.hpp"
 #include <cstring>
 #include <stdexcept>
 #include <malloc.h>
@@ -159,7 +160,7 @@ void terminate_stack()noexcept {
  for(USHORT i=0;i<count;++i){std::uintptr_t value=reinterpret_cast<std::uintptr_t>(frames[i]);if(value>=base)value-=base;char line[20]="0x0000000000000000\n";for(unsigned n=0;n<16;++n){const auto x=static_cast<unsigned>(value&15);line[17-n]="0123456789abcdef"[x];value>>=4;}DWORD wrote=0;WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,19,&wrote,nullptr);}
  ExitProcess(91);
 }
-int main(){std::set_terminate(terminate_stack);try{close_fault::ScopedObservers observers;
+int main(){if(!ckfs_test::report_runtime_self("sync-hierarchy"))return 1;std::set_terminate(terminate_stack);try{close_fault::ScopedObservers observers;
  raw_text("BEGIN epoch_constructor\n");epoch_constructor();
  raw_text("BEGIN session_finish\n");session_failure(false);
  raw_text("BEGIN session_commit\n");session_failure(true);

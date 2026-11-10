@@ -2,6 +2,13 @@
 
 ## Unreleased 0.5 development checkpoint
 
+- Replace the Copy, target-read Seed, Sync and held-journal-reader Windows
+  close fault imports with compiled observers after genuine native operations.
+  Qualify 80 focused cases on NTFS/ReFS in each normal and matching ASan mode,
+  including real close failures, first-error retention and allocation denial.
+  Give Seed invocations exclusively created native workspaces and retain
+  per-invocation executable/ASan-module evidence. Remaining legacy fixtures
+  and the complete Windows qualification gate stay open.
 - Add worker-owned stable C Actions-with-Root, Trash/restore, and verified
   retry/prefix-copy jobs with one-use review and explicit native drain.
 - Add V3 semantic metadata evidence, bounded native source capture, independent

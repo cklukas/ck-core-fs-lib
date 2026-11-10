@@ -76,13 +76,45 @@ void report_capture_close(DWORD code,const char* operation)noexcept {
 }
 // Failure injection observes a real consumed close; it cannot skip the OS call.
 bool close_native_consumer_handle(HANDLE handle,const char* operation)noexcept {
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+    (void)operation;return CloseHandle(handle)!=FALSE;
+#else
+    const DWORD before=GetLastError();
     detail::observe_native_close(handle,operation);
-    const BOOL native_ok=CloseHandle(handle);
-    const DWORD native_error=native_ok?ERROR_SUCCESS:GetLastError();
+    SetLastError(before);const BOOL native_ok=CloseHandle(handle);
+    const DWORD saved=GetLastError();
+    const DWORD native_error=native_ok?ERROR_SUCCESS:saved;
     const auto injected=detail::inject_native_close_failure(handle,operation,native_ok!=FALSE,native_error);
     if(!native_ok){SetLastError(native_error);return false;}
     if(injected){SetLastError(injected);return false;}
-    return true;
+    SetLastError(saved);return true;
+#endif
+}
+// Preserve native LastError around observation-only callbacks. These helpers
+// execute exactly one native operation; neither callback can replace its result.
+bool read_native_consumer_file(HANDLE handle,void* bytes,DWORD count,DWORD* copied,const char* operation)noexcept {
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+    (void)operation;return ReadFile(handle,bytes,count,copied,nullptr)!=FALSE;
+#else
+    const DWORD before=GetLastError();
+    detail::observe_native_file_before(handle,detail::NativeTestIo::Read,count,operation);
+    SetLastError(before);const BOOL okay=ReadFile(handle,bytes,count,copied,nullptr);
+    const DWORD error=GetLastError();
+    detail::observe_native_file_after(handle,detail::NativeTestIo::Read,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);
+    SetLastError(error);return okay!=FALSE;
+#endif
+}
+bool write_native_consumer_file(HANDLE handle,const void* bytes,DWORD count,DWORD* written,const char* operation)noexcept {
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+    (void)operation;return WriteFile(handle,bytes,count,written,nullptr)!=FALSE;
+#else
+    const DWORD before=GetLastError();
+    detail::observe_native_file_before(handle,detail::NativeTestIo::Write,count,operation);
+    SetLastError(before);const BOOL okay=WriteFile(handle,bytes,count,written,nullptr);
+    const DWORD error=GetLastError();
+    detail::observe_native_file_after(handle,detail::NativeTestIo::Write,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);
+    SetLastError(error);return okay!=FALSE;
+#endif
 }
 struct HandleCloser {
     void operator()(void* handle) const noexcept {
@@ -683,7 +715,7 @@ public:
         if(capture_close_started_){if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);return;}
         capture_close_started_=true;
         if(writable_){capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_capture.writer_not_read_owner"};}
-        else {finished_=true;const HANDLE h=handle_.release();if(h&&h!=INVALID_HANDLE_VALUE&&!CloseHandle(h)){const auto e=GetLastError();capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,e,"metadata_capture.channel_CloseHandle"};report_capture_close(e,"metadata_capture.channel_CloseHandle");}}
+        else {finished_=true;const HANDLE h=handle_.release();if(h&&h!=INVALID_HANDLE_VALUE&&!close_native_consumer_handle(h,"metadata_capture.channel_CloseHandle")){const auto e=GetLastError();capture_close_error_=MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,e,"metadata_capture.channel_CloseHandle"};report_capture_close(e,"metadata_capture.channel_CloseHandle");}}
         if(capture_close_error_)detail::record_metadata_capture_close(*capture_close_error_);
         target_read_consumer_.reset();
     }
@@ -779,7 +811,7 @@ public:
             LARGE_INTEGER position{}; position.QuadPart = static_cast<LONGLONG>(offset);
             if (!SetFilePointerEx(handle_.get(), position, nullptr, FILE_BEGIN))
                 return failure<ContentRead>(GetLastError(), "content.seek");
-            if (count && !ReadFile(handle_.get(), bytes.data(), count, &copied, nullptr))
+            if (count && !read_native_consumer_file(handle_.get(), bytes.data(), count, &copied, "content.ReadFile"))
                 return failure<ContentRead>(GetLastError(), "content.ReadFile");
         }
         bytes.resize(copied);
@@ -820,7 +852,7 @@ public:
         if (!SetFilePointerEx(handle_.get(), position, nullptr, FILE_BEGIN))
             return failure<std::size_t>(GetLastError(), "content.write_seek");
         DWORD written = 0;
-        if (!WriteFile(handle_.get(), bytes.data(), static_cast<DWORD>(std::min(bytes.size(), static_cast<std::size_t>(MAXDWORD))), &written, nullptr))
+        if (!write_native_consumer_file(handle_.get(), bytes.data(), static_cast<DWORD>(std::min(bytes.size(), static_cast<std::size_t>(MAXDWORD))), &written, "content.WriteFile"))
             return failure<std::size_t>(GetLastError(), "content.WriteFile");
         if (stop.stop_requested())
             return Result::unavailable(ObservationState::Unknown,
@@ -887,9 +919,9 @@ public:
         // data writer. Consume both owners first so destructors cannot retry.
         const HANDLE security=security_handle_.release();
         const HANDLE writer=handle_.release();
-        const DWORD security_error=!security || security==INVALID_HANDLE_VALUE || CloseHandle(security) ? ERROR_SUCCESS : GetLastError();
+        const DWORD security_error=!security || security==INVALID_HANDLE_VALUE || close_native_consumer_handle(security,"content.finish_security_close") ? ERROR_SUCCESS : GetLastError();
         const DWORD flush_error=FlushFileBuffers(writer) ? ERROR_SUCCESS : GetLastError();
-        const DWORD close_error=CloseHandle(writer) ? ERROR_SUCCESS : GetLastError();
+        const DWORD close_error=close_native_consumer_handle(writer,"content.finish_CloseHandle") ? ERROR_SUCCESS : GetLastError();
         if(channel_error)finish_result_=std::move(*channel_error);
         else if(channel_exception)finish_result_=Observation<bool>::unavailable(ObservationState::Failed,
             {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"content.finish_channel_exception"});
@@ -910,7 +942,7 @@ public:
         else {
             finish_started_=true;content_access_=false;layout_access_=false;
             const HANDLE security=security_handle_.release(),data=handle_.release();
-            for(const HANDLE h:{security,data})if(h&&h!=INVALID_HANDLE_VALUE&&!CloseHandle(h)){
+            for(const HANDLE h:{security,data})if(h&&h!=INVALID_HANDLE_VALUE&&!close_native_consumer_handle(h,"metadata_capture.source_CloseHandle")){
                 const MetadataCaptureCleanupError e{ObservationState::Failed,ErrorDomain::Win32,GetLastError(),"metadata_capture.source_CloseHandle"};
                 if(!capture_close_error_)capture_close_error_=e;report_capture_close(static_cast<DWORD>(e.code),e.operation);
             }

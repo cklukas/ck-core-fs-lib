@@ -11,6 +11,19 @@ enum class NativeTestIo {Query,Read,Write,Flush,WorkerStart,PendingWait,InputDra
 using NativeIoObserver=void(*)(NativeTestIo)noexcept;
 inline std::atomic<NativeIoObserver> native_test_io_observer{nullptr};
 inline void observe_native_test_io(NativeTestIo op)noexcept{if(const auto f=native_test_io_observer.load(std::memory_order_acquire))f(op);}
+// Observation only: callbacks cannot replace a native result, alter bytes, or
+// skip I/O. The after notification preserves the exact post-native boundary
+// needed to arm allocation failure before a journal's subsequent revalidation.
+using NativeFileIoBefore=void(*)(void*,NativeTestIo,std::uint32_t,const char*) noexcept;
+using NativeFileIoAfter=void(*)(void*,NativeTestIo,bool,std::uint32_t,const char*) noexcept;
+inline std::atomic<NativeFileIoBefore> native_file_test_before{nullptr};
+inline std::atomic<NativeFileIoAfter> native_file_test_after{nullptr};
+inline void observe_native_file_before(void* handle,NativeTestIo op,std::uint32_t count,const char* operation)noexcept {
+ if(const auto f=native_file_test_before.load(std::memory_order_acquire))f(handle,op,count,operation);
+}
+inline void observe_native_file_after(void* handle,NativeTestIo op,bool succeeded,std::uint32_t error,const char* operation)noexcept {
+ if(const auto f=native_file_test_after.load(std::memory_order_acquire))f(handle,op,succeeded,error,operation);
+}
 using NativeCloseBefore=void(*)(void*,const char*,const char*) noexcept;
 using NativeCloseAfter=std::uint32_t(*)(void*,const char*,bool,std::uint32_t) noexcept;
 inline std::atomic<NativeCloseBefore> native_close_test_before{nullptr};
@@ -30,6 +43,8 @@ inline std::uint32_t inject_native_close_failure(void* handle,const char* operat
 }
 #else
 inline void observe_native_test_io(NativeTestIo)noexcept{}
+inline void observe_native_file_before(void*,NativeTestIo,std::uint32_t,const char*)noexcept{}
+inline void observe_native_file_after(void*,NativeTestIo,bool,std::uint32_t,const char*)noexcept{}
 struct NativeCloseRoleScope final {explicit NativeCloseRoleScope(const char*)noexcept{}};
 inline void observe_native_close(void*,const char*)noexcept{}
 inline std::uint32_t inject_native_close_failure(void*,const char*,bool,std::uint32_t)noexcept{return 0;}

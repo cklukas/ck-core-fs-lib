@@ -1,0 +1,96 @@
+{
+  "date": "2026-11-10",
+  "status": "FOCUSED_NATIVE_WINDOWS_BATCH_PASS_NOT_RELEASE_QUALIFICATION",
+  "base_backend": "fc56de16433cf7066c344f8c052debc7e6197535",
+  "frontend_runtime_inputs": "2c5296225268f740468ec5a17ab554778335ec7c",
+  "source_packet_sha256": "c718377f2c10e1530217fc8b3cdf2f584e5bf499be04751a7665090ccb7a162c",
+  "native_runtime_receipt_sha256": "3faa46cbe894e13ba5c67053f75d07a62a655f3f278732b7d195600e4c4565eb",
+  "durable_packet": "windows-native-close-runtime-20261110-43c9888q",
+  "durable_manifest_sha256": "8cbb19cafe6baf020df93ac1057db0eeabc9c102da35f79a40f018e2a571f94a",
+  "profiles": "MSVC14.44.35207 x64 Release staticCRT/MT, RTTI/GR, exceptions/EHsc, nativeclosehooks uniform across wholeSDK and fixtures; ASan fsanitize=address and pinned app-local runtime",
+  "ASan_runtime_sha256": "3aa742521e8cbd23252f0545aa51d5a15624a3e4430fbe2f81567afaeb3fc59b",
+  "modes": [
+    {
+      "mode": "normal",
+      "cases": 80,
+      "native_invocation_reports": 80,
+      "images": 6,
+      "failures": 0,
+      "skips": 0,
+      "xml_sha256": "6d98a7d8ccdeaec507a703deb44a783223cd7455684e3f0258f4cc1e1337fb9d",
+      "full_log_sha256": "d63db3606465e968ac3a77b084ada0254f43764fc8f05c2851ba9cf6e85696f9"
+    },
+    {
+      "mode": "asan",
+      "cases": 80,
+      "native_invocation_reports": 80,
+      "images": 6,
+      "failures": 0,
+      "skips": 0,
+      "xml_sha256": "592cbb3b4211e6f6786c32b71023664b4726c44baf1bbf61463aac776e5eedef",
+      "full_log_sha256": "9ac541db902236aaf61143d56d289e51f5e85fe17d9c75858bb9dcd7ff0da152"
+    }
+  ],
+  "test_elapsed_seconds": {
+    "normal-ctest": 100.88598550017923,
+    "asan-ctest": 183.56512100016698
+  },
+  "workspace_controls": {
+    "cases": 12,
+    "providers": [
+      "NTFS",
+      "ReFS"
+    ],
+    "profiles": {
+      "reader": {
+        "child_timeout": 45,
+        "kill_wait": 3,
+        "cleanup": 5,
+        "ctest": 60
+      },
+      "seed": {
+        "child_timeout": 285,
+        "kill_wait": 3,
+        "cleanup": 5,
+        "ctest": 300
+      }
+    },
+    "scope": "Normal standalone control; actual success/nonzero/timeout, native-owned fresh children, long/rawUTF16 and exact cleanup; not a substitute for SDK normal/ASan cases."
+  },
+  "runtime_input_files_sha256": {
+    "CMakeLists.txt": "7b500107a6d4519a75ce6347e743be18adb2d7c3d41f7e83bb0b6e20258e10f3",
+    "cmake/HeldOperationJournalReaderWindowsTests.cmake": "2d037766c04e669b8e7531ec88b406d77e162f6d495dd2e380dca2fb586a0652",
+    "tests/native_fixture_workspace_windows.py": "56534af5f5b06e48b9fcf583f947dd7e79778b51fe293d2d1baa957c1c82506e",
+    "tests/reader_close_windows_fixture.hpp": "d7af8a474cd59e846186283ac8d0e8569ecab074811588d3b2af13cdc888f1ae",
+    "tests/files_operation_recovery_windows_close_tests.cpp": "0c6ec3a453d8ae0ea95cd283e88185799879b1513f85a46a681a516b620d5c30",
+    "tests/native_copy_source_close_windows_tests.cpp": "14f31d5d1b932b04f2d0dcacef78ecb021dd9e16af0daab02ae1f26057c50dd4",
+    "tests/sync_session_native_close_tests.cpp": "836a40339df97fb6cfdce0e087b391e99cafc1092b176f6f88ff460e0cec2402",
+    "tests/run_seed_close_fixture_windows.py": "b317371a137a348eeeb08814aa470c20005cb3ddb9941a5989019e1fa0d9efa6",
+    "tests/reader_close_windows_allocator.cpp": "1d5d81eaccd9afdecb7558b235ee364a78f3b42b13a0672a22890264cd14cf87",
+    "tests/native_directory_replay_job_tests.cpp": "e277174fabd47c80088600fc94612e3178055115cd96a5f56da0409bf94f8fa9",
+    "tests/native_sync_hierarchy_windows_oom_tests.cpp": "ab93508c60a1283a257718095b6f599a083f349bf4e19d2bcf15c597e270cbe2",
+    "tests/run_reader_close_fixture_windows.py": "9976ca63da8036fec464de372ce6a5ffca6518e2bafe928bd2db87e4973602cc",
+    "tests/held_operation_journal_reader_windows_close_tests.cpp": "e3694f7f3f293aace2c7426f8ac0dfa4cdc27270a52871967f1a81310fd7c9ae",
+    "tests/reader_close_windows_fixture.cpp": "4de604102e686a0aaefc2936d53e96543d1f96b7853b857bae15a7cbf98a91a4",
+    "tests/windows_test_runtime_self_report.hpp": "760c399208d4752a363c0483398ebeb4018f92e1422fbb5eed76b01995d0488e",
+    "tests/target_read_seed_tests.cpp": "136fc41ceded09b9a23688940a2245b2febb674f7b4ff5aaadcc77250fc01945",
+    "src/files/platform/metadata_windows.cpp": "c6cbb7a0f4781607409f6af9796da1a1799ac441b63f6c3d6887b01f906783a0",
+    "src/files/platform/sync_session_windows.cpp": "b855d8b86cc2fbd53da2f08efe6d583ea326875d1359b4c21e4174f9c16c1308",
+    "src/files/platform/native_windows_checked_close.hpp": "dfe0804244c58fa6d1e32058a426bcbfcf93848905bb7b304f865155c2fbffca",
+    "src/files/platform/operation_journal_file_windows.cpp": "2c0470159ee1c82bf3c077890b61d57c7beced46cb6495262ec425a93a2e4258",
+    "src/files/platform/native_close_test_faults.hpp": "5729e44cf0c530b6ca9bf33f0cc5e747d630ccbedf7f4b23c6476c48f7296951"
+  },
+  "remaining_windows_source_gate": {
+    "findings": 26,
+    "files": 10,
+    "required_legacy_entrypoints_retained": 14,
+    "state": "BLOCKED"
+  },
+  "remaining": [
+    "Callback-free production configuration qualification",
+    "Whole Windows source/native/provider/installed consumer matrix",
+    "Whole Tree receipt integration",
+    "Frontend native-window interactive acceptance"
+  ],
+  "publication": "Development checkpoint only; no release, frontend dependency pin or Apply approval."
+}

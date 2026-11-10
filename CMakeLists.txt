@@ -1128,3 +1128,10 @@ if(BUILD_TESTING AND WIN32)
       SCRATCH_ROOT "${CK_CORE_FS_NATIVE_TEST_ROOT}" EXPECTED_FS "${CK_CORE_FS_ARCHIVE_TEST_FS}")
   endif()
 endif()
+
+# Explicit focused batch with a pinned real frontend controller; this does not
+# unblock or exclude any legacy Windows fixture or its source safety gate.
+option(CK_CORE_FS_TEST_READER_CLOSE_WINDOWS "Register coherent reader native close qualification" OFF)
+if(CK_CORE_FS_TEST_READER_CLOSE_WINDOWS)
+  include(cmake/HeldOperationJournalReaderWindowsTests.cmake)
+endif()

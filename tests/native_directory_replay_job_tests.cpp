@@ -433,10 +433,10 @@ void operator delete(void* pointer)noexcept{std::free(pointer);}
 void operator delete[](void* pointer)noexcept{std::free(pointer);}
 void operator delete(void* pointer,std::size_t)noexcept{std::free(pointer);}
 void operator delete[](void* pointer,std::size_t)noexcept{std::free(pointer);}
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(CKFS_DIRECTORY_FIXTURE_NO_RUNTIME_OVERRIDES)
 extern "C" BOOL (WINAPI* __imp_FlushFileBuffers)(HANDLE)=observed_flush;
 int wmain(int argc,wchar_t** argv){CHECK(argc==2);run(std::filesystem::path(argv[1]));return 0;}
-#else
+#elif !defined(_WIN32)
 extern "C" int fsync(int fd){return observed_fsync(fd);}
 int main(int argc,char** argv){CHECK(argc==2);run(std::filesystem::path(argv[1]));return 0;}
 #endif

@@ -1,22 +1,50 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
+#ifdef _WIN32
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+#error Rebuild the complete SDK and this fixture with matching compiled native-close hooks.
+#endif
+#endif
+#include "platform/native_close_test_faults.hpp"
+// Reuse the genuine fixture/setup without inheriting its standalone flush import
+// override. That legacy fixture keeps its own entrypoint and migration finding.
+#define CKFS_DIRECTORY_FIXTURE_NO_RUNTIME_OVERRIDES
 #define CKFS_DIRECTORY_WORKER_TEST_SUPPORT
 #include "directory_postorder_worker_tests.cpp"
 #undef CKFS_DIRECTORY_WORKER_TEST_SUPPORT
+#undef CKFS_DIRECTORY_FIXTURE_NO_RUNTIME_OVERRIDES
 #include "platform/native_target_read_seed.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
+#ifdef _WIN32
+#include "windows_test_runtime_self_report.hpp"
+#endif
 namespace {
 MetadataCaptureBudget* close_budget=nullptr;
 std::size_t close_reservations=0;
 unsigned budgeted_closes=0;
 bool consume_close_failure=false;
-BOOL WINAPI seed_budget_close(HANDLE handle){
- using F=BOOL(WINAPI*)(HANDLE);static const auto real=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"CloseHandle"));
- if(close_budget){CHECK(close_budget->retained_handle_reservations()==close_reservations);++budgeted_closes;}
- const auto result=real(handle);
- if(result&&consume_close_failure){consume_close_failure=false;SetLastError(ERROR_ACCESS_DENIED);return FALSE;}
- return result;
+FILE_ID_INFO budget_identity{};
+thread_local void* budget_closing=nullptr;
+void seed_budget_before(void* handle,const char*,const char*)noexcept {
+ budget_closing=nullptr;
+ if(close_budget){
+  CHECK(close_budget->retained_handle_reservations()==close_reservations);
+  FILE_ID_INFO observed{};CHECK(GetFileInformationByHandleEx(handle,FileIdInfo,&observed,sizeof(observed)));
+  CHECK(observed.VolumeSerialNumber==budget_identity.VolumeSerialNumber&&
+   std::memcmp(observed.FileId.Identifier,budget_identity.FileId.Identifier,16)==0);
+  ++budgeted_closes;budget_closing=handle;
+ }
 }
+std::uint32_t seed_budget_after(void* handle,const char*,bool native_ok,std::uint32_t)noexcept {
+ const bool selected=budget_closing==handle;budget_closing=nullptr;
+ if(selected&&native_ok&&consume_close_failure){consume_close_failure=false;return ERROR_ACCESS_DENIED;}
+ return 0; // The provider always preserves a real native close error.
+}
+struct SeedBudgetObservers final {
+ SeedBudgetObservers(){CHECK(!detail::native_close_test_before.load()&&!detail::native_close_test_after.load());detail::native_close_test_before.store(seed_budget_before);detail::native_close_test_after.store(seed_budget_after);}
+ ~SeedBudgetObservers(){detail::native_close_test_after.store(nullptr);detail::native_close_test_before.store(nullptr);close_budget=nullptr;}
+ SeedBudgetObservers(const SeedBudgetObservers&)=delete;SeedBudgetObservers& operator=(const SeedBudgetObservers&)=delete;
+};
 class SeedLatch final:public MetadataCaptureFailureLatch {
 public:
  explicit SeedLatch(PreparedJournalRoot::Pointer root):root_(std::move(root)){}
@@ -46,6 +74,10 @@ void directory_clone_budget(const std::filesystem::path& path,bool complete,bool
  copy_payload(f,cursor);file(cursor,name("late-second"));file(cursor,name("late-third"));payload_target=take(HeldChild::observe_with_access(cursor,name("payload"),EntryAccess::ContentRead));children_done=true;
  CHECK(take(job->children_finished()));bounded_await(*job,DirectoryReplayPhase::Complete);CHECK(seed&&proof->io_finished());
  auto entry=take(seed->source());
+ const auto actual_target=take(entry->inspect_basic());CHECK(actual_target.identity.value());
+ CHECK(actual_target.identity.value()->scheme==IdentityScheme::WindowsFileId128);
+ std::memcpy(&budget_identity.VolumeSerialNumber,actual_target.identity.value()->volume.bytes.data(),8);
+ std::memcpy(budget_identity.FileId.Identifier,actual_target.identity.value()->object.bytes.data(),16);
  // This is a chain of actual native capture clones (DuplicateHandle), NOT
  // shared_ptr copies. Each new native owner consumes exactly one reservation.
  const auto baseline=budget->retained_handle_reservations();
@@ -157,8 +189,7 @@ void directory_seed(const std::filesystem::path& path,bool complete){
 }
 }
 #ifdef _WIN32
-extern "C" {decltype(&CloseHandle) __imp_CloseHandle=&seed_budget_close;}
-int wmain(int argc,wchar_t** argv){CHECK(argc==2||argc==3);
+int wmain(int argc,wchar_t** argv){if(!ckfs_test::report_runtime_self("target-seed"))return 1;CHECK(argc==2||argc==3);SeedBudgetObservers observers;
  if(argc==3&&std::wstring_view(argv[2])==L"--fixture-address-only") {
   const auto address=fixture_native_address(std::filesystem::path(argv[1]));
   const auto path=extended_address(address);const auto* units=address.windows_units();CHECK(units);

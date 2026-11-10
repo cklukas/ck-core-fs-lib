@@ -33,6 +33,35 @@
 
 namespace ck::files {
 namespace {
+// Regression observers bracket the same native call and cannot turn failure
+// into success. Always preserve the OS result/error before invoking callbacks.
+bool close_native_consumer_handle(HANDLE handle,const char* operation)noexcept {
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+    (void)operation;return CloseHandle(handle)!=FALSE;
+#else
+    const DWORD before=GetLastError();
+    detail::observe_native_close(handle,operation);
+    SetLastError(before);const BOOL native_ok=CloseHandle(handle);
+    const DWORD saved=GetLastError();
+    const DWORD native_error=native_ok?ERROR_SUCCESS:saved;
+    const auto injected=detail::inject_native_close_failure(handle,operation,native_ok!=FALSE,native_error);
+    if(!native_ok){SetLastError(native_error);return false;}
+    if(injected){SetLastError(injected);return false;}
+    SetLastError(saved);return true;
+#endif
+}
+bool write_native_consumer_file(HANDLE handle,const void* bytes,DWORD count,DWORD* written,const char* operation)noexcept {
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+    (void)operation;return WriteFile(handle,bytes,count,written,nullptr)!=FALSE;
+#else
+    const DWORD before=GetLastError();
+    detail::observe_native_file_before(handle,detail::NativeTestIo::Write,count,operation);
+    SetLastError(before);const BOOL okay=WriteFile(handle,bytes,count,written,nullptr);
+    const DWORD error=GetLastError();
+    detail::observe_native_file_after(handle,detail::NativeTestIo::Write,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);
+    SetLastError(error);return okay!=FALSE;
+#endif
+}
 struct Close {
     void operator()(void* value) const noexcept {
         if(value&&value!=INVALID_HANDLE_VALUE){
@@ -237,7 +266,7 @@ public:
         if (!SetFilePointerEx(file_.get(), at, nullptr, FILE_BEGIN)) return io_failure<std::size_t>(GetLastError(), "journal_file.write_seek");
         DWORD count{};
         detail::observe_native_test_io(detail::NativeTestIo::Write);
-        if (!WriteFile(file_.get(), bytes.data(), static_cast<DWORD>(std::min(bytes.size(), static_cast<std::size_t>(MAXDWORD))), &count, nullptr))
+        if (!write_native_consumer_file(file_.get(), bytes.data(), static_cast<DWORD>(std::min(bytes.size(), static_cast<std::size_t>(MAXDWORD))), &count, "journal_file.WriteFile"))
             return io_failure<std::size_t>(GetLastError(), "journal_file.WriteFile");
         auto after=revalidate();
         if(!after.value())return unavailable_read<std::size_t>(after);
@@ -377,9 +406,9 @@ private:
     }
     void close_handles() noexcept {
         const auto file=file_.release();
-        if(file&&file!=INVALID_HANDLE_VALUE) {if(!CloseHandle(file))remember_close(GetLastError(),"journal_file.CloseHandle");observe_close_fault();}
+        if(file&&file!=INVALID_HANDLE_VALUE) {if(!close_native_consumer_handle(file,"journal_file.CloseHandle"))remember_close(GetLastError(),"journal_file.CloseHandle");observe_close_fault();}
         const auto directory=directory_.release();
-        if(directory&&directory!=INVALID_HANDLE_VALUE&&!CloseHandle(directory))remember_close(GetLastError(),"journal_file.parent_CloseHandle");
+        if(directory&&directory!=INVALID_HANDLE_VALUE&&!close_native_consumer_handle(directory,"journal_file.parent_CloseHandle"))remember_close(GetLastError(),"journal_file.parent_CloseHandle");
     }
     Observation<bool> finish_result() const {
         detail::PreparedJournalConsumerFailure cached{};

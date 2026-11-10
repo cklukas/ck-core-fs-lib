@@ -1,12 +1,17 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
-// Native base-source close regression. Upstream persistent-OOM mode is also
-// built against the untouched 401 SDK, without any header changes.
+// Native base-source close regression. SDK and fixture require one coherent
+// compiled-hook build; no system import or runtime memory patch is used.
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+#error Rebuild the complete SDK and this fixture with matching compiled native-close hooks.
+#endif
+#include "platform/native_close_test_faults.hpp"
 #include "native_operation_copy_job.hpp"
 #include "native_filesystem.hpp"
 #include "metadata_capture_job.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
 #include <windows.h>
+#include "windows_test_runtime_self_report.hpp"
 #include <dbghelp.h>
 #include <atomic>
 #include <bit>
@@ -341,30 +346,48 @@ bool matches(HANDLE h,const FILE_ID_INFO& expected)noexcept {
  if(!expected.VolumeSerialNumber)return false;FILE_ID_INFO current{};
  return GetFileInformationByHandleEx(h,FileIdInfo,&current,sizeof(current))&&same_id(current,expected);
 }
-BOOL WINAPI capture_read(HANDLE h,LPVOID data,DWORD size,LPDWORD count,LPOVERLAPPED overlapped) {
- using Fn=BOOL(WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED);
- static const auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"ReadFile"));
- const auto before=GetLastError();if(auto* w=native_watch;w&&size&&matches(h,w->source_id)){
+void before_file(void* h,detail::NativeTestIo op,std::uint32_t count,const char*)noexcept {
+ auto* w=native_watch;if(!w)return;
+ if(op==detail::NativeTestIo::Read&&count&&matches(h,w->source_id)){
   if(w->source&&w->source!=h){persistent_oom=false;std::fputs("multiple base source read handles\n",stderr);std::abort();}
   w->source=h;++w->source_reads;
- }SetLastError(before);return real(h,data,size,count,overlapped);
+ }
+ if(op==detail::NativeTestIo::Write){if(matches(h,w->journal_id))w->journal_handle=h;else if(matches(h,w->stage_id))w->stage=h;}
 }
-BOOL WINAPI capture_write(HANDLE h,LPCVOID data,DWORD size,LPDWORD count,LPOVERLAPPED overlapped) {
- using Fn=BOOL(WINAPI*)(HANDLE,LPCVOID,DWORD,LPDWORD,LPOVERLAPPED);
- static const auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"WriteFile"));
- const auto before=GetLastError();if(auto* w=native_watch){if(matches(h,w->journal_id))w->journal_handle=h;else if(matches(h,w->stage_id))w->stage=h;}
- SetLastError(before);const BOOL ok=real(h,data,size,count,overlapped);const auto error=GetLastError();if(auto* w=native_watch;w&&ok&&h==w->journal_handle&&w->protocol&&w->source_reads&&!w->protocol_triggered){w->protocol_triggered=true;persistent_oom=true;}SetLastError(error);return ok;
+void after_file(void* h,detail::NativeTestIo op,bool okay,std::uint32_t,const char*)noexcept {
+ // Preserve the original failure point: after the exact real journal WriteFile
+ // succeeded, before its subsequent native revalidation/diagnostic allocation.
+ if(auto* w=native_watch;w&&op==detail::NativeTestIo::Write&&okay&&h==w->journal_handle&&w->protocol&&w->source_reads&&!w->protocol_triggered){w->protocol_triggered=true;persistent_oom=true;}
 }
-BOOL WINAPI capture_close(HANDLE h) {
- using Fn=BOOL(WINAPI*)(HANDLE);static const auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"CloseHandle"));
- auto* w=native_watch;const auto before=GetLastError();if(w&&w->reuse_guard_active&&h==w->source)w->retried=true;const bool source=w&&h==w->source&&matches(h,w->source_id);
- if(w&&w->consumed&&h==w->source){DWORD flags=0;if(!GetHandleInformation(h,&flags)&&GetLastError()==ERROR_INVALID_HANDLE)w->retried=true;}
- const bool stage=w&&h==w->stage&&matches(h,w->stage_id),journal=w&&h==w->journal_handle&&matches(h,w->journal_id);
- SetLastError(before);const BOOL ok=real(h);const auto error=GetLastError();
+thread_local NativeWatch* closing_watch=nullptr;
+thread_local void* closing_handle=nullptr;
+thread_local bool closing_source=false,closing_stage=false,closing_journal=false;
+void before_close(void* h,const char*,const char*)noexcept {
+ auto* w=native_watch;closing_watch=w;closing_handle=h;closing_source=closing_stage=closing_journal=false;
+ if(!w)return;
+ if(w->reuse_guard_active&&h==w->source)w->retried=true;
+ if(w->consumed&&h==w->source){DWORD flags=0;if(!GetHandleInformation(h,&flags)&&GetLastError()==ERROR_INVALID_HANDLE)w->retried=true;}
+ closing_source=h==w->source&&matches(h,w->source_id);
+ closing_stage=h==w->stage&&matches(h,w->stage_id);
+ closing_journal=h==w->journal_handle&&matches(h,w->journal_id);
+}
+std::uint32_t after_close(void* h,const char*,bool okay,std::uint32_t)noexcept {
+ auto* w=closing_watch;const bool source=closing_source,stage=closing_stage,journal=closing_journal;
+ if(closing_handle!=h||w!=native_watch){persistent_oom=false;std::abort();}
+ closing_watch=nullptr;closing_handle=nullptr;closing_source=closing_stage=closing_journal=false;
  if(w){if(stage){++w->stage_closes;w->allocations_at_stage_close=w->oom_allocations;}if(journal)++w->journal_closes;if(source){++w->source_closes;w->consumed=true;if(w->journal){const auto state=w->journal->state(0);if(state)w->state_at_source_close=*state;}
-   if(ok&&w->fault){persistent_oom=w->oom;SetLastError(ERROR_READ_FAULT);return FALSE;}
- }}SetLastError(error);return ok;
+   if(okay&&w->fault){persistent_oom=w->oom;return ERROR_READ_FAULT;}
+ }}return 0; // A real native failure is never replaced or suppressed.
 }
+struct CompiledObservers final {
+ CompiledObservers(){
+  if(detail::native_close_test_before.load()||detail::native_close_test_after.load()||detail::native_file_test_before.load()||detail::native_file_test_after.load())throw std::runtime_error("native observer already installed");
+  detail::native_file_test_before.store(before_file);detail::native_file_test_after.store(after_file);
+  detail::native_close_test_before.store(before_close);detail::native_close_test_after.store(after_close);
+ }
+ ~CompiledObservers(){persistent_oom=false;detail::native_close_test_after.store(nullptr);detail::native_close_test_before.store(nullptr);detail::native_file_test_after.store(nullptr);detail::native_file_test_before.store(nullptr);}
+ CompiledObservers(const CompiledObservers&)=delete;CompiledObservers& operator=(const CompiledObservers&)=delete;
+};
 FILE_ID_INFO native_id(const ObjectIdentity& value){FILE_ID_INFO result{};std::memcpy(&result.VolumeSerialNumber,value.volume.bytes.data(),8);std::memcpy(result.FileId.Identifier,value.object.bytes.data(),16);return result;}
 struct BorrowProbe final {
  OpenedEntry* source;NativeWatch* watch;
@@ -440,12 +463,7 @@ void upstream_oom(bool protocol) {
  std::printf("PASS persistent upstream OOM mode=%s finalizer exactly once\n",protocol?"protocol":"finalizer");
 }
 }
-extern "C" {
-decltype(&ReadFile) __imp_ReadFile=&capture_read;
-decltype(&WriteFile) __imp_WriteFile=&capture_write;
-decltype(&CloseHandle) __imp_CloseHandle=&capture_close;
-}
-int wmain(int argc,wchar_t** argv){std::set_terminate(fatal);try{
+int wmain(int argc,wchar_t** argv){if(!ckfs_test::report_runtime_self("native-copy"))return 1;std::set_terminate(fatal);try{CompiledObservers observers;
  CHECK(argc>=2);
  if(std::wstring_view(argv[1])==L"--upstream-finalizer-oom")upstream_oom(false);
  else if(std::wstring_view(argv[1])==L"--upstream-protocol-oom")upstream_oom(true);
