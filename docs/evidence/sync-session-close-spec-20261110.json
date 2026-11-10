@@ -1,0 +1,15 @@
+{
+  "problem": "Linux-only unconditional noexcept on fixture C close override conflicts with system header; both actual GitHub Clang22 sanitizer builds stopped before tests",
+  "fix": "Derive the override exception specification from the actual included close declaration on each POSIX platform; body/assertions/instrumentation unchanged",
+  "source_before_sha256": "3a7ab7f23221909223a32a44696b9d8d83b68c04e3056243c0b57bb175a6bf82",
+  "source_after_sha256": "453596f5e4b307b5f45ebbd6aed4cc7fc095542f488d84ea29d4d92d7b09d348",
+  "packet": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/sync-session-close-spec-20261110",
+  "receipt_sha256": "07ae1879ace0c5e6d16d057966f61da4d2d1903a26110107e5573c243829ba58",
+  "validation": {
+    "Clang19_Linux_ASan_UBSan_syntax_negative": "original fails with same exception-specification error",
+    "Clang19_Linux_ASan_UBSan_syntax_positive": "fixed passes; same headers and flags",
+    "AppleClang_macOS_syntax_positive": "fixed full fixture translation unit passes",
+    "scope": "Syntax/ABI-declaration checks only; native regression execution and complete Clang22 builds remain required"
+  },
+  "native_success_claimed": false
+}

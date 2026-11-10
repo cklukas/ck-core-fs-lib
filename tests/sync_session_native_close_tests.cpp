@@ -184,10 +184,7 @@ void operator delete[](void* p,std::size_t)noexcept{std::free(p);}
 #ifdef _WIN32
 extern "C" {decltype(&CloseHandle) __imp_CloseHandle=&watch::close_handle;decltype(&ReleaseMutex) __imp_ReleaseMutex=&watch::release_mutex;}
 #else
-extern "C" int close(int fd)
-#ifdef __linux__
-noexcept
-#endif
+extern "C" int close(int fd) noexcept(noexcept(::close(fd)))
 {return watch::close_file(fd);}
 #endif
 namespace {
