@@ -127,3 +127,11 @@ failure-log excerpts and stages compiler, source, timing and CTest records;
 failed-lane staging is not a downloadable failure bundle. Inspect the retained
 server log when a lane fails. Configuration/parser checks alone are not a
 successful platform run.
+
+The first primary-runner attempt (`e7fdec4`, run
+`00001794290846474504-f08300ed`) stopped before compilation: the sandbox presents
+UID 0, which the ordinary-host-user admission check rejects. CI is enabled,
+but that runner identity prerequisite remains unresolved and the site has not
+published from this attempt. The identity predicate and host security policy
+remain unchanged. See `docs/evidence/backend-ci-first-runtime-20261110.json` for
+the separately observed GitHub failures and the retry-launcher repair scope.

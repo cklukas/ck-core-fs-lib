@@ -1,0 +1,39 @@
+{
+  "utc": "2026-11-10T06:15:55.211695+00:00",
+  "packet": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/backend-ci-first-runtime-20261110",
+  "github": {
+    "run": 42763853454,
+    "source": "570588ffdc3fd6c9fa604bbcfb4c27af31b3c255",
+    "linux_browser_on": "193/195; retry mount bootstrap EPERM and native close owner-observation assertion failed",
+    "linux_browser_off": "193/195; same two failures",
+    "windows": "Blocked before configure:48 unsafe-hook findings in14 retained sources",
+    "sanitizers": "Still running/queued at collection; no result claimed"
+  },
+  "rpi4": {
+    "run": "00001794290846474504-f08300ed",
+    "source": "e7fdec4a70637b8315f99ddbc7d755acbf134a4c",
+    "result": "exit77 beforecompile; sandbox presentsUID0; ordinaryhostuser admission refused",
+    "ci_enabled": true,
+    "qualification": false,
+    "pages_published": false
+  },
+  "retry_launcher_fix": {
+    "reason": "Retry wrapper ignored explicit CK_FS_NAMESPACE_BOOTSTRAP even though CI bootstrap prerequisite passed",
+    "sha256": "3d244f2ea9cb2cffddc1dc3e6eceb93083672e932ad0a4746bbbc094ba2bb04d",
+    "shared_helper_sha256": "e4a0247a28884b55ec883f9be7f22e71da7013f584f21d985333ba29c4afb030",
+    "changes": "Reuse existing explicit caller-bound identity-map helper; retain all six genuine bind-alias cases and original deadlines/native assertions; unknown mode refuses before fixture/native launch",
+    "validation": [
+      "Python AST PASS",
+      "Independent source review PASS",
+      "Ordinary Linux unknown-mode negative control exit1; no scratch directory created"
+    ],
+    "native_six_case_qualification": "PENDING; source review and negative admission are not a native pass"
+  },
+  "remaining": [
+    "Native six-case bootstrap validation",
+    "Fortified libc owner-observation investigation and actual runtime proof",
+    "Supported ordinary-user runner identity contract on rpi4",
+    "Windows safe compiled-hook migration",
+    "Full sanitizer and frontend platform gates"
+  ]
+}
