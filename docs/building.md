@@ -38,11 +38,11 @@ The driver propagates the selected actual provider to archive and metadata
 fixtures, admits output ancestry before creating it, and checks for known unsafe
 legacy runtime-hook fixtures **before configure or native execution**. That
 preflight now reports zero unsafe runtime-hook findings, with all fourteen
-legacy fixture entrypoints retained. This source scan permits coherent
-compilation; it does not establish native correctness. Full Windows runtime
-qualification remains open while the independent workspace-wrapper handle-count
-prerequisite, matching normal/ASan cohorts and production-OFF artifact proof are
-resolved. Do not bypass these gates or claim a full Windows pass from the scan.
+legacy fixture entrypoints retained. Use the configured CI and workstation
+cohorts to validate the migrated fixtures. Full Windows qualification still
+requires passing native tests in matching normal and ASan cohorts, plus
+production-OFF artifact checks. The separate workspace-wrapper handle-count
+experiment remains under investigation.
 The independently qualified, scoped journal-close target is described in
 [the native contracts](native-contracts.md#windows-journal-temporary-close-errors).
 
