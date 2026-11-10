@@ -6,6 +6,7 @@
 #endif
 #include "native_filesystem.hpp"
 #include "native_home.hpp"
+#include "native_archive_file.hpp"
 #include "metadata_replay.hpp"
 #include "metadata_capture_job.hpp"
 #include "native_target_read_seed.hpp"
@@ -959,6 +960,43 @@ public:
             return Observation<bool>::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "content.F_FULLFSYNC"});
 #endif
         return Observation<bool>::available(true);
+    }
+    Observation<bool> prepare_archive(std::uint64_t size,bool sparse) {
+        using R=Observation<bool>;
+        if(!content_write_access_||finish_started_||!publication_||directory_metadata_target_)
+            return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"archive.creator_required"));
+        struct stat info{};
+        if(fstat(descriptor_.get(),&info)!=0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"archive.fstat"});
+        if(!S_ISREG(info.st_mode)||info.st_size!=0||info.st_nlink!=(publication_->anonymous?0:1))
+            return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,"archive.creator_shape"));
+        if(size>static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))
+            return R::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::InvalidLimit,"archive.size"));
+#if !defined(__linux__)
+        if(sparse)return R::unavailable(ObservationState::Unsupported,adapter_error(AdapterError::ProviderReviewRequired,"archive.sparse_provider"));
+#else
+        (void)sparse; // extending a fresh inode does not allocate its holes.
+#endif
+        if(ftruncate(descriptor_.get(),static_cast<off_t>(size))!=0)
+            return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"archive.ftruncate"});
+        layout_access_=true;
+        return R::available(true);
+    }
+    std::optional<MetadataCaptureCleanupError> finish_archive() noexcept {
+        if(finish_started_)return std::nullopt;
+        finish_started_=true;content_write_access_=false;content_access_=false;layout_access_=false;
+        const int writer=descriptor_.release();
+        if(writer<0)return std::nullopt;
+        const int flush_error=fsync(writer)==0?0:errno;
+#if defined(__APPLE__)
+        const int full_error=flush_error==0&&fcntl(writer,F_FULLFSYNC)!=0?errno:0;
+#endif
+        const int close_error=close(writer)==0?0:errno;
+        if(flush_error)return MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Posix,flush_error,"archive.finish_fsync"};
+#if defined(__APPLE__)
+        if(full_error)return MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Posix,full_error,"archive.finish_fullsync"};
+#endif
+        if(close_error)return MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Posix,close_error,"archive.finish_close"};
+        return std::nullopt;
     }
     Observation<bool> finish_content_writes() override {
         using Result=Observation<bool>;
@@ -3442,6 +3480,19 @@ Observation<bool> PosixOpenedEntry::publish_noreplace(const DirectoryCursor& des
 }
 
 } // namespace
+
+Observation<bool> detail::prepare_native_archive_file(OpenedEntry& file,std::uint64_t size,bool sparse) {
+    auto* native=dynamic_cast<PosixOpenedEntry*>(&file);
+    if(!native)return Observation<bool>::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::UnqualifiedIdentity,"archive.native_creator_required"));
+    return native->prepare_archive(size,sparse);
+}
+std::optional<MetadataCaptureCleanupError> detail::finish_native_archive_file(OpenedEntry& file) noexcept {
+    auto* native=dynamic_cast<PosixOpenedEntry*>(&file);
+    if(!native)return MetadataCaptureCleanupError{ObservationState::Unsupported,ErrorDomain::Adapter,
+        static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"archive.native_creator_required"};
+    return native->finish_archive();
+}
 
 Observation<int> detail::duplicate_posix_journal_directory(const DirectoryCursor& cursor) {
     const auto* native=dynamic_cast<const PosixDirectoryCursor*>(&cursor);

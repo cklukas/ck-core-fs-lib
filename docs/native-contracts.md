@@ -58,6 +58,16 @@ perform its own fresh native validation and commit protocol. See the
 [development validation record](validation-2026-11-03-development.md) for the
 qualified Windows scopes and pending combined/platform gates.
 
+## Native archive image writer
+
+The unreleased `NativeArchiveWriteJob` creates and retains its own native stage,
+materializes bounded extents and zero gaps, verifies the full image, and journals
+no-replace publication. ARW2 records remain descriptive evidence. Its worker-only
+lifetime, Root first-error drainage, cancellation and uncertain-publication
+outcomes are defined in the [archive writer contract](native-archive-write.md).
+Source-volume acquisition, stable C archive APIs, replacement retention and
+Tree execution receipts remain separate capabilities.
+
 ## Retained replacement
 
 The incoming file is copied and its data and requested metadata are verified

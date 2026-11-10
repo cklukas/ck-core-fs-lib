@@ -7,6 +7,7 @@
 #include "native_journal_directory_bridge.hpp"
 #include "metadata_replay.hpp"
 #include "metadata_capture_job.hpp"
+#include "native_archive_file.hpp"
 #include "native_metadata_stream_target.hpp"
 #include "native_target_read_seed.hpp"
 #include "native_target_read_budget.hpp"
@@ -836,6 +837,33 @@ public:
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidAccess), "content.flush_access"});
         if (!FlushFileBuffers(handle_.get())) return failure<bool>(GetLastError(), "content.FlushFileBuffers");
         return Observation<bool>::available(true);
+    }
+    Observation<bool> prepare_archive(std::uint64_t size,bool sparse) {
+        if(!content_write_access_||finish_started_||!publication_||directory_metadata_target_||!channel_writers_.empty())
+            return failure<bool>(ERROR_ACCESS_DENIED,"archive.creator_required");
+        FILE_STANDARD_INFO info{};
+        if(!GetFileInformationByHandleEx(handle_.get(),FileStandardInfo,&info,sizeof(info)))return failure<bool>(GetLastError(),"archive.FileStandardInfo");
+        if(info.Directory||info.EndOfFile.QuadPart!=0||info.NumberOfLinks!=1||size>static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()))
+            return failure<bool>(ERROR_INVALID_DATA,"archive.creator_shape");
+        if(sparse){FILE_SET_SPARSE_BUFFER input{TRUE};DWORD returned=0;
+            if(!DeviceIoControl(handle_.get(),FSCTL_SET_SPARSE,&input,sizeof(input),nullptr,0,&returned,nullptr))return failure<bool>(GetLastError(),"archive.FSCTL_SET_SPARSE");}
+        FILE_END_OF_FILE_INFO eof{};eof.EndOfFile.QuadPart=static_cast<LONGLONG>(size);
+        if(!SetFileInformationByHandle(handle_.get(),FileEndOfFileInfo,&eof,sizeof(eof)))return failure<bool>(GetLastError(),"archive.FileEndOfFileInfo");
+        layout_access_=true;return Observation<bool>::available(true);
+    }
+    std::optional<MetadataCaptureCleanupError> finish_archive() noexcept {
+        if(finish_started_)return std::nullopt;
+        finish_started_=true;content_write_access_=false;content_access_=false;layout_access_=false;rename_access_=false;
+        // Archive creator has no metadata replay/channel owners. Consume both
+        // native handles before formatting any diagnostics.
+        const HANDLE security=security_handle_.release(),writer=handle_.release();
+        const DWORD se=!security||security==INVALID_HANDLE_VALUE||CloseHandle(security)?0:GetLastError();
+        const DWORD fe=!writer||writer==INVALID_HANDLE_VALUE||FlushFileBuffers(writer)?0:GetLastError();
+        const DWORD ce=!writer||writer==INVALID_HANDLE_VALUE||CloseHandle(writer)?0:GetLastError();
+        if(se)return MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,se,"archive.security_CloseHandle"};
+        if(fe)return MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,fe,"archive.finish_FlushFileBuffers"};
+        if(ce)return MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,ce,"archive.finish_CloseHandle"};
+        return std::nullopt;
     }
     Observation<bool> finish_content_writes() override {
         using Result=Observation<bool>;
@@ -4363,5 +4391,17 @@ Observation<std::unique_ptr<DirectoryCursor>> detail::open_native_session_root(c
     if(!(tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)||(tag.FileAttributes&unsafe))return R::unavailable(ObservationState::Unsupported,{ErrorDomain::Adapter,18,"session_lease.root_kind"});
     auto id=identity(opened.get(),lease.scope_);
     return R::available(std::make_unique<WindowsDirectoryCursor>(std::move(opened),std::move(id),lease.scope_));
+}
+Observation<bool> detail::prepare_native_archive_file(OpenedEntry& file,std::uint64_t size,bool sparse) {
+    auto* native=dynamic_cast<WindowsOpenedEntry*>(&file);
+    if(!native)return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"archive.native_creator_required"});
+    return native->prepare_archive(size,sparse);
+}
+std::optional<MetadataCaptureCleanupError> detail::finish_native_archive_file(OpenedEntry& file) noexcept {
+    auto* native=dynamic_cast<WindowsOpenedEntry*>(&file);
+    if(!native)return MetadataCaptureCleanupError{ObservationState::Unsupported,ErrorDomain::Adapter,
+        static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"archive.native_creator_required"};
+    return native->finish_archive();
 }
 } // namespace ck::files

@@ -30,6 +30,7 @@ nav:
       - docs/operations.md
       - docs/operation-planning.md
       - docs/native-contracts.md
+      - docs/native-archive-write.md
       - docs/conflict-resolution.md
       - docs/safety.md
   - title: API

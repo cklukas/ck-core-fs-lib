@@ -13,6 +13,19 @@ The default is `../ck-core-fs-lib` relative to the ckUtilities checkout. The
 ckVision-based frontend remains in ckUtilities; it links the `ck_files_core`
 and `ck_files_platform` targets from this project.
 
+### Archive writer composition
+
+The development archive adapter in `files_volume_archive.cpp` encodes its
+reviewed document into a header, manifest and data-extent recipe, then invokes
+`NativeArchiveWriteJob` from `ck_core_fs_native`. It supplies genuine held
+destination/Root owners, drains the job on its worker, and resolves Root's final
+failure before emitting a result. Legacy journal callbacks and display addresses
+cannot substitute for native ownership. See the [contract and C++ example](native-archive-write.md).
+
+Whole-volume source acquisition and consistency qualification remain with the
+source provider. This integration adds no stable C archive export or replacement
+retention receipt and does not change any released SDK or frontend pin.
+
 ## CDE
 
 CDE should consume the installed C ABI or a CMake-built shared library. Its

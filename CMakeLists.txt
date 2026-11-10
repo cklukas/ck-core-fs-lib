@@ -184,6 +184,7 @@ target_compile_features(ck_files_platform PUBLIC cxx_std_20)
 # platform implementations can call portable codecs without an archive cycle.
 add_library(ck_core_fs_native STATIC
   src/files/reviewed_tree_plan.cpp
+  src/files/native_archive_write_job.cpp
   src/files/native_main_content_job.cpp
   src/files/regular_execution_source.cpp
   src/files/directory_execution_source.cpp
@@ -1059,3 +1060,28 @@ install(FILES
   ${CMAKE_CURRENT_BINARY_DIR}/ck-core-fs-config.cmake
   ${CMAKE_CURRENT_BINARY_DIR}/ck-core-fs-config-version.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ck-core-fs)
+
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(ck_fs_native_archive_write_job_tests tests/native_archive_write_job_tests.cpp)
+  target_link_libraries(ck_fs_native_archive_write_job_tests PRIVATE ck_core_fs_native)
+  target_compile_options(ck_fs_native_archive_write_job_tests PRIVATE -UNDEBUG)
+  target_link_options(ck_fs_native_archive_write_job_tests PRIVATE -Wl,--wrap=ftruncate -Wl,--wrap=pwrite -Wl,--wrap=fsync -Wl,--wrap=close -Wl,--wrap=linkat -Wl,--wrap=pread)
+  foreach(archive_case positive partial cancel cancel-before cancel-after-publish occupied resize write flush publish close close-oom first-enospc-close-oom invalid root-overlap journal-write post-link-file-flush post-link-parent-flush crash-before-publish crash-after-publish)
+    add_test(NAME native_archive_${archive_case} COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py $<TARGET_FILE:ck_fs_native_archive_write_job_tests>
+      ${CK_CORE_FS_NATIVE_TEST_ROOT} ${archive_case})
+    set_tests_properties(native_archive_${archive_case} PROPERTIES TIMEOUT 180
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  endforeach()
+endif()
+
+if(BUILD_TESTING AND WIN32)
+  set(CK_CORE_FS_ARCHIVE_TEST_FS "" CACHE STRING "Required native archive fixture filesystem: NTFS or ReFS")
+  set_property(CACHE CK_CORE_FS_ARCHIVE_TEST_FS PROPERTY STRINGS NTFS ReFS)
+  set(CK_CORE_FS_ARCHIVE_UNC_TEST_ROOT "" CACHE PATH "Optional explicitly reachable native archive UNC refusal fixture")
+  include(cmake/NativeArchiveWindowsTests.cmake)
+  ck_fs_add_native_archive_windows_tests(
+    NATIVE_TARGET ck_core_fs_native SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}"
+    SCRATCH_ROOT "${CK_CORE_FS_NATIVE_TEST_ROOT}" EXPECTED_FS "${CK_CORE_FS_ARCHIVE_TEST_FS}"
+    UNC_ROOT "${CK_CORE_FS_ARCHIVE_UNC_TEST_ROOT}")
+endif()
