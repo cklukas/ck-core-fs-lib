@@ -1,5 +1,6 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
+#include "mac_capability_fixture.hpp"
 #include "ck_fs_tree.h"
 #include <algorithm>
 #include <cassert>
@@ -157,6 +158,10 @@ int main(int argc, char** argv) {
     ckfet_job* job = reinterpret_cast<ckfet_job*>(1);
     auto invalid = o; invalid.reserved = 1;
     assert(ckfet_start_v1(source, target, &invalid, &job, &e) == CKFE_API_INVALID_ARGUMENT && job == nullptr);
+#if defined(__APPLE__)
+    const auto target_before=mac_capability_fixture::observe(std::filesystem::path(root)/"target");
+    const auto journal_before=mac_capability_fixture::observe(journal);
+#endif
     assert((prepared?ckfet_start_with_journal_root_v1(source,target,&o,journal_owner,&job,&e):
         ckfet_start_v1(source,target,&o,&job,&e))==CKFE_API_OK&&job);
     // A running job owns both roots after these public owners are destroyed.
@@ -249,8 +254,39 @@ int main(int argc, char** argv) {
     assert(ckfet_acknowledge_command_v1(job,s.command_id) == CKFE_API_OK);
     assert(ckfet_execute_v1(job, s.plan_generation, old_receipt, &command) == CKFE_API_STALE_PLAN && !command);
     if (mode == "stale"||prepared) { std::puts("REVIEWED"); std::fflush(stdout); assert(std::getchar() == 'x'); }
+#if defined(__APPLE__)
+    const auto source_before=mac_capability_fixture::observe(std::filesystem::path(root)/"source");
+#endif
     assert(ckfet_execute_v1(job, s.plan_generation, s.receipt_id, &command) == CKFE_API_OK);
     s = wait(job, true); show(s);
+#if defined(__APPLE__)
+    if(!compare){
+        assert(s.command_state==CKFET_COMMAND_REJECTED&&s.failure_state==CKFE_OBSERVATION_UNSUPPORTED&&
+          s.failure_domain==CKFE_ERROR_ADAPTER&&s.failure_code==14);
+        assert(!s.completed_items&&!s.copied_bytes&&!s.partial&&!s.recovery_required);
+        assert(mac_capability_fixture::observe(std::filesystem::path(root)/"source")==source_before&&
+          mac_capability_fixture::observe(std::filesystem::path(root)/"target")==target_before&&
+          mac_capability_fixture::observe(journal)==journal_before);
+        assert(ckfet_acknowledge_command_v1(job,s.command_id)==CKFE_API_OK);
+        // Fresh review still cannot bypass a missing native capability.
+        assert(submit()==CKFE_API_OK&&command);s=wait(job,true);
+        assert(s.command_state==CKFET_COMMAND_ACCEPTED&&s.receipt_id);
+        assert(ckfet_acknowledge_command_v1(job,s.command_id)==CKFE_API_OK);
+        assert(ckfet_execute_v1(job,s.plan_generation,s.receipt_id,&command)==CKFE_API_OK&&command);
+        s=wait(job,true);assert(s.command_state==CKFET_COMMAND_REJECTED&&s.failure_state==CKFE_OBSERVATION_UNSUPPORTED&&
+          s.failure_domain==CKFE_ERROR_ADAPTER&&s.failure_code==14);
+        ckfet_request_cancel(job);drained(job);assert(ckfet_poll_v1(job,&s)==CKFE_API_OK&&s.state==CKFET_CANCELLED);
+        assert(!s.completed_items&&!s.copied_bytes&&!s.partial&&!s.recovery_required);
+        assert(mac_capability_fixture::observe(std::filesystem::path(root)/"source")==source_before&&
+          mac_capability_fixture::observe(std::filesystem::path(root)/"target")==target_before&&
+          mac_capability_fixture::observe(journal)==journal_before);
+        if(journal_owner){assert(ckfjr_finish_v1(journal_owner)==CKFE_API_OK);const auto final=root_wait(journal_owner,true);
+          assert(final.state==CKFJR_COMPLETE&&final.worker_drained);ckfjr_release(journal_owner);}
+        ckfet_release(job);ckfe_error_free(&e);
+        std::puts("Mac C Tree issued receipt cannot bypass unsupported execution admission; no data/journal effects");
+        return 0;
+    }
+#endif
     assert(s.command_state == CKFET_COMMAND_ACCEPTED);
     if (s.command_state == CKFET_COMMAND_ACCEPTED) {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);

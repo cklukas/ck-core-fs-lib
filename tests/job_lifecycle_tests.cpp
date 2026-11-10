@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "ck_file_engine.h"
+#include "mac_capability_fixture.hpp"
 
 // Keep every check (including calls with side effects) active in RelWithDebInfo.
 #undef NDEBUG
@@ -394,9 +395,34 @@ struct Fixture {
 
 void completed_copy(Fixture &fixture, bool concurrent_drain) {
     const char *name = concurrent_drain ? "concurrent.bin" : "overflow.bin";
+#ifdef __APPLE__
+    const auto source_before=mac_capability_fixture::observe(fixture.source_path,false);
+    const auto target_before=mac_capability_fixture::observe(fixture.destination_path);
+#endif
     auto *job = fixture.start(name, concurrent_drain);
     Events events;
     const auto terminal = wait(job, concurrent_drain ? &events : nullptr);
+#ifdef __APPLE__
+    assert(terminal.state==CKFE_JOB_RECOVERY_REQUIRED&&terminal.processed_bytes==0&&terminal.processed_items==1);
+    Error failure;ckfe_job_snapshot snapshot{};
+    ok(ckfe_job_poll(job,&snapshot,&failure.value),failure);
+    assert(failure.value.domain==CKFE_ERROR_ADAPTER&&failure.value.code==4&&failure.value.operation&&
+      std::strcmp(failure.value.operation,"create_staging_file.fd_publication_unqualified")==0);
+    Error report_error;ckfe_job_preservation_report_v1 report{};
+    ok(ckfe_job_get_preservation_report_v1(job,&report,sizeof(report),&report_error.value),report_error);
+    assert(report.source_preserved_fields==0&&report.current_effective_uid_gid_applied==0&&
+      report.provider_qualification!=CKFE_OBSERVATION_AVAILABLE);
+    events.finish(job,CKFE_JOB_RECOVERY_REQUIRED);
+    const auto journal_before=mac_capability_fixture::observe(fixture.journal);
+    for(unsigned attempt=0;attempt<3;++attempt){const auto cached=poll(job);assert(cached.state==terminal.state&&cached.processed_bytes==0);}
+    assert(mac_capability_fixture::observe(fixture.journal)==journal_before);
+    ckfe_job_destroy(job);
+    assert(mac_capability_fixture::observe(fixture.journal)==journal_before);
+    assert(mac_capability_fixture::observe(fixture.source_path,false)==source_before);
+    assert(mac_capability_fixture::observe(fixture.destination_path)==target_before);
+    fixture.verify_source();
+    std::printf("Mac copy %s exact publication refusal, zero progress/claims, stable events/journal and source PASS\n",name);
+#else
     assert(terminal.state == CKFE_JOB_COMPLETED);
     assert(terminal.total_bytes_known && terminal.total_bytes == fixture_size);
     assert(terminal.processed_bytes == fixture_size && terminal.processed_items == 1);
@@ -423,6 +449,7 @@ void completed_copy(Fixture &fixture, bool concurrent_drain) {
     std::printf("copy %s events=%llu coalesced=%llu bytes=%llu\n", name,
         static_cast<unsigned long long>(events.count), static_cast<unsigned long long>(events.lost),
         static_cast<unsigned long long>(terminal.processed_bytes));
+#endif
 }
 void explicit_replay_policy(Fixture& fixture) {
     Error error;
@@ -439,6 +466,18 @@ void explicit_replay_policy(Fixture& fixture) {
     const auto terminal = wait(job,nullptr);
     ckfe_job_preservation_report_v1 report{};
     ok(ckfe_job_get_preservation_report_v1(job,&report,sizeof(report),&error.value),error);
+#ifdef __APPLE__
+    assert(terminal.state==CKFE_JOB_RECOVERY_REQUIRED);
+    Error failure;ckfe_job_snapshot current{};ok(ckfe_job_poll(job,&current,&failure.value),failure);
+    assert(failure.value.domain==CKFE_ERROR_ADAPTER&&failure.value.code==4&&failure.value.operation&&
+      std::strcmp(failure.value.operation,"create_staging_file.fd_publication_unqualified")==0);
+    assert(report.source_preserved_fields==0&&report.current_effective_uid_gid_applied==0);
+    assert(mac_capability_fixture::absent(fixture.destination_path+"/explicit-replay.bin"));
+    const auto journal_before=mac_capability_fixture::observe(fixture.journal);
+    for(unsigned attempt=0;attempt<3;++attempt)assert(poll(job).state==CKFE_JOB_RECOVERY_REQUIRED);
+    assert(mac_capability_fixture::observe(fixture.journal)==journal_before);
+    std::puts("Mac explicit original-owner/privilege opt-in does not qualify publication or achieved metadata");
+#else
     if (terminal.state == CKFE_JOB_COMPLETED) {
         assert(report.provider_qualification == CKFE_OBSERVATION_AVAILABLE);
         assert((report.source_preserved_fields & CKFE_PRESERVED_SOURCE_OWNER) != 0);
@@ -460,6 +499,7 @@ void explicit_replay_policy(Fixture& fixture) {
         assert(!std::getenv("CK_METADATA_REPLAY_REQUIRE_NATIVE_SUCCESS"));
         std::printf("C v2 strict replay remains unavailable on this provider: state=%s\n",ckfe_job_state_name(terminal.state));
     }
+#endif
     ckfe_job_destroy(job);
 #ifndef _WIN32
     assert(chmod((fixture.source_path + "/payload.bin").c_str(),0600) == 0);
@@ -499,5 +539,9 @@ int main(int argc, char **argv) {
     explicit_replay_policy(fixture);
     cancelled_copy(fixture);
     destroy_running(fixture);
+    #ifdef __APPLE__
+    std::puts("Mac native publication refusal, zero metadata claims, events, cancellation and teardown passed");
+#else
     std::puts("native copy, progress, events, cancellation, and worker teardown passed");
+#endif
 }

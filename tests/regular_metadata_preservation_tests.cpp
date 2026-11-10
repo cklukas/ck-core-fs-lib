@@ -4,6 +4,7 @@
 #include "native_operation_copy_job.hpp"
 #include "native_filesystem.hpp"
 #include "object_inventory_job.hpp"
+#include "mac_capability_fixture.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -101,6 +102,50 @@ struct Fixture {
 #endif
     }
 };
+#if defined(__APPLE__)
+void native_tests(){
+ for(bool attributes:{false,true})for(bool consent:{false,true}){
+  Fixture fixture;fixture.source();if(attributes)fixture.xattr();
+  const auto source_before=mac_capability_fixture::observe(fixture.path("source"));
+  auto created=fixture.batch(consent,"unpublished",1);
+  require(created.value()!=nullptr,"ordinary native metadata preflight");
+  auto job=std::move(created).take_value();
+  for(unsigned step=0;step<10000&&(job->state()==OperationBatchState::Ready||job->state()==OperationBatchState::Running);++step)job->advance();
+  require(job->state()==OperationBatchState::NeedsReconciliation,"Mac ordinary publication refusal state");
+  require(job->result().items.size()==1&&job->progress().observed_bytes==0,"refused copy changed progress");
+  const auto failure=job->result().items.front().failure;
+  require(failure&&failure->state==ObservationState::Unsupported&&failure->error.domain==ErrorDomain::Adapter&&
+    failure->error.code==4&&failure->error.operation=="create_staging_file.fd_publication_unqualified","exact strong publication refusal");
+  require(mac_capability_fixture::absent(fixture.path("unpublished")),"unqualified destination created");
+  require(mac_capability_fixture::observe(fixture.path("source"))==source_before,"source metadata/data changed");
+  if(attributes){char value[32]{};require(getxattr(fixture.path("source").c_str(),"user.ck_metadata_test",value,sizeof(value),0,0)==9&&
+    std::memcmp(value,"metadata",9)==0,"source xattr changed");}
+  const auto journal_before=mac_capability_fixture::observe(fixture.root);
+  for(unsigned poll=0;poll<3;++poll)require(job->advance()==OperationBatchState::NeedsReconciliation,"cached refusal changed state");
+  require(mac_capability_fixture::observe(fixture.root)==journal_before,"cached refusal performed effects");
+  job.reset();
+  unsigned journals=0;
+  for(const auto& entry:std::filesystem::directory_iterator(fixture.root)){
+   if(!entry.path().filename().native().starts_with(".ck-copy-journal-"))continue;
+   ++journals;auto handle=open_native_operation_journal_file(std::move(NativeAbsolutePath::from_posix(fixture.root)).take_value(),
+     *NativeName::from_posix(entry.path().filename().native()),false);
+   require(handle.value()!=nullptr,"read actual refusal journal");auto decoded=load_operation_journal(**handle.value());
+   require((*handle.value())->finish_io().value()!=nullptr,"close actual journal reader");
+   require(decoded.value()&&!decoded.value()->tail&&decoded.value()->journal->records().size()==2&&
+     decoded.value()->journal->records()[0].state==OperationJournalState::Planned&&
+     decoded.value()->journal->records()[1].state==OperationJournalState::Prepared,"no copied/verified/published journal claim");
+  }
+  require(journals==1,"one actual refusal journal");
+  std::cout<<"Mac ordinary/xattr preflight publication REFUSED attrs="<<attributes<<" consent="<<consent<<" no replay\n";
+ }
+ Fixture full;full.source();const auto before=mac_capability_fixture::observe(full.root);
+ auto unsupported=full.batch(false,"full",42,RegularMetadataScope::CompleteMetadataV1);
+ require_review(unsupported);
+ require(unsupported.state()==ObservationState::Unsupported&&unsupported.unavailable_detail()->error.operation==
+   "metadata_replay.complete_security_coverage_unproved","Complete security coverage remains unproved");
+ require(mac_capability_fixture::observe(full.root)==before,"Complete preflight created effects");
+}
+#else
 void native_tests() {
     Fixture ordinary;
     ordinary.source();
@@ -247,7 +292,8 @@ void native_tests() {
     std::cout << "versioned metadata scope, ACL/xattr replay and explicit-consent checks passed\n";
     if (native_qualified) std::cout << "scope-1 native ordinary preservation and source-mutation checks passed\n";
     else std::cout << "scope-1 preserving gate NOT PASSED; mutation/ownership cases requiring native success not run\n";
-}
+ }
+#endif // native success fixture on other POSIX providers
 #endif
 }
 int main() {

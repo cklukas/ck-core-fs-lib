@@ -1,5 +1,6 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
+#include "mac_capability_fixture.hpp"
 #include "../src/files/reviewed_tree_plan.hpp"
 #include "native_filesystem.hpp"
 #include "private_journal_scope.hpp"
@@ -104,6 +105,41 @@ extern "C" {decltype(&ReadFile) __imp_ReadFile=&tree_capture_test::read;decltype
 extern "C" ssize_t pread(int fd,void* data,size_t n,off_t off){return tree_capture_test::read(fd,data,n,off);}
 extern "C" int close(int fd){return tree_capture_test::close(fd);}
 #endif
+
+#if defined(__APPLE__)
+namespace ancestor_observation {
+struct Sample {dev_t dev;ino_t ino;timespec modified,changed;char path[1024];};
+thread_local bool enabled=false;
+thread_local unsigned count=0;
+thread_local Sample samples[512]{};
+int observe(int fd,struct stat* value){
+ using F=int(*)(int,struct stat*);static const auto real=reinterpret_cast<F>(dlsym(RTLD_NEXT,"fstat"));
+ const int status=real(fd,value),saved=errno;
+ if(!status&&enabled&&S_ISDIR(value->st_mode)){
+  auto& sample=samples[count++%512];sample.dev=value->st_dev;sample.ino=value->st_ino;
+  sample.modified=value->st_mtimespec;sample.changed=value->st_ctimespec;
+  sample.path[0]='\0';(void)fcntl(fd,F_GETPATH,sample.path);
+ }
+ errno=saved;return status;
+}
+void dump(){
+ const unsigned first=count>512?count-512:0;
+ for(unsigned i=first;i<count;++i){const auto& a=samples[i%512];
+  for(unsigned j=i+1;j<count;++j){const auto& b=samples[j%512];if(a.dev!=b.dev||a.ino!=b.ino)continue;
+   if(a.modified.tv_sec!=b.modified.tv_sec||a.modified.tv_nsec!=b.modified.tv_nsec||a.changed.tv_sec!=b.changed.tv_sec||a.changed.tv_nsec!=b.changed.tv_nsec)
+    std::fprintf(stderr,"ANCESTOR_NATIVE_DELTA %s dev=%llu ino=%llu indices=%u,%u m=%lld.%09ld->%lld.%09ld c=%lld.%09ld->%lld.%09ld\n",a.path,(unsigned long long)a.dev,(unsigned long long)a.ino,i,j,(long long)a.modified.tv_sec,a.modified.tv_nsec,(long long)b.modified.tv_sec,b.modified.tv_nsec,(long long)a.changed.tv_sec,a.changed.tv_nsec,(long long)b.changed.tv_sec,b.changed.tv_nsec);
+   break;
+  }
+ }
+}
+}
+// This TU is also included by the Root cancellation fixture, which owns
+// its own fstat fault hook. Never interpose twice in that executable.
+#if !defined(main)
+extern "C" int fstat(int fd,struct stat* value){return ancestor_observation::observe(fd,value);}
+#endif
+#endif
+
 using namespace ck::files;
 namespace {
 unsigned checks = 0;
@@ -1298,6 +1334,65 @@ void test_progressive_root_close(){
 }
 }
 #ifndef CKFS_TREE_EXECUTION_TEST_SUPPORT
+#if defined(__APPLE__)
+void test_mac_directory_execution_refusal(bool changed){
+ for(unsigned variant=0;variant<(changed?6U:2U);++variant){
+  Fixture f(!changed&&variant==1);mkdir_new(f.path("s/folder"));write_file(f.path("s/folder/a"),"original");
+  const auto source_before=mac_capability_fixture::observe(f.path("s"));
+  const auto target_before=mac_capability_fixture::observe(f.path("d"));
+  const auto journal_before=mac_capability_fixture::observe(f.path("journals"));
+  auto job=positive_job(f);
+  std::fprintf(stderr,"ANCESTOR_NATIVE_CASE variant=%u changed=%u\n",variant,unsigned(changed));
+  ancestor_observation::count=0;ancestor_observation::enabled=true;
+  try{preview(*job);}catch(...){ancestor_observation::enabled=false;ancestor_observation::dump();throw;}
+  ancestor_observation::enabled=false;ancestor_observation::dump();
+  auto receipt=take(job->review({}));
+  auto refused=job->begin_execution(receipt);
+  CHECK(!refused.value()&&refused.state()==ObservationState::Unsupported);
+  CHECK(refused.unavailable_detail()->error.domain==ErrorDomain::Adapter&&refused.unavailable_detail()->error.code==14&&
+    refused.unavailable_detail()->error.operation=="reviewed_tree.directory_atime_observer_unqualified");
+  CHECK(mac_capability_fixture::observe(f.path("s"))==source_before);
+  CHECK(mac_capability_fixture::observe(f.path("d"))==target_before);
+  CHECK(mac_capability_fixture::observe(f.path("journals"))==journal_before);
+  if(changed){
+   if(variant==0)write_file(f.path("s/folder/a"),"modified",true);
+   if(variant==1){rename_exact(f.path("s/folder/a"),f.path("s/old"));write_file(f.path("s/folder/a"),"original");}
+   if(variant==2)write_file(f.path("d/foreign"),"target changed");
+   if(variant==3){rename_exact(f.path("d"),f.path("old-d"));mkdir_new(f.path("d"));}
+   if(variant==4){rename_exact(f.path("s/folder"),f.path("s/old"));mkdir_new(f.path("s/folder"));write_file(f.path("s/folder/a"),"original");}
+   if(variant==5){rename_exact(f.path("s"),f.path("old-s"));mkdir_new(f.path("s"));}
+  }
+  const auto current_source=mac_capability_fixture::observe(f.path("s"));
+  const auto current_target=mac_capability_fixture::observe(f.path("d"));
+  for(unsigned retry=0;retry<3;++retry){
+   const auto blocked=job->begin_execution(receipt);CHECK(!blocked.value());
+   if(changed&&(variant==3||variant==5)){
+    CHECK(blocked.state()==ObservationState::Changed&&blocked.unavailable_detail()->error.code==static_cast<std::int64_t>(AdapterError::PlanDecisionStale));
+    CHECK(blocked.unavailable_detail()->error.operation==(retry==0?"reviewed_tree.private_scan_membership_changed":"reviewed_tree.receipt"));
+   }else CHECK(blocked.state()==ObservationState::Unsupported&&blocked.unavailable_detail()->error.domain==ErrorDomain::Adapter&&
+     blocked.unavailable_detail()->error.code==14&&blocked.unavailable_detail()->error.operation=="reviewed_tree.directory_atime_observer_unqualified");
+  }
+  CHECK(job->state()==((changed&&(variant==3||variant==5))?ReviewedTreeState::Failed:ReviewedTreeState::AwaitingReview)&&job->progress().completed_items==0&&
+    !job->progress().partial&&!job->progress().recovery_required);
+  CHECK(mac_capability_fixture::observe(f.path("s"))==current_source);
+  CHECK(mac_capability_fixture::observe(f.path("d"))==current_target);
+  CHECK(mac_capability_fixture::observe(f.path("journals"))==journal_before);
+  job.reset();CHECK(mac_capability_fixture::observe(f.path("journals"))==journal_before);
+  std::printf("Mac directory execution admission REFUSED variant=%u changed=%d; review receipt grants no execution authority, no data/journal effects\n",variant,changed);
+ }
+}
+void test_mac_plan_validation(){
+ Fixture f;write_file(f.path("s/a"),"original");
+ auto invalid=f.request();invalid.digest_chunk_bytes=0;CHECK(!ReviewedTreePlanJob::create(std::move(invalid)).value());
+ invalid=f.request();invalid.destination_root=invalid.source_root;CHECK(!ReviewedTreePlanJob::create(std::move(invalid)).value());
+ const auto source=mac_capability_fixture::observe(f.path("s")),target=mac_capability_fixture::observe(f.path("d")),journal=mac_capability_fixture::observe(f.path("journals"));
+ auto job=positive_job(f);std::stop_source stop;stop.request_stop();CHECK(job->advance(stop.get_token())==ReviewedTreeState::Cancelled);
+ CHECK(!job->progress().partial&&!job->progress().recovery_required);
+ job.reset();CHECK(mac_capability_fixture::observe(f.path("s"))==source&&mac_capability_fixture::observe(f.path("d"))==target&&
+    mac_capability_fixture::observe(f.path("journals"))==journal);
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
         if(argc==2&&std::string_view(argv[1])=="--loss-main") {test_explicit_loss_main();test_loss_root_close();std::printf("explicit loss Scanner: %u checks passed\n",checks);return 0;}
@@ -1309,8 +1404,12 @@ int main(int argc, char** argv) {
             std::printf("reviewed_tree progressive metadata: %u checks passed\n",checks);return 0;
         }
         if(argc==2&&std::string_view(argv[1])=="--changed-receipts-only") {
+#ifdef __APPLE__
+            test_mac_directory_execution_refusal(true);
+#else
             test_changed_receipts();
-            std::printf("reviewed_tree_plan stale receipts: %u checks passed\n",checks);return 0;
+#endif
+            std::printf("reviewed_tree_plan receipt capability checks: %u checks passed\n",checks);return 0;
         }
 #ifdef __linux__
         if(argc==2&&std::string_view(argv[1])=="--cancel-writer-finish") {
@@ -1328,13 +1427,17 @@ int main(int argc, char** argv) {
             std::printf("reviewed_tree_plan Compare review: %u checks passed\n", checks); return 0;
         }
         test_compare_acknowledges_descriptive_choices();
+#ifdef __APPLE__
+        test_mac_directory_execution_refusal(false);test_mac_plan_validation();
+#else
         test_copy(); test_copy(true); test_receipts_and_rules(); test_deletions_and_unsupported();
         test_changed_receipts(); test_overlap_collision_and_limits(); test_cancellation(); test_profiles();
         test_changes_during_execution(); test_parent_move_into_source(); test_assessment_and_receipt_revocation(); test_retention_capabilities_and_incoming_copy();
 #ifndef _WIN32
         test_exact_names_links_and_fifo(); test_lossless_native_names();
 #endif
-        std::printf("reviewed_tree_plan: %u checks passed\n", checks);
+#endif
+        std::printf("reviewed_tree_plan: %u checks passed (platform admission contracts)\n", checks);
         return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "reviewed_tree_plan: %s\n", e.what()); return 1; }
 }

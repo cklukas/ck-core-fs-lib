@@ -62,6 +62,17 @@ with tempfile.TemporaryDirectory(prefix="tree-c-", dir=scratch) as work:
             assert list(target.iterdir()) == [target / "alpha"]
             assert list(journal.iterdir()) == [], "Compare created mutation journals"
             assert stat.S_IMODE(journal.stat().st_mode) == journal_mode, "Compare changed journal-root permissions"
+        elif sys.platform == "darwin" and mode in ("copy", "keepboth"):
+            assert not (target / "alpha-incoming").exists()
+            assert not (target / "nested").exists()
+            if mode == "keepboth":
+                assert (target / "alpha").read_bytes() == b"original target remains"
+                assert list(target.iterdir()) == [target / "alpha"]
+            else:
+                assert list(target.iterdir()) == []
+            assert list(journal.iterdir()) == [], "refused Mac review wrote a mutation journal"
+            assert (source / "alpha").read_bytes() == b"complete file data\0\xff" * 256
+            assert (source / "nested" / "beta").read_bytes() == b"nested exact bytes\x80" * 128
         elif mode in ("copy", "keepboth"):
             if mode == "keepboth":
                 assert (target / "alpha").read_bytes() == b"original target remains"

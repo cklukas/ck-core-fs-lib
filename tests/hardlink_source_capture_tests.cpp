@@ -2,6 +2,7 @@
 #include "metadata_capture_job.hpp"
 #include "metadata_replay.hpp"
 #include "native_filesystem.hpp"
+#include "mac_capability_fixture.hpp"
 #include "native_operation_copy_job.hpp"
 #include "private_journal_scope.hpp"
 #include "prepared_journal_root.hpp"
@@ -176,7 +177,35 @@ void source_version(){
  f.bytes.push_back(std::byte{0x21});check(f.read(f.source,f.original)==f.bytes&&f.read(f.source,f.alias)==f.bytes,"both surviving aliases contain exactly original data plus real appended byte");
  yes(job->finish_io());
 }
-void native_copy(){Fixture f;yes(prepare_native_operation_journal_root(f.journal_address()));NativeOperationCopyBatchRequest r;r.sources={take(HeldChild::observe_with_access(f.source,f.original,EntryAccess::ContentRead))};r.destination=f.target;r.destination_names={name("copy")};r.journal_root=f.journal_address();r.journal_id.bytes[0]=std::byte{71};r.policy.metadata_scope=RegularMetadataScope::OrdinaryCallerVisibleV1;r.policy.metadata_policy=policy();r.open_journal=open_native_operation_journal_file;auto job=take(create_native_operation_copy_batch(std::move(r)));for(unsigned i=0;i<10000&&job->state()!=OperationBatchState::Complete&&job->state()!=OperationBatchState::NeedsReconciliation&&job->state()!=OperationBatchState::Failed&&job->state()!=OperationBatchState::Cancelled;++i)job->advance();check(job->state()==OperationBatchState::Complete,"native hardlink source copy Complete");check(f.read(f.target,name("copy"))==f.bytes,"actual copied destination bytes");check(f.read(f.source,f.original)==f.bytes&&f.read(f.source,f.alias)==f.bytes,"copy preserves both source aliases");auto target=take(f.target->open_child(name("copy")));check(*take(target->inspect_basic()).link_count.value()==1,"copied destination has own single link");}
+void native_copy(){Fixture f;yes(prepare_native_operation_journal_root(f.journal_address()));
+#if defined(__APPLE__)
+ const auto source_before=mac_capability_fixture::observe(f.root/"source");
+ const auto target_before=mac_capability_fixture::observe(f.root/"target");
+#endif
+ NativeOperationCopyBatchRequest r;r.sources={take(HeldChild::observe_with_access(f.source,f.original,EntryAccess::ContentRead))};r.destination=f.target;r.destination_names={name("copy")};r.journal_root=f.journal_address();r.journal_id.bytes[0]=std::byte{71};r.policy.metadata_scope=RegularMetadataScope::OrdinaryCallerVisibleV1;r.policy.metadata_policy=policy();r.open_journal=open_native_operation_journal_file;auto job=take(create_native_operation_copy_batch(std::move(r)));for(unsigned i=0;i<10000&&job->state()!=OperationBatchState::Complete&&job->state()!=OperationBatchState::NeedsReconciliation&&job->state()!=OperationBatchState::Failed&&job->state()!=OperationBatchState::Cancelled;++i)job->advance();
+#if defined(__APPLE__)
+ check(job->state()==OperationBatchState::NeedsReconciliation,"Mac hardlink copy refuses publication");
+ check(job->progress().observed_bytes==0&&job->result().items.size()==1,"refusal has no copied bytes");
+ const auto failure=job->result().items.front().failure;
+ check(failure&&failure->state==ObservationState::Unsupported&&failure->error.domain==ErrorDomain::Adapter&&
+   failure->error.code==4&&failure->error.operation=="create_staging_file.fd_publication_unqualified","exact Mac publication capability refusal");
+ check(mac_capability_fixture::observe(f.root/"source")==source_before,"both source aliases unchanged");
+ check(mac_capability_fixture::observe(f.root/"target")==target_before,"no target or staging published");
+ const auto journal_before=mac_capability_fixture::observe(f.root/"journals");
+ for(unsigned poll=0;poll<3;++poll)check(job->advance()==OperationBatchState::NeedsReconciliation,"stable refusal poll");
+ check(mac_capability_fixture::observe(f.root/"journals")==journal_before,"terminal poll cannot replay journal");
+ job.reset();
+ for(const auto& file:std::filesystem::directory_iterator(f.root/"journals")){
+  if(!file.path().filename().native().starts_with(".ck-copy-journal-"))continue;
+  auto handle=take(open_native_operation_journal_file(f.journal_address(),name(file.path().filename().native().c_str()),false));
+  auto parsed=take(load_operation_journal(*handle));yes(handle->finish_io());
+  check(!parsed.tail&&parsed.journal->records().size()==2&&parsed.journal->records()[0].state==OperationJournalState::Planned&&
+    parsed.journal->records()[1].state==OperationJournalState::Prepared,"Mac hardlink journal stops before copy");
+ }
+#else
+check(job->state()==OperationBatchState::Complete,"native hardlink source copy Complete");check(f.read(f.target,name("copy"))==f.bytes,"actual copied destination bytes");check(f.read(f.source,f.original)==f.bytes&&f.read(f.source,f.alias)==f.bytes,"copy preserves both source aliases");auto target=take(f.target->open_child(name("copy")));check(*take(target->inspect_basic()).link_count.value()==1,"copied destination has own single link");
+#endif
+}
 void target_alias(){Fixture f;auto seed=take(f.source->create_child_file(name("single-source")));check(take(seed->write_content(0,f.bytes))==f.bytes.size(),"single-link reference bytes");yes(seed->finish_content_writes());auto source=take(f.source->open_child(name("single-source"),EntryAccess::ContentRead|EntryAccess::MetadataAndAttributes|EntryAccess::MetadataAndSecurity));auto snapshot=take(capture_metadata_replay(*source,policy()));auto unique=take(f.target->create_child_file(name("writer")));check(take(unique->write_content(0,f.bytes))==f.bytes.size(),"target setup bytes");auto writer=std::shared_ptr<OpenedEntry>(std::move(unique));auto basic=take(writer->inspect_basic());auto alias=f.target->create_hard_link(name("writer"),*basic.identity.value(),*f.target,name("writer-alias"));
 yes(std::move(alias));check(*take(writer->inspect_basic()).link_count.value()==2,"actual writable target count2");auto qualified=writer->qualify_metadata_replay(policy());if(qualified.unavailable_detail()){const auto&e=*qualified.unavailable_detail();std::printf("TARGET_ALIAS_QUALIFY state=%u domain=%u code=%lld op=%s\n",unsigned(e.state),unsigned(e.error.domain),(long long)e.error.code,e.error.operation.c_str());}check(!qualified.value()&&qualified.state()==ObservationState::Unsupported&&qualified.unavailable_detail()->error.domain==ErrorDomain::Adapter&&qualified.unavailable_detail()->error.code==14,"native writable target count2 qualification denied");auto before=take(writer->inspect_basic());auto applied=apply_metadata_replay(*writer,snapshot);check(!applied.value()&&applied.state()==ObservationState::Unsupported&&applied.unavailable_detail()->error.domain==ErrorDomain::Adapter&&applied.unavailable_detail()->error.code==14,"target alias denied before metadata replay");auto after=take(writer->inspect_basic());check(*before.modified.value()==*after.modified.value()&&*before.changed.value()==*after.changed.value(),"aliased target timestamps unchanged");
 #ifdef _WIN32
@@ -229,7 +258,13 @@ int run_local_cases(){
 #ifdef _WIN32
 run_case("local TEMP path policy",path_policy);
 #endif
-run_case("ordinary-hardlink progressive+legacy capture",source_capture);run_case("linkcount/content-version revalidation",source_version);run_case("actual ordinary hardlink native copy",native_copy);run_case("aliased writable target denied",target_alias);run_case("private journal alias refused",private_alias);
+run_case("ordinary-hardlink progressive+legacy capture",source_capture);run_case("linkcount/content-version revalidation",source_version);
+#ifdef __APPLE__
+run_case("ordinary hardlink Mac publication refusal",native_copy);
+#else
+run_case("actual ordinary hardlink native copy",native_copy);
+#endif
+run_case("aliased writable target denied",target_alias);run_case("private journal alias refused",private_alias);
 #ifdef __linux__
 run_case("Complete SYS_ADMIN context",complete_context);
 #endif

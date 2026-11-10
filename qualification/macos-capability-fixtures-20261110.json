@@ -1,0 +1,290 @@
+{
+  "prior_frozen_receipt": {
+    "schema": 1,
+    "frozen_utc": "2026-11-10T00:02:46.856711+00:00",
+    "base_master": "0fb7a0969808a102b5a7fb09d96bc7d12eeec0a6",
+    "patch": {
+      "path": "/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/fixtures.patch",
+      "sha256": "ba3bc368261e285e34380f6812b9f7e4febdff1805d3e7e4807c71c45a92a3ab",
+      "file_guards": "/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/patch-manifest.json"
+    },
+    "source_manifest_sha256": "97694c85c04024031b2df67163481a7c34f0901c3b47445b79ba3588710b38cd",
+    "product_and_headers_exact_baseline": true,
+    "qualification": {
+      "tests": 65,
+      "passed": 65,
+      "failed": 0,
+      "all_translation_units": 187,
+      "prelaunch_hashes": "/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/authoritative-prelaunch.json",
+      "prelaunch_sha256": "47153fdb51079639c21d34eb8f95d270bf1f17d4c3b8d1eecbd584bc6b6588b0",
+      "prelaunch_before_test": true,
+      "stages": [
+        {
+          "name": "configure",
+          "command": [
+            "cmake",
+            "-S",
+            "/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/source",
+            "-B",
+            "/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/build",
+            "-G",
+            "Ninja",
+            "-DBUILD_TESTING=ON",
+            "-DCK_CORE_FS_BUILD_BROWSER=ON",
+            "-DCMAKE_BUILD_TYPE=",
+            "-DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang",
+            "-DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++",
+            "-DCMAKE_C_FLAGS=-O1 -g0 -UNDEBUG -fsanitize=thread -fno-omit-frame-pointer -resource-dir=/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/resource",
+            "-DCMAKE_CXX_FLAGS=-O1 -g0 -UNDEBUG -fsanitize=thread -fno-omit-frame-pointer -resource-dir=/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/resource",
+            "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread -resource-dir=/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/resource",
+            "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread -resource-dir=/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/resource",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+            "-DCMAKE_INSTALL_PREFIX=/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/install",
+            "-DCK_CORE_FS_NATIVE_TEST_ROOT=/Volumes/PRO-BLADE/tmp/mac-tsan-observed.TWgj6lk2"
+          ],
+          "start": "2026-11-09T23:59:08.134856+00:00",
+          "end": "2026-11-09T23:59:09.781803+00:00",
+          "seconds": 1.646974749979563,
+          "result": 0
+        },
+        {
+          "name": "build",
+          "command": [
+            "cmake",
+            "--build",
+            "/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/build",
+            "--parallel",
+            "1"
+          ],
+          "start": "2026-11-09T23:59:09.816196+00:00",
+          "end": "2026-11-10T00:01:51.368582+00:00",
+          "seconds": 161.55254683305975,
+          "result": 0
+        },
+        {
+          "name": "test",
+          "command": [
+            "ctest",
+            "--test-dir",
+            "/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/build",
+            "--parallel",
+            "1",
+            "--output-on-failure",
+            "--output-junit",
+            "/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/tests.xml"
+          ],
+          "start": "2026-11-10T00:01:51.453902+00:00",
+          "end": "2026-11-10T00:02:36.168002+00:00",
+          "seconds": 44.71416408405639,
+          "result": 0
+        }
+      ],
+      "result": {
+        "ctest_result": 0,
+        "matching_runtime_loaded": true,
+        "runtime_sha256": "ba79ff2e55b670221abbcd28d5becef30eae9b56b9f77d9a6a9673f4e356eae2",
+        "race_warning_present": false,
+        "runtime_check_failure": false,
+        "source_unchanged": true,
+        "scope": "Frozenmaster0fb7a09 currentheadlessbackendwholeMacTSan withmatchingqualifiedLLVM23.1.4patchedDarwinerrno-lifetimeruntime. AllcurrentconfiguredTUs instrumented; no sanitizerexclusions, no positiveMacpublication/Windows/hierarchy/archivewriterclaim."
+      },
+      "runtime_sha256": "ba79ff2e55b670221abbcd28d5becef30eae9b56b9f77d9a6a9673f4e356eae2",
+      "changed_test_objects_fresh": true,
+      "test_deadlines_exclusions_cmake_unchanged": true
+    },
+    "integration": {
+      "live_reviewed_tree_baseline_sha256": "e704e972dc849541ed2f132f0ff6a9944a094e20f4d7e8e6670221e6d0b8bd25",
+      "receiver_reviewed_tree_final_sha256": "329f7cc276cc54ecd1e036b5dec88fd2be404a46e366b58ea0ec065f09df5c01",
+      "patch_sha256": "ba3bc368261e285e34380f6812b9f7e4febdff1805d3e7e4807c71c45a92a3ab",
+      "narrow_patch_applied": true,
+      "live_files_edited": false
+    },
+    "prior_evidence": [
+      {
+        "path": "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/current-mac-tsan-v10-mktdpt4_",
+        "result": "55/65; original preserved, no output removed"
+      },
+      {
+        "path": "/Volumes/S8T/tmp/mac-tsan-fixtures.DfhhE0k2",
+        "result": "58/65 failed; source, logs, hashes preserved; build retired only after final green"
+      },
+      {
+        "path": "/Volumes/S8T/tmp/mac-tsan-final.IUT7Fv49",
+        "result": "first65/65, repeated64/65 due journal_scope.ancestor_changed before review; source and all failure evidence preserved; build retired after final green"
+      }
+    ],
+    "scope_limits": [
+      "Native Mac publication and directory-atime execution remain precisely Unsupported; no positive publication/replay claim.",
+      "Review receipts authorize no execution when capability admission refuses; no source/target/journal effects proven. Failed ordinary job attempt counts one processed item and zero bytes.",
+      "One prior repeated-run ancestor-change refusal remains unexplained. Passive test fstat diagnostics do not change native status/errno, retry, or weaken production guard; new cohort passing does not establish root cause.",
+      "Old authoritative-result.json matching_runtime_loaded=false was a path-only checker error: log loads verified /build/lib/darwin runtime, byte-identical to resource copy. Original evidence retained.",
+      "No production, SDK, CMake, deadline, sanitizer exclusion or live repository changes. Windows-specific receiver hunk retained; no new Windows native qualification."
+    ],
+    "retired_outputs": [
+      {
+        "path": "/Volumes/S8T/tmp/mac-tsan-fixtures.DfhhE0k2/build",
+        "state": "retired after exact process/open-file check",
+        "artifact_manifest_sha256": "259e34b5a06a82992c36285810e5028194314819c7ef598a55c3d8cfab15b0e2"
+      },
+      {
+        "path": "/Volumes/S8T/tmp/mac-tsan-final.IUT7Fv49/build",
+        "state": "retired after exact process/open-file check",
+        "artifact_manifest_sha256": "1a5277f727db6694da7b7af11183c50022d4aaf94e63d4ed876183e683a05e00"
+      }
+    ],
+    "current_verified_build": "/Volumes/S8T/tmp/mac-tsan-observed.fm95y3Im/build",
+    "active_owned_pids": [],
+    "cpu_slot": "Explicitly returned to Main; no further compiler/test jobs after freeze"
+  },
+  "prior_patch_manifest": {
+    "tests/mac_capability_fixture.hpp": {
+      "baseline_sha256": null,
+      "candidate_sha256": "806353cd1aa6c083c443cff6e09c00a27cf652786cc2a6ad81bcb30440ec1fd4"
+    },
+    "tests/native_regular_metadata_job_tests.cpp": {
+      "baseline_sha256": "481be0ef72743212741e2c4eb9ceaa58c328e27d39929b8651f1cb6661847f1c",
+      "candidate_sha256": "0377501b277c3940503bb84ffd41266bc1a58045c3181617dca9748fe75aa2a9"
+    },
+    "tests/hardlink_source_capture_tests.cpp": {
+      "baseline_sha256": "e36e6de293fbcb04c7af76c9efd01721998895355102e8015c56fb6b0a5e2672",
+      "candidate_sha256": "e7d843563d7d5217b49a43765e4446556837c0071cda84e3f7df811f9cd01691"
+    },
+    "tests/regular_metadata_preservation_tests.cpp": {
+      "baseline_sha256": "2a611e976fb9cc917823a8993004713782617d1c15fb39778fe058a40204ecc7",
+      "candidate_sha256": "271d6ca46f6807ae1bab3fc9798fea8d8d819bd8fa12d738c8963628badd829b"
+    },
+    "tests/job_lifecycle_tests.cpp": {
+      "baseline_sha256": "3ca9a507e74853ff57a863c5b6d5eb6e8f16c5397c12551f84e0ea6f41bb1d70",
+      "candidate_sha256": "5c6d643e2934054d1c845284b8bd82a32200a1438e399b0677a27f06b3eee124"
+    },
+    "tests/reviewed_tree_plan_tests.cpp": {
+      "baseline_sha256": "55ab634d9ceae0da8c1ff9c63f6e48c23856d9b0a641e998cff0a3ef54b84832",
+      "candidate_sha256": "aebbe0b6ccf467d9a01aa3974c3ae8ede1f852d7e3c36d5a31b072dc8389a675"
+    },
+    "tests/tree_c_tests.cpp": {
+      "baseline_sha256": "58a32ecb6c2e3525d263297036e9357a1d42ec9ea3ca81ff178f1d96728943b7",
+      "candidate_sha256": "888adb9744a567d1e4e2544e78ddf7301730a10e0c22df7f8b1c6ebca56dd7c5"
+    },
+    "tests/run_tree_c.py": {
+      "baseline_sha256": "dbaaa73d491c483be0d4f226cb6ec3df8b9dddc7a69179097f00e4a68d382934",
+      "candidate_sha256": "8f1aff531384835b2efbf4fabc6c684fb5a8234bd1719f4fb121b0431887deae"
+    }
+  },
+  "main_changes": [
+    "Keep copyright/SPDX before includes in two test TUs.",
+    "Rename the Mac helper to execution_refusal to match the actual admission phase."
+  ],
+  "current_file_hashes": {
+    "tests/mac_capability_fixture.hpp": "806353cd1aa6c083c443cff6e09c00a27cf652786cc2a6ad81bcb30440ec1fd4",
+    "tests/native_regular_metadata_job_tests.cpp": "0377501b277c3940503bb84ffd41266bc1a58045c3181617dca9748fe75aa2a9",
+    "tests/hardlink_source_capture_tests.cpp": "e7d843563d7d5217b49a43765e4446556837c0071cda84e3f7df811f9cd01691",
+    "tests/regular_metadata_preservation_tests.cpp": "271d6ca46f6807ae1bab3fc9798fea8d8d819bd8fa12d738c8963628badd829b",
+    "tests/job_lifecycle_tests.cpp": "5c6d643e2934054d1c845284b8bd82a32200a1438e399b0677a27f06b3eee124",
+    "tests/reviewed_tree_plan_tests.cpp": "c2a86384c7a5a8670eabb7560993e0fa3d85c27a8da1339ebb69b6535ec3ebba",
+    "tests/tree_c_tests.cpp": "a6ceea98afac93e1fb2fda16893cadde59706de849a1d4b60eac945bc43979a7",
+    "tests/run_tree_c.py": "8f1aff531384835b2efbf4fabc6c684fb5a8234bd1719f4fb121b0431887deae"
+  },
+  "status": "QUALIFIED current Main product/header bytes and exact final fixture bytes;65/65defaultMacTSanPASS zeroSkipped",
+  "current_qualification": {
+    "source_base": "0be3748144da9ea63cbcb4b2a4d991c6da317f67",
+    "source_manifest_sha256": "c226a3cc5aad30b1aaa8b20f47d94a9bccdc3a59daa3b48406bbcba4b3755795",
+    "tests": {
+      "name": "Darwin-clang++",
+      "tests": "65",
+      "failures": "0",
+      "disabled": "0",
+      "skipped": "0",
+      "hostname": "mac-studio.lan",
+      "time": "45",
+      "timestamp": "2026-11-10T01:09:25"
+    },
+    "result": {
+      "ctest_result": 0,
+      "matching_runtime_loaded": true,
+      "runtime_sha256": "ba79ff2e55b670221abbcd28d5becef30eae9b56b9f77d9a6a9673f4e356eae2",
+      "race_warning_present": false,
+      "runtime_check_failure": false,
+      "source_unchanged": true,
+      "scope": "Current0be3748 product/header bytes plus exact final Mac fixture changes and prior Windows corrections; fresh allconfiguredTUs with matching LLVM23.1.4 and qualifiedDarwinv3TSan. No exclusions; no positiveMacpublication/nativeGUI/Windows/hierarchy/archive claim."
+    },
+    "translation_units": 187,
+    "prelaunch_sha256": "7cff27cc3e125ac0a7b0b95ebad8684901645d3bdf4f43e04d8ef73f9c96eccc",
+    "prelaunch_utc": "2026-11-10T00:09:25.783314+00:00",
+    "test_start": "2026-11-10T00:09:25.785783+00:00",
+    "build_seconds": 158.26322862505913,
+    "test_seconds": 45.97552870900836,
+    "stages": [
+      {
+        "name": "configure",
+        "command": [
+          "cmake",
+          "-S",
+          "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/current-mac-tsan-v13-95bwxpov/source",
+          "-B",
+          "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/current-mac-tsan-v13-95bwxpov/build",
+          "-G",
+          "Ninja",
+          "-DBUILD_TESTING=ON",
+          "-DCK_CORE_FS_BUILD_BROWSER=ON",
+          "-DCMAKE_BUILD_TYPE=",
+          "-DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang",
+          "-DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++",
+          "-DCMAKE_C_FLAGS=-O1 -g0 -UNDEBUG -fsanitize=thread -fno-omit-frame-pointer -resource-dir=/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/resource",
+          "-DCMAKE_CXX_FLAGS=-O1 -g0 -UNDEBUG -fsanitize=thread -fno-omit-frame-pointer -resource-dir=/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/resource",
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread -resource-dir=/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/resource",
+          "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread -resource-dir=/Volumes/S8T/tmp/ck-tsan-permanent-runtime-v3/resource",
+          "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+          "-DCMAKE_INSTALL_PREFIX=/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/current-mac-tsan-v13-95bwxpov/install",
+          "-DCK_CORE_FS_NATIVE_TEST_ROOT=/Volumes/PRO-BLADE/tmp/ckfs-current-tsan-v13-bs4k96_8"
+        ],
+        "start": "2026-11-10T00:06:45.333470+00:00",
+        "end": "2026-11-10T00:06:47.365852+00:00",
+        "seconds": 2.032415207941085,
+        "result": 0
+      },
+      {
+        "name": "build",
+        "command": [
+          "cmake",
+          "--build",
+          "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/current-mac-tsan-v13-95bwxpov/build",
+          "--parallel",
+          "1"
+        ],
+        "start": "2026-11-10T00:06:47.407767+00:00",
+        "end": "2026-11-10T00:09:25.670836+00:00",
+        "seconds": 158.26322862505913,
+        "result": 0
+      },
+      {
+        "name": "test",
+        "command": [
+          "ctest",
+          "--test-dir",
+          "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/current-mac-tsan-v13-95bwxpov/build",
+          "--parallel",
+          "1",
+          "--output-on-failure",
+          "--output-junit",
+          "/Volumes/S8T/tmp/ck-core-fs-hardening.6j2hcco1/current-mac-tsan-v13-95bwxpov/tests.xml"
+        ],
+        "start": "2026-11-10T00:09:25.785783+00:00",
+        "end": "2026-11-10T00:10:11.761247+00:00",
+        "seconds": 45.97552870900836,
+        "result": 0
+      }
+    ],
+    "verified_current_product_header_test_files": 416,
+    "current_input_hashes": {
+      "tests/mac_capability_fixture.hpp": "806353cd1aa6c083c443cff6e09c00a27cf652786cc2a6ad81bcb30440ec1fd4",
+      "tests/native_regular_metadata_job_tests.cpp": "0377501b277c3940503bb84ffd41266bc1a58045c3181617dca9748fe75aa2a9",
+      "tests/hardlink_source_capture_tests.cpp": "e7d843563d7d5217b49a43765e4446556837c0071cda84e3f7df811f9cd01691",
+      "tests/regular_metadata_preservation_tests.cpp": "271d6ca46f6807ae1bab3fc9798fea8d8d819bd8fa12d738c8963628badd829b",
+      "tests/job_lifecycle_tests.cpp": "5c6d643e2934054d1c845284b8bd82a32200a1438e399b0677a27f06b3eee124",
+      "tests/reviewed_tree_plan_tests.cpp": "c2a86384c7a5a8670eabb7560993e0fa3d85c27a8da1339ebb69b6535ec3ebba",
+      "tests/tree_c_tests.cpp": "a6ceea98afac93e1fb2fda16893cadde59706de849a1d4b60eac945bc43979a7",
+      "tests/run_tree_c.py": "8f1aff531384835b2efbf4fabc6c684fb5a8234bd1719f4fb121b0431887deae"
+    },
+    "limits": "Earlierancestor_changedfailureunexplainedandretained; no positiveMacpublication/nativeGUI/newWindows/hierarchy/archiveclaim."
+  }
+}

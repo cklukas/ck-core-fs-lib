@@ -1172,3 +1172,36 @@ verified before importing the one-file change. See
 `qualification/windows-native-close-registration-20261110.json` in the source
 repository. The three installed-consumer startup timeouts remain unresolved;
 this configuration fix does not qualify that separate runtime gate.
+
+
+## November 10 current macOS capability fixtures and TSan
+
+The current `0be3748` product/private-header bytes with the final Mac fixture
+corrections passed **65/65 default CTest entries, zero skipped**, under the
+matching LLVM 23.1.4 and qualified Darwin v3 ThreadSanitizer runtime. A fresh
+whole build compiled all 187 translation units in 158.26 seconds; tests took
+45.98 seconds. Every object and executable was hashed before launch and checked
+unchanged afterward, along with source and runtime hashes. No race warning or
+runtime check failure was reported. The comparable 187-TU builds took 161.55
+and 188.69 seconds; actual compilation and fingerprints establish freshness.
+
+The eight test files now exercise exact Mac capability refusals instead of
+expecting unsupported positive publication. Checks include unchanged source and
+target identity/content/metadata, journal states without publication claims,
+no replay on cached polling, native drainage, zero copied bytes and zero achieved
+preservation fields. A failed C copy attempt counts one processed item. Tree
+review can issue a receipt; execution admission still refuses the missing native
+directory-atime capability before effects. Retention, capture, aliases, model
+rules, cancellation and teardown retain their independent checks. Existing
+Windows fixture corrections are preserved. No product guard, timeout, sanitizer
+exclusion or CMake test registration changed.
+
+The earlier 55/65 and 58/65 cohorts remain failures in their original evidence.
+A subsequent repeated cohort failed 64/65 at `journal_scope.ancestor_changed`;
+its cause remains unexplained. Passive native-stat diagnostics preserve return
+values and errno, and a later passing cohort does not establish why that earlier
+failure occurred. This receipt is a passing current cohort, not a claim that the
+intermittent ancestry issue is fixed. Positive strong publication on macOS,
+native-window acceptance, newer Windows/current combined SDKs and the unmerged
+hierarchy/archive work remain separate gates. Exact records are in
+`qualification/macos-capability-fixtures-20261110.json`.

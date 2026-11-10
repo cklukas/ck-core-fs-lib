@@ -6,6 +6,7 @@
 #undef main
 #include "native_regular_metadata_job.hpp"
 #include "staging_file.hpp"
+#include "mac_capability_fixture.hpp"
 #ifdef _WIN32
 #include <malloc.h>
 #endif
@@ -175,6 +176,27 @@ void regular_case(MetadataOwnership ownership,unsigned outcome) {
     check(source->budget->retained_handle_reservations()==0,"source native reservations leaked");
     std::cout<<"native regular metadata ownership="<<unsigned(ownership)<<" outcome="<<outcome<<" PASS\n";
 }
+#if defined(__APPLE__)
+void mac_staging_admission(MetadataOwnership ownership){
+ Fixture fixture;RegularState state(fixture);
+ auto source=std::make_shared<RegularSource>(fixture,state.root,ownership);
+ const auto before=mac_capability_fixture::observe(fixture.root);
+ const auto reads=native_reads.load();
+ for(unsigned attempt=0;attempt<3;++attempt){
+  const auto refused=fixture.directory->create_staging_file(regular_name(".regular-stage"));
+  check(!refused.value()&&refused.state()==ObservationState::Unsupported&&refused.unavailable_detail()->error.domain==ErrorDomain::Adapter&&
+    refused.unavailable_detail()->error.code==4&&refused.unavailable_detail()->error.operation=="create_staging_file.fd_publication_unqualified",
+    "Mac regular writer needs a qualified staging provider");
+ }
+ check(native_reads==reads,"staging refusal read source content");
+ check(mac_capability_fixture::observe(fixture.root)==before,"staging refusal modified source/state namespace");
+ check(take(source->finish()),"fallible source proof drain");
+ check(source->proof->io_finished()&&source->budget->retained_handle_reservations()==0,"refused staging leaked source proof readers");
+ check(take(state.root->finish_io()),"refused staging lost Root close result");
+ std::printf("Mac regular metadata prerequisite REFUSED ownership=%u; source proof/drain qualified, replay not entered\n",unsigned(ownership));
+}
+#endif
+
 }
 void* operator new(std::size_t size){
     if(persistent_final_diagnostic_failure){++persistent_diagnostic_attempts;throw std::bad_alloc();}
@@ -196,10 +218,15 @@ void operator delete[](void* value,std::align_val_t)noexcept{_aligned_free(value
 void operator delete(void* value,std::size_t,std::align_val_t)noexcept{_aligned_free(value);}
 void operator delete[](void* value,std::size_t,std::align_val_t)noexcept{_aligned_free(value);}
 #endif
-int main(){try{regular_case(MetadataOwnership::Original,0);regular_case(MetadataOwnership::CurrentCaller,0);
+int main(){try{
+#ifdef __APPLE__
+    mac_staging_admission(MetadataOwnership::Original);mac_staging_admission(MetadataOwnership::CurrentCaller);
+#else
+    regular_case(MetadataOwnership::Original,0);regular_case(MetadataOwnership::CurrentCaller,0);
     regular_case(MetadataOwnership::Original,1);regular_case(MetadataOwnership::Original,2);
 #ifdef _WIN32
     regular_case(MetadataOwnership::Original,3);
+#endif
 #endif
     return 0;
 }catch(const std::exception& e){persistent_final_diagnostic_failure=false;frame=false;close_watch=false;close_armed=false;std::fprintf(stderr,"native_regular_metadata_job: %s\n",e.what());return 1;}}
