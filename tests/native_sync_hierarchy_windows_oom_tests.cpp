@@ -102,7 +102,35 @@ std::filesystem::path ext(std::filesystem::path p){auto s=windows_extended_path(
 DWORD handles(){DWORD count=0;CHECK(GetProcessHandleCount(GetCurrentProcess(),&count));return count;}
 struct Fixture {
  std::filesystem::path root;PreparedJournalRoot::Pointer journal;std::vector<std::filesystem::path> dirs;bool nested;
- explicit Fixture(bool with_nested=true):nested(with_nested){auto t=env(L"TEMP");CHECK(t);root=ext(*t);CHECK(root.native().starts_with(L"\\\\?\\V:\\tmp\\"));static unsigned sequence=0;root/=L"hierarchy-oom-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64())+L"-"+std::to_wstring(sequence++);mkdir(root);mkdir(root/L"left");mkdir(root/L"right");NativeFileSystem fs;PreparedJournalRootRequest request;request.parent=std::shared_ptr<const DirectoryCursor>(get(fs.open_directory(root)));request.child=name(L"store");request.disposition=JournalRootDisposition::ProvisionChild;request.navigation_hint=address(L"store");JournalRootPreparationProgress progress;journal=get(prepare_native_journal_root(std::move(request),progress));dirs.push_back(root/L"store");if(nested)add_nested();else{write(root/L"left/a");write(root/L"right/a");}}
+ explicit Fixture(bool with_nested = true) : nested(with_nested) {
+  const auto temp = env(L"TEMP");
+  CHECK(temp);
+  root = ext(*temp);
+  // Hosted CTest supplies its explicit runner fixture root.
+  if (const auto require_v = env(L"CK_FS_REQUIRE_V_DEV_DRIVE"); require_v && *require_v == L"1")
+   CHECK(root.native().starts_with(L"\\\\?\\V:\\tmp\\"));
+  static unsigned sequence = 0;
+  root /= L"hierarchy-oom-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+      std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(sequence++);
+  mkdir(root);
+  mkdir(root/L"left");
+  mkdir(root/L"right");
+  NativeFileSystem fs;
+  PreparedJournalRootRequest request;
+  request.parent = std::shared_ptr<const DirectoryCursor>(get(fs.open_directory(root)));
+  request.child = name(L"store");
+  request.disposition = JournalRootDisposition::ProvisionChild;
+  request.navigation_hint = address(L"store");
+  JournalRootPreparationProgress progress;
+  journal = get(prepare_native_journal_root(std::move(request), progress));
+  dirs.push_back(root/L"store");
+  if (nested) {
+   add_nested();
+  } else {
+   write(root/L"left/a");
+   write(root/L"right/a");
+  }
+ }
  void mkdir(std::filesystem::path p){p=ext(std::move(p));CHECK(CreateDirectoryW(p.c_str(),nullptr));dirs.push_back(std::move(p));}
  void write(std::filesystem::path p){p=ext(std::move(p));HANDLE h=CreateFileW(p.c_str(),GENERIC_WRITE|FILE_READ_ATTRIBUTES,7,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);CHECK(h!=INVALID_HANDLE_VALUE);DWORD written=0;const char b='x';CHECK(WriteFile(h,&b,1,&written,nullptr)&&written==1&&FlushFileBuffers(h));CHECK(CloseHandle(h));}
  void add_nested(){mkdir(root/L"left/d");mkdir(root/L"left/d/e");write(root/L"left/d/e/file");nested=true;}

@@ -64,7 +64,10 @@ struct Fixture {
         std::wstring temp(size,L'\0');CHECK(GetEnvironmentVariableW(L"TMPDIR",temp.data(),size)==size-1);temp.pop_back();
         CHECK(GetEnvironmentVariableW(L"TEMP",nullptr,0)>1&&GetEnvironmentVariableW(L"TMP",nullptr,0)>1);
         auto normalized=windows_extended_path(temp);CHECK(normalized);temp=std::move(*normalized);
-        CHECK(temp.starts_with(L"V:\\tmp\\")||temp.starts_with(L"\\\\?\\V:\\tmp\\"));
+        // Hosted CTest supplies its explicit runner fixture root.
+        wchar_t require_v[2]{};
+        if(GetEnvironmentVariableW(L"CK_FS_REQUIRE_V_DEV_DRIVE",require_v,2)==1&&require_v[0]==L'1')
+            CHECK(temp.starts_with(L"\\\\?\\V:\\tmp\\"));
         path=std::filesystem::path(temp)/(L"action-private-scope-"+std::to_wstring(GetCurrentProcessId()));mkdir_private(path);
 #else
         const auto* temp=std::getenv("TMPDIR");CHECK(temp&&*temp);
