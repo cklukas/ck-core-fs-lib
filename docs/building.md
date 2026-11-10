@@ -43,6 +43,16 @@ cohorts to validate the migrated fixtures. Full Windows qualification still
 requires passing native tests in matching normal and ASan cohorts, plus
 production-OFF artifact checks. The separate workspace-wrapper handle-count
 experiment remains under investigation.
+
+The action-scope test uses a dedicated NTFS virtual disk labeled
+`CKFEA05SCOPE`. Hosted Windows CI provisions and removes the disk within its
+runner workspace. For workstation qualification, provide the exact attached
+image as `QUALIFICATION_ACTION_SCOPE_VHD` and its dedicated mounted workspace
+as `QUALIFICATION_ACTION_SCOPE_ROOT`, both below `V:\tmp`. The launcher checks
+that the held volume belongs to that image and is distinct from the ordinary
+NTFS and ReFS fixtures before the test can modify its Recycle Bin. Missing or
+mismatched isolation fails the registered test.
+
 The independently qualified, scoped journal-close target is described in
 [the native contracts](native-contracts.md#windows-journal-temporary-close-errors).
 

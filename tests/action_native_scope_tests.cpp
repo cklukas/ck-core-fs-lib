@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <source_location>
+#include <string_view>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -165,14 +166,21 @@ NativeTrashReceipt close_failure(PreparedJournalRoot::Pointer root,std::shared_p
     CHECK(take(parent->lookup_child(leaf,ChildLookupMode::NativeDefault)).state()==ChildLookupState::Missing);
     return receipt;
 }
-void run(const std::filesystem::path& path) {
+void run(const std::filesystem::path& path, std::wstring_view admitted_volume, bool hosted) {
     wchar_t isolated[2]{};
     CHECK(GetEnvironmentVariableW(L"CKFEA_ISOLATED_SCOPE_VOLUME",isolated,2)==1&&isolated[0]==L'1');
     CHECK(GetEnvironmentVariableW(L"TMPDIR",nullptr,0)>1&&GetEnvironmentVariableW(L"TEMP",nullptr,0)>1&&
         GetEnvironmentVariableW(L"TMP",nullptr,0)>1);
-    CHECK(path.native().starts_with(L"V:\\tmp\\")||path.native().starts_with(L"\\\\?\\V:\\tmp\\"));
+    if (hosted) {
+        CHECK(admitted_volume.size()==49&&path.native().size()>admitted_volume.size());
+        CHECK(CompareStringOrdinal(path.native().data(),static_cast<int>(admitted_volume.size()),
+                                   admitted_volume.data(),static_cast<int>(admitted_volume.size()),TRUE)==CSTR_EQUAL);
+    } else {
+        CHECK(path.native().starts_with(L"V:\\tmp\\")||path.native().starts_with(L"\\\\?\\V:\\tmp\\"));
+    }
     NativeFileSystem fs;auto base=std::shared_ptr<const DirectoryCursor>(take(fs.open_directory(path)));
     const auto native_volume=volume(base); // Refuse Main's shared Disk5 label.
+    CHECK(std::wstring_view(native_volume)==admitted_volume);
     auto sources=mkdir(base,"sources");auto control=mkdir(base,"control");
     CHECK(take(prepare_native_operation_journal_root(take(NativeAbsolutePath::from_host(path/L"control")))));
     auto active=prepare(control);file(sources,name("bootstrap"));
@@ -237,7 +245,9 @@ void run(const std::filesystem::path& path) {
 }
 #ifdef _WIN32
 int wmain(int argc,wchar_t** argv) {
-    CHECK(argc==2);run(std::filesystem::path(argv[1]));std::printf("native_action_scope: %u checks passed\n",checks);
+    CHECK(argc==3||(argc==4&&std::wstring_view(argv[3])==L"--hosted"));
+    run(std::filesystem::path(argv[1]),argv[2],argc==4);
+    std::printf("native_action_scope: %u checks passed\n",checks);
 }
 #else
 int main(int argc,char** argv) {

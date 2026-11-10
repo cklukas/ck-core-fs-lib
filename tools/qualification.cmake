@@ -51,13 +51,33 @@ if(CMAKE_HOST_WIN32)
   if(NOT DEFINED QUALIFICATION_NATIVE_TEST_ROOT OR NOT IS_ABSOLUTE "${QUALIFICATION_NATIVE_TEST_ROOT}")
     message(FATAL_ERROR "Select the actual Windows fixture root explicitly with QUALIFICATION_NATIVE_TEST_ROOT")
   endif()
+  set(workstation_paths QUALIFICATION_OUTPUT QUALIFICATION_NATIVE_TEST_ROOT)
+  foreach(key QUALIFICATION_ACTION_SCOPE_ROOT QUALIFICATION_ACTION_SCOPE_VHD)
+    if(NOT "${${key}}" STREQUAL "")
+      if(key STREQUAL "QUALIFICATION_ACTION_SCOPE_ROOT" AND "${${key}}" MATCHES "^hosted-guid:")
+        if(NOT "$ENV{GITHUB_ACTIONS}" STREQUAL "true" OR
+            NOT "$ENV{RUNNER_ENVIRONMENT}" STREQUAL "github-hosted" OR
+            NOT "$ENV{RUNNER_OS}" STREQUAL "Windows" OR
+            "$ENV{CK_FS_REQUIRE_V_DEV_DRIVE}" STREQUAL "1" OR
+            NOT "${${key}}" MATCHES "^hosted-guid:[0-9A-Fa-f-]+$" OR
+            "${QUALIFICATION_ACTION_SCOPE_VHD}" STREQUAL "")
+          message(FATAL_ERROR "Hosted action scope requires GitHub-hosted Windows, a volume GUID and its owned image")
+        endif()
+      else()
+        if(NOT IS_ABSOLUTE "${${key}}" OR "${${key}}" MATCHES ";")
+          message(FATAL_ERROR "${key} must be an explicit absolute path")
+        endif()
+        list(APPEND workstation_paths "${key}")
+      endif()
+    endif()
+  endforeach()
   # Workstation launchers opt into the mandatory development-drive policy.
   # Hosted Windows uses its controlled absolute runner temporary storage.
   if("$ENV{CK_FS_REQUIRE_V_DEV_DRIVE}" STREQUAL "1")
     if(NOT EXISTS "V:/")
       message(FATAL_ERROR "Windows workstation development drive V: is unavailable")
     endif()
-    foreach(key QUALIFICATION_OUTPUT QUALIFICATION_NATIVE_TEST_ROOT)
+    foreach(key IN LISTS workstation_paths)
       # Lexical policy key only: retain ${key}'s native spelling for I/O.
       string(REPLACE "\\" "/" native_path "${${key}}")
       if(native_path MATCHES "^//[?]/[A-Za-z]:/")
@@ -216,8 +236,11 @@ if(CMAKE_HOST_WIN32)
   run(windows-source-preflight "${qualification_python}" "${source}/tools/check_windows_runtime_hooks.py"
     --source "${source}" --report "${QUALIFICATION_OUTPUT}/windows-hook-preflight.json")
   list(APPEND options "-DCK_CORE_FS_ARCHIVE_TEST_FS=${QUALIFICATION_WINDOWS_TEST_FS}"
-    "-DCK_CORE_FS_METADATA_TARGET_NATIVE_FS=${QUALIFICATION_WINDOWS_TEST_FS}")
+    "-DCK_CORE_FS_METADATA_TARGET_NATIVE_FS=${QUALIFICATION_WINDOWS_TEST_FS}"
+    "-DCK_CORE_FS_ACTION_SCOPE_ROOT=${QUALIFICATION_ACTION_SCOPE_ROOT}"
+    "-DCK_CORE_FS_ACTION_SCOPE_VHD=${QUALIFICATION_ACTION_SCOPE_VHD}")
   record("Windows expected fixture provider=${QUALIFICATION_WINDOWS_TEST_FS}; archive and metadata targets receive the same explicit value; native held-provider preflight remains independent.")
+  record("Action scope workspace=${QUALIFICATION_ACTION_SCOPE_ROOT}; image=${QUALIFICATION_ACTION_SCOPE_VHD}; action_native_scope requires independent native admission of an owned NTFS VHD.")
 endif()
 set(build "${QUALIFICATION_OUTPUT}/build")
 run(configure "${CMAKE_COMMAND}" -S "${source}" -B "${build}"

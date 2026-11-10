@@ -843,14 +843,20 @@ if(BUILD_TESTING)
   set_tests_properties(action_private_scope PROPERTIES TIMEOUT 180
     ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
   if(WIN32)
+    set(CK_CORE_FS_ACTION_SCOPE_ROOT "" CACHE STRING "Dedicated NTFS VHD workspace or hosted-guid:<UUID>")
+    set(CK_CORE_FS_ACTION_SCOPE_VHD "" CACHE FILEPATH "Exact attached image backing the action-scope workspace")
     add_executable(ck_fs_action_native_scope_tests tests/action_native_scope_tests.cpp)
     target_link_libraries(ck_fs_action_native_scope_tests PRIVATE ck_core_fs_native)
     target_compile_options(ck_fs_action_native_scope_tests PRIVATE /UNDEBUG)
+    set(_action_data_roots "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    if(CK_CORE_FS_TEST_READER_CLOSE_WINDOWS)
+      list(APPEND _action_data_roots "${CK_CORE_FS_READER_CLOSE_NTFS_ROOT}" "${CK_CORE_FS_READER_CLOSE_REFS_ROOT}")
+    endif()
     add_test(NAME action_native_scope COMMAND ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py
-      $<TARGET_FILE:ck_fs_action_native_scope_tests> ${CK_CORE_FS_NATIVE_TEST_ROOT})
-    set_tests_properties(action_native_scope PROPERTIES TIMEOUT 180
-      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_action_scope_fixture_windows.py"
+      $<TARGET_FILE:ck_fs_action_native_scope_tests>
+      "${CK_CORE_FS_ACTION_SCOPE_ROOT}" "${CK_CORE_FS_ACTION_SCOPE_VHD}" ${_action_data_roots})
+    set_tests_properties(action_native_scope PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
   endif()
   add_executable(ck_fs_tree_diagnostics_c_tests tests/tree_diagnostics_c_tests.c)
   target_link_libraries(ck_fs_tree_diagnostics_c_tests PRIVATE ck_file_engine_c)

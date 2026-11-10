@@ -94,6 +94,13 @@ jobs:
             [IO.Directory]::CreateDirectory($fixture) | Out-Null
             $provider = & ./tools/windows_fixture_provider.ps1 -FixtureRoot $fixture -Report (Join-Path $env:TMPDIR 'windows-provider.json')
             $qualification += "-DQUALIFICATION_WINDOWS_TEST_FS=$provider", "-DQUALIFICATION_NATIVE_TEST_ROOT=$fixture"
+            if ($env:RUNNER_ENVIRONMENT -ceq 'github-hosted' -and $env:CK_FS_REQUIRE_V_DEV_DRIVE -cne '1') {
+              $cmake = (Get-Command cmake.exe -CommandType Application).Source
+              python -B tools/hosted_action_scope_vhd.py $fixture --cmake $cmake @qualification -P tools/qualification.cmake
+              exit $LASTEXITCODE
+            }
+            # A V: workstation caller supplies its independently owned attached image.
+            $qualification += "-DQUALIFICATION_ACTION_SCOPE_ROOT=$env:CK_CORE_FS_ACTION_SCOPE_ROOT", "-DQUALIFICATION_ACTION_SCOPE_VHD=$env:CK_CORE_FS_ACTION_SCOPE_VHD"
           }
           # The helper refuses stale output directories; bootstrap/preflight lives separately.
           cmake @qualification -P tools/qualification.cmake

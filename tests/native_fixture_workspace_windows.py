@@ -72,11 +72,16 @@ class _NativeReleases:
         if remaining:
             raise self.stop
 
-def run_fixture(binary, parent, provider, args, *, seed=False, _native_observer=None):
+def run_fixture(binary, parent, provider, args, *, seed=False, _native_observer=None,
+                _admit_action_scope=None, _hosted_scope_lease=None):
     if os.name != "nt":
         raise RuntimeError("Windows only: binary explicit-parent NTFS|ReFS [args]")
     if provider not in ("NTFS", "ReFS"):
         raise ValueError("explicit native provider required")
+    if _admit_action_scope is not None and (seed or provider != "NTFS" or args):
+        raise ValueError("action scope requires its own NTFS workspace")
+    if _hosted_scope_lease is not None and _admit_action_scope is None:
+        raise ValueError("a hosted lease requires native action admission")
     if not parent.startswith("\\\\?\\"):
         parent = parent.replace("/", "\\")
         if parent.startswith("\\\\"):
@@ -207,6 +212,12 @@ def run_fixture(binary, parent, provider, args, *, seed=False, _native_observer=
             raise RuntimeError("native parent must be an actual directory, not a final reparse object")
         if actual.value != provider:
             raise RuntimeError("actual native provider does not match explicit selection")
+        scope_guid = None
+        if _admit_action_scope is not None:
+            # Admission reads the already-held parent before any creation.
+            scope_guid = _admit_action_scope(parent_handle)
+            if not scope_guid:
+                raise RuntimeError("missing admitted action scope volume identity")
         require(a.OpenProcessToken(k.GetCurrentProcess(), 8, c.byref(token)))
         observe("open-token", token)
         needed = w.DWORD()
@@ -222,7 +233,8 @@ def run_fixture(binary, parent, provider, args, *, seed=False, _native_observer=
         free(consumed, "sid")
         require(a.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, c.byref(sd), None))
         observe("open-sd", sd)
-        name = ("seed-close-" if seed else "reader-close-") + uuid.uuid4().hex
+        prefix = "action-scope-" if scope_guid else ("seed-close-" if seed else "reader-close-")
+        name = prefix + uuid.uuid4().hex
         root = relative(parent_handle, name, create=True, security=sd)
         work = parent.rstrip("\\") + "\\" + name
         observe("open-root", root)
@@ -233,11 +245,29 @@ def run_fixture(binary, parent, provider, args, *, seed=False, _native_observer=
         close(consumed, "token")
         env = dict(os.environ, TEMP=work, TMP=work, TMPDIR=work)
         # Provider is checked natively above; seed wmain takes ROOT only.
-        command = [binary, work, *args] if seed else [binary, work, provider, *args]
-        child = subprocess.Popen(command, env=env, shell=False)
+        if scope_guid:
+            env["CKFEA_ISOLATED_SCOPE_VOLUME"] = "1"
+            command = [binary, work, scope_guid]
+            child_timeout = 150
+        else:
+            command = [binary, work, *args] if seed else [binary, work, provider, *args]
+            child_timeout = 285 if seed else 45
+        startup = None
+        if _hosted_scope_lease is not None:
+            # The child retains a reference to the same exclusive file object.
+            # CTest killing this wrapper cannot make detach safe while the child lives.
+            command.append("--hosted")
+            startup = subprocess.STARTUPINFO(lpAttributeList={"handle_list": [_hosted_scope_lease]})
+            os.set_handle_inheritable(_hosted_scope_lease, True)
+        try:
+            child = subprocess.Popen(command, executable=binary if scope_guid else None,
+                                     env=env, startupinfo=startup, close_fds=True, shell=False)
+        finally:
+            if _hosted_scope_lease is not None:
+                os.set_handle_inheritable(_hosted_scope_lease, False)
         observe("child-started", child.pid)
         try:
-            result = child.wait(timeout=285 if seed else 45)
+            result = child.wait(timeout=child_timeout)
         except subprocess.TimeoutExpired:
             child.kill()
             child.wait(timeout=3)  # Reap before any cleanup, never leave run()'s150s orphan.
