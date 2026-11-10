@@ -245,8 +245,13 @@ run(test "${CMAKE_CTEST_COMMAND}" --test-dir "${build}" -C "${config}"
 set(prefix "${QUALIFICATION_OUTPUT}/install")
 run(install "${CMAKE_COMMAND}" --install "${build}" --config "${config}" --prefix "${prefix}")
 set(consumer "${QUALIFICATION_OUTPUT}/consumer")
+set(consumer_options "")
+if(flags)
+  list(APPEND consumer_options -DCK_CORE_FS_CONSUMER_CXX_LINKER=ON)
+  record("Installed consumer remains C11; matching C++ final driver supplies the instrumented C++ backend runtime. Ordinary qualification retains the C-only link gate.")
+endif()
 run(consumer-configure "${CMAKE_COMMAND}" -S "${source}/tests/consumer" -B "${consumer}"
-  "-DCMAKE_PREFIX_PATH=${prefix}" ${options})
+  "-DCMAKE_PREFIX_PATH=${prefix}" ${options} ${consumer_options})
 run(consumer-build "${CMAKE_COMMAND}" --build "${consumer}" --config "${config}" --parallel 1 --verbose)
 # Windows DLL resolution uses the installed bin directory, not the build tree.
 if(CMAKE_HOST_WIN32)

@@ -44,7 +44,12 @@ The independently qualified, scoped journal-close target is described in
 [the native contracts](native-contracts.md#windows-journal-temporary-close-errors).
 
 The C ABI smoke test is compiled as a C translation unit and verifies that the
-installed-facing header remains C-compatible. Platform qualification targets the
+installed-facing header remains C-compatible. Its default project enables only
+C and links with the C driver. Sanitizer qualification explicitly enables
+`CK_CORE_FS_CONSUMER_CXX_LINKER=ON`: the source is still compiled as strict C11,
+while the matching C++ driver supplies the instrumented backend's complete
+runtime at the final link, including UBSan vptr support. No sanitizer check or
+runtime symbol is suppressed or stubbed. Platform qualification targets the
 same project on Linux, macOS, and Windows; a platform admission or runtime
 failure remains an open gate. Add path, identity, cancellation,
 and reparse/security regression tests before changing a native boundary.

@@ -1,0 +1,15 @@
+{
+  "scope": "Installed C11 consumer link-driver correction, no product/header changes",
+  "receipt": "/Volumes/PRO-BLADE/Development/ck-core-fs-qualification/c11-sanitizer-link-driver-20261110/receipt-final.json",
+  "receipt_sha256": "31e2cb9540c932650e5f81a591e8eae8d6b2b2e01fc70ab94c297047bbd1fb11",
+  "negative": "Original Clang19 ASan/UBSan C-driver link fails on missing UBSan vptr runtime symbols",
+  "positive": [
+    "Default C-only GNU14 C11 consumer config/build/run PASS, no CXX compiler enabled",
+    "Clang19 C11 compilation plus matching C++ sanitizer final link config/build/run PASS"
+  ],
+  "SDKs_unchanged": {
+    "normal_files": 171,
+    "asan_files": 171
+  },
+  "boundary": "Does not qualify full SDK tests, other platforms, or the entire qualification driver; those gates remain required"
+}
