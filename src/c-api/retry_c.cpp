@@ -168,7 +168,7 @@ void run(std::shared_ptr<RetryState> state,VerifiedCopyRetryRequest request) noe
             auto finished=core->finish_io();
             finish_failed=!finished.value()||!*finished.value();
         }catch(...){finish_failed=true;}
-        if(const auto hook=detail::verified_copy_retry_test_after_drain.load(std::memory_order_acquire))hook();
+        detail::verified_copy_retry_after_drain_checkpoint();
         // All callbacks/finalizers have returned and ownership was drained.
         // Keep the genuine Roots alive while a separate first writer publishes
         // its native tuple. This loop performs memory-only POD readback; it is

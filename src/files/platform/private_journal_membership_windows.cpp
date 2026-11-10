@@ -28,7 +28,7 @@ void native_error(PrivateMembershipFailure& failure,DWORD code,const char* op) n
 }
 void closed(PreparedJournalRoot& root,PrivateMembershipFailure& failure,DWORD code) noexcept {
     if(!code)try {
-        if(private_membership_test_fault)if(auto fault=private_membership_test_fault(PrivateMembershipFaultPoint::Close))code=static_cast<DWORD>(*fault);
+        if(auto fault=private_membership_fault(PrivateMembershipFaultPoint::Close))code=static_cast<DWORD>(*fault);
     } catch(...) {
         record_prepared_journal_consumer_failure(root,ObservationState::Unknown,ErrorDomain::Adapter,
             static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"journal_membership.close_hook");
@@ -116,7 +116,7 @@ struct Scan {
         return true;
     }
     bool hook(PrivateMembershipFaultPoint point) {
-        if(private_membership_test_fault)if(auto fault=private_membership_test_fault(point)) {
+        if(auto fault=private_membership_fault(point)) {
             native_error(failure,static_cast<DWORD>(*fault),"journal_membership.read_hook");return false;
         }
         return running();

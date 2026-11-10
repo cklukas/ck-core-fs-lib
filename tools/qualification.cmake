@@ -245,7 +245,12 @@ run(test "${CMAKE_CTEST_COMMAND}" --test-dir "${build}" -C "${config}"
 set(prefix "${QUALIFICATION_OUTPUT}/install")
 run(install "${CMAKE_COMMAND}" --install "${build}" --config "${config}" --prefix "${prefix}")
 set(consumer "${QUALIFICATION_OUTPUT}/consumer")
-set(consumer_options "")
+# This helper always builds the SDK with BUILD_TESTING=ON. Explicitly match
+# its private header definitions in controlled installed clients; production
+# clients retain the OFF default and SDK targets export no test capabilities.
+set(test_producer_options -DCK_CORE_FS_CONSUMER_MATCH_TEST_PRODUCER=ON)
+set(consumer_options ${test_producer_options})
+record("Installed test clients explicitly match the producer's private testing profile; production OFF prefixes require the default OFF client profile.")
 if(flags)
   list(APPEND consumer_options -DCK_CORE_FS_CONSUMER_CXX_LINKER=ON)
   record("Installed consumer remains C11; matching C++ final driver supplies the instrumented C++ backend runtime. Ordinary qualification retains the C-only link gate.")
@@ -265,7 +270,7 @@ if(DEFINED QUALIFICATION_NATIVE_TEST_ROOT)
   set(layer_fixture_root "${QUALIFICATION_NATIVE_TEST_ROOT}")
 endif()
 run(layer-consumers-configure "${CMAKE_COMMAND}" -S "${source}/tests/installed_layers" -B "${layer_consumers}"
-  "-DCMAKE_PREFIX_PATH=${prefix}" "-DCK_LAYER_FIXTURE_ROOT=${layer_fixture_root}" ${options})
+  "-DCMAKE_PREFIX_PATH=${prefix}" "-DCK_LAYER_FIXTURE_ROOT=${layer_fixture_root}" ${options} ${test_producer_options})
 run(layer-consumers-build "${CMAKE_COMMAND}" --build "${layer_consumers}" --config "${config}" --parallel 1 --verbose)
 run(layer-consumers-test "${CMAKE_CTEST_COMMAND}" --test-dir "${layer_consumers}" -C "${config}"
   --output-on-failure --no-tests=error --parallel 1 --timeout 90)

@@ -33,8 +33,16 @@ namespace detail {
 // Internal failure-only test seam. Close is observed AFTER the actual close;
 // it never skips I/O or manufactures a successful qualification.
 enum class PrivateMembershipFaultPoint { DirectoryReadComplete, BeforeFinalCheck, Close };
+#if defined(CK_FS_INTERNAL_TEST_HOOKS) && CK_FS_INTERNAL_TEST_HOOKS
 using PrivateMembershipFault = std::optional<std::int64_t>(*)(PrivateMembershipFaultPoint);
 inline thread_local PrivateMembershipFault private_membership_test_fault = nullptr;
+inline std::optional<std::int64_t> private_membership_fault(PrivateMembershipFaultPoint point) {
+    const auto fault=private_membership_test_fault;
+    return fault?fault(point):std::nullopt;
+}
+#else
+inline std::optional<std::int64_t> private_membership_fault(PrivateMembershipFaultPoint) { return std::nullopt; }
+#endif
 
 struct PrivateMembershipFailure final {
     ObservationState state = ObservationState::Available;

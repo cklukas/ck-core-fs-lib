@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_filesystem.hpp"
 #include "native_close_test_faults.hpp"
+#include "legacy_native_fixture_windows.hpp"
+#include "native_windows_checked_metadata_io.hpp"
 #include "../native_trash.hpp"
 #include "native_journal_directory_bridge.hpp"
 #include "../operation_journal_file.hpp"
@@ -46,8 +48,23 @@
 #include <string_view>
 #include <utility>
 #include <atomic>
+#include <cerrno>
 
 namespace ck::files {
+#ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
+// Audited source closure of these TEN native request API families in this TU
+// and native_windows_checked_metadata_io.hpp (see guarded call-site manifest).
+// This is test observation coverage, never native filesystem/owner capability.
+// Pending NtCreateFile is only a request: no guessed output/completion event.
+std::uint64_t detail::legacy_native_metadata_coverage()noexcept {
+    using Op=detail::LegacyNativeOperation;
+    return detail::legacy_operation_bit(Op::Read)|detail::legacy_operation_bit(Op::Write)|
+        detail::legacy_operation_bit(Op::Close)|detail::legacy_operation_bit(Op::Duplicate)|
+        detail::legacy_operation_bit(Op::NativeCreate)|detail::legacy_operation_bit(Op::Create)|
+        detail::legacy_operation_bit(Op::OpenById)|detail::legacy_operation_bit(Op::Query)|
+        detail::legacy_operation_bit(Op::Flush)|detail::legacy_operation_bit(Op::SetInfo);
+}
+#endif
 namespace {
 thread_local detail::WindowsJournalCloseObserver journal_close_observer;
 }
@@ -76,46 +93,80 @@ void report_capture_close(DWORD code,const char* operation)noexcept {
 }
 // Failure injection observes a real consumed close; it cannot skip the OS call.
 bool close_native_consumer_handle(HANDLE handle,const char* operation)noexcept {
-#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
-    (void)operation;return CloseHandle(handle)!=FALSE;
-#else
-    const DWORD before=GetLastError();
-    detail::observe_native_close(handle,operation);
-    SetLastError(before);const BOOL native_ok=CloseHandle(handle);
-    const DWORD saved=GetLastError();
-    const DWORD native_error=native_ok?ERROR_SUCCESS:saved;
-    const auto injected=detail::inject_native_close_failure(handle,operation,native_ok!=FALSE,native_error);
-    if(!native_ok){SetLastError(native_error);return false;}
-    if(injected){SetLastError(injected);return false;}
-    SetLastError(saved);return true;
-#endif
+    // One native close + original failure-only injector, both owned by the
+    // shared adapter. Do not wrap this helper with a second close injector.
+    return detail::legacy_close_handle(handle,operation)!=FALSE;
 }
-// Preserve native LastError around observation-only callbacks. These helpers
-// execute exactly one native operation; neither callback can replace its result.
-bool read_native_consumer_file(HANDLE handle,void* bytes,DWORD count,DWORD* copied,const char* operation)noexcept {
+// One genuine native read, followed only by noexcept scalar observation. The
+// first BOOL, copied count, LastError and errno are captured BEFORE observers;
+// pending OVERLAPPED requests remain FALSE/ERROR_IO_PENDING, not completed data.
+// Each callback sees the real native boundary; neither may replace the result.
+bool read_native_consumer_file(HANDLE handle,void* bytes,DWORD count,DWORD* copied,const char* operation,OVERLAPPED* io=nullptr)noexcept {
 #ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
-    (void)operation;return ReadFile(handle,bytes,count,copied,nullptr)!=FALSE;
+    (void)operation;return detail::legacy_read_file(handle,bytes,count,copied,io,"legacy.metadata_windows.ReadFile.1")!=FALSE;
 #else
-    const DWORD before=GetLastError();
+    const DWORD before=GetLastError();const int before_errno=errno;
     detail::observe_native_file_before(handle,detail::NativeTestIo::Read,count,operation);
-    SetLastError(before);const BOOL okay=ReadFile(handle,bytes,count,copied,nullptr);
-    const DWORD error=GetLastError();
+    errno=before_errno;SetLastError(before);const BOOL okay=detail::legacy_read_file(handle,bytes,count,copied,io,"legacy.metadata_windows.ReadFile.2");
+    const DWORD error=GetLastError();const int native_errno=errno;
+    const DWORD native_copied=okay&&copied?*copied:0;
     detail::observe_native_file_after(handle,detail::NativeTestIo::Read,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);
-    SetLastError(error);return okay!=FALSE;
+    errno=native_errno;SetLastError(error);
+    detail::observe_native_read_after(handle,detail::NativeReadPhase::Request,count,native_copied,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);
+    errno=native_errno;SetLastError(error);
+    if(okay||!io||error!=ERROR_IO_PENDING) {
+        detail::observe_native_read_after(handle,detail::NativeReadPhase::Completion,count,native_copied,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);
+        errno=native_errno;SetLastError(error);
+    }
+    return okay!=FALSE;
 #endif
 }
-bool write_native_consumer_file(HANDLE handle,const void* bytes,DWORD count,DWORD* written,const char* operation)noexcept {
-#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
-    (void)operation;return WriteFile(handle,bytes,count,written,nullptr)!=FALSE;
+
+// The issuing function cannot treat ERROR_IO_PENDING as completed bytes. Only
+// the actual kernel completion/drain result reaches this distinct phase. No
+// second ReadFile, counter increment, allocation or synthetic completion here.
+bool complete_native_consumer_read(HANDLE handle,OVERLAPPED* io,DWORD requested,DWORD* copied,
+                                   BOOL wait,detail::NativeReadPhase phase,const char* operation)noexcept {
+    const BOOL okay=GetOverlappedResult(handle,io,copied,wait);
+#ifdef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+    const DWORD error=GetLastError();const int native_errno=errno;
+    const DWORD native_copied=okay&&copied?*copied:0;
+    const auto actual_phase=!okay&&error==ERROR_IO_INCOMPLETE?detail::NativeReadPhase::Pending:phase;
+    detail::observe_native_read_after(handle,actual_phase,requested,native_copied,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);
+    errno=native_errno;SetLastError(error);
 #else
-    const DWORD before=GetLastError();
-    detail::observe_native_file_before(handle,detail::NativeTestIo::Write,count,operation);
-    SetLastError(before);const BOOL okay=WriteFile(handle,bytes,count,written,nullptr);
-    const DWORD error=GetLastError();
-    detail::observe_native_file_after(handle,detail::NativeTestIo::Write,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);
-    SetLastError(error);return okay!=FALSE;
+    (void)requested;(void)phase;(void)operation;
 #endif
+    return okay!=FALSE;
 }
+
+#ifdef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+} // namespace
+namespace detail {
+bool probe_native_capture_read(void* handle,void* bytes,std::uint32_t count,std::uint32_t* copied,void* overlapped)noexcept {
+    DWORD actual=0;
+    const bool okay=read_native_consumer_file(static_cast<HANDLE>(handle),bytes,count,&actual,"capture_probe.ReadFile",static_cast<OVERLAPPED*>(overlapped));
+    if(copied)*copied=actual;
+    return okay;
+}
+bool probe_native_capture_read_completion(void* handle,void* io,std::uint32_t count,std::uint32_t* copied,bool wait,NativeReadPhase phase)noexcept {
+    DWORD actual=0;
+    const bool okay=complete_native_consumer_read(static_cast<HANDLE>(handle),static_cast<OVERLAPPED*>(io),count,&actual,
+        wait?TRUE:FALSE,phase,"capture_probe.GetOverlappedResult");
+    if(copied)*copied=actual;
+    return okay;
+}
+bool probe_native_capture_close(void* handle)noexcept {
+    return close_native_consumer_handle(static_cast<HANDLE>(handle),"capture_probe.CloseHandle");
+}
+} // namespace detail
+namespace {
+#endif
+
+bool write_native_consumer_file(HANDLE handle,const void* bytes,DWORD count,DWORD* written,const char* operation)noexcept {
+    return detail::write_windows_metadata_file(handle,bytes,count,written,operation)!=FALSE;
+}
+
 struct HandleCloser {
     void operator()(void* handle) const noexcept {
         if (handle != nullptr && handle != INVALID_HANDLE_VALUE && !close_native_consumer_handle(handle,"metadata_capture.temporary_CloseHandle")) {
@@ -284,7 +335,7 @@ bool set_file_link_information(HANDLE source, FileLinkInformationCompat *informa
 
 Observation<ObjectIdentity> identity(HANDLE handle, const AdapterScope& scope) {
     FILE_ID_INFO native{};
-    if (GetFileInformationByHandleEx(handle, FileIdInfo, &native, sizeof(native))) {
+    if (detail::legacy_query(handle, FileIdInfo, &native, sizeof(native),"legacy.metadata_windows.GetFileInformationByHandleEx.1")) {
         NativeIdentifier object;
         static_assert(sizeof(native.FileId.Identifier) == sizeof(object.bytes));
         std::memcpy(object.bytes.data(), native.FileId.Identifier, sizeof(native.FileId.Identifier));
@@ -342,7 +393,7 @@ Observation<std::uint64_t> nonnegative(LONGLONG value, const char* operation) {
 Observation<BasicMetadata> handle_metadata(HANDLE handle, const AdapterScope& scope) {
     detail::observe_native_test_io(detail::NativeTestIo::Query);
     FILE_BASIC_INFO native{};
-    if (!GetFileInformationByHandleEx(handle, FileBasicInfo, &native, sizeof(native)))
+    if (!detail::legacy_query(handle, FileBasicInfo, &native, sizeof(native),"legacy.metadata_windows.GetFileInformationByHandleEx.2"))
         return failure<BasicMetadata>(GetLastError(), "FileBasicInfo");
     BasicMetadata result;
     result.identity = identity(handle, scope);
@@ -362,7 +413,7 @@ Observation<BasicMetadata> handle_metadata(HANDLE handle, const AdapterScope& sc
     if ((native.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
         result.kind = Observation<ObjectKind>::available(ObjectKind::ReparsePoint);
         FILE_ATTRIBUTE_TAG_INFO tag{};
-        if (GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag))) {
+        if (detail::legacy_query(handle, FileAttributeTagInfo, &tag, sizeof(tag),"legacy.metadata_windows.GetFileInformationByHandleEx.3")) {
             result.reparse_tag = Observation<std::uint32_t>::available(tag.ReparseTag);
             if (tag.ReparseTag == IO_REPARSE_TAG_SYMLINK) result.kind = Observation<ObjectKind>::available(ObjectKind::SymbolicLink);
             if (tag.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) result.kind = Observation<ObjectKind>::available(ObjectKind::Junction);
@@ -380,7 +431,7 @@ Observation<BasicMetadata> handle_metadata(HANDLE handle, const AdapterScope& sc
     result.linux_attributes = not_applicable<LinuxFileAttributes>("linux_attributes");
 
     FILE_STANDARD_INFO standard{};
-    if (GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standard))) {
+    if (detail::legacy_query(handle, FileStandardInfo, &standard, sizeof(standard),"legacy.metadata_windows.GetFileInformationByHandleEx.4")) {
         result.link_count = Observation<std::uint64_t>::available(standard.NumberOfLinks);
         if (*result.kind.value() == ObjectKind::RegularFile) {
             result.logical_size = nonnegative(standard.EndOfFile.QuadPart, "FileStandardInfo.size");
@@ -629,13 +680,13 @@ public:
         if(compare_identity(*current.value(),owner_)!=IdentityComparison::Same)return Result::unavailable(ObservationState::Changed,
             {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.owner_changed"});
         FILE_STANDARD_INFO standard{};
-        if(!GetFileInformationByHandleEx(handle_.get(),FileStandardInfo,&standard,sizeof(standard)))
+        if(!detail::legacy_query(handle_.get(),FileStandardInfo,&standard,sizeof(standard),"legacy.metadata_windows.GetFileInformationByHandleEx.5"))
             return failure<MetadataReplayChannelState>(GetLastError(),"metadata_channels.FileStandardInfo");
         if(standard.DeletePending)return Result::unavailable(ObservationState::Changed,
             {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::MetadataChanged),"metadata_channels.delete_pending"});
         LARGE_INTEGER size{};FILE_BASIC_INFO attributes{};
         if(!GetFileSizeEx(handle_.get(),&size))return failure<MetadataReplayChannelState>(GetLastError(),"metadata_channels.GetFileSizeEx");
-        if(!GetFileInformationByHandleEx(handle_.get(),FileBasicInfo,&attributes,sizeof(attributes)))
+        if(!detail::legacy_query(handle_.get(),FileBasicInfo,&attributes,sizeof(attributes),"legacy.metadata_windows.GetFileInformationByHandleEx.6"))
             return failure<MetadataReplayChannelState>(GetLastError(),"metadata_channels.FileBasicInfo");
         constexpr DWORD supported=FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_READONLY|FILE_ATTRIBUTE_HIDDEN|
             FILE_ATTRIBUTE_SYSTEM|FILE_ATTRIBUTE_ARCHIVE|FILE_ATTRIBUTE_NORMAL|FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
@@ -656,7 +707,7 @@ public:
         if(!SetFilePointerEx(handle_.get(),at,nullptr,FILE_BEGIN))return failure<ContentRead>(GetLastError(),"metadata_channels.read_seek");
         const auto count=static_cast<DWORD>(std::min<std::uint64_t>(limits.max_bytes,before.value()->logical_size-offset));
         std::vector<std::byte> bytes(count);DWORD copied=0;
-        if(count&&!ReadFile(handle_.get(),bytes.data(),count,&copied,nullptr))return failure<ContentRead>(GetLastError(),"metadata_channels.ReadFile");
+        if(count&&!read_native_consumer_file(handle_.get(),bytes.data(),count,&copied,"metadata_channels.ReadFile"))return failure<ContentRead>(GetLastError(),"metadata_channels.ReadFile");
         bytes.resize(copied);const auto after=inspect();
         if(!after.value()){const auto& e=*after.unavailable_detail();return Result::unavailable(e.state,e.error);}
         if(after.value()->logical_size!=before.value()->logical_size)return Result::unavailable(ObservationState::Changed,
@@ -666,7 +717,7 @@ public:
     Observation<bool> truncate() {
         if(!writable_||finished_)return failure<bool>(ERROR_ACCESS_DENIED,"metadata_channels.truncate_access");
         FILE_END_OF_FILE_INFO size{};
-        if(!SetFileInformationByHandle(handle_.get(),FileEndOfFileInfo,&size,sizeof(size)))
+        if(!detail::legacy_set_info(handle_.get(),FileEndOfFileInfo,&size,sizeof(size),"legacy.metadata_windows.SetFileInformationByHandle.1"))
             return failure<bool>(GetLastError(),"metadata_channels.FileEndOfFileInfo");
         return Observation<bool>::available(true);
     }
@@ -678,13 +729,13 @@ public:
         LARGE_INTEGER at{};at.QuadPart=static_cast<LONGLONG>(offset);
         if(!SetFilePointerEx(handle_.get(),at,nullptr,FILE_BEGIN))return failure<std::size_t>(GetLastError(),"metadata_channels.write_seek");
         DWORD written=0;
-        if(!WriteFile(handle_.get(),data.data(),static_cast<DWORD>(data.size()),&written,nullptr))
+        if(!write_native_consumer_file(handle_.get(),data.data(),static_cast<DWORD>(data.size()),&written,"metadata_channels.WriteFile"))
             return failure<std::size_t>(GetLastError(),"metadata_channels.WriteFile");
         return Observation<std::size_t>::available(written);
     }
     Observation<bool> flush() {
         if(!writable_||finished_)return failure<bool>(ERROR_ACCESS_DENIED,"metadata_channels.flush_access");
-        if(!FlushFileBuffers(handle_.get()))return failure<bool>(GetLastError(),"metadata_channels.FlushFileBuffers");
+        if(!detail::flush_windows_metadata_file(handle_.get(),"metadata_channels.FlushFileBuffers"))return failure<bool>(GetLastError(),"metadata_channels.FlushFileBuffers");
         return Observation<bool>::available(true);
     }
     Observation<bool> finish() {
@@ -695,8 +746,8 @@ public:
                 ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidAccess),"metadata_channels.finish_not_writer"};
             else {
                 finished_=true;const HANDLE writer=handle_.release();
-                const DWORD flush_error=FlushFileBuffers(writer)?ERROR_SUCCESS:GetLastError();
-                const DWORD close_error=CloseHandle(writer)?ERROR_SUCCESS:GetLastError();
+                const DWORD flush_error=detail::flush_windows_metadata_file(writer,"metadata_channels.finish_FlushFileBuffers")?ERROR_SUCCESS:GetLastError();
+                const DWORD close_error=close_native_consumer_handle(writer,"metadata_channels.finish_CloseHandle")?ERROR_SUCCESS:GetLastError();
                 if(flush_error)writer_finish_error_=MetadataCaptureCleanupError{error_state(flush_error),ErrorDomain::Win32,
                     flush_error,"metadata_channels.finish_FlushFileBuffers"};
                 else if(close_error)writer_finish_error_=MetadataCaptureCleanupError{error_state(close_error),ErrorDomain::Win32,
@@ -723,8 +774,8 @@ public:
         using R=Observation<std::unique_ptr<WindowsMetadataChannel>>;
         if(writable_||finished_)return failure<std::unique_ptr<WindowsMetadataChannel>>(ERROR_INVALID_HANDLE,"target_read.channel_closed_or_writer");
         HANDLE raw=nullptr;
-        if(!DuplicateHandle(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,
-            FILE_READ_DATA|FILE_READ_ATTRIBUTES|SYNCHRONIZE,FALSE,0))
+        if(!detail::legacy_duplicate(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,
+            FILE_READ_DATA|FILE_READ_ATTRIBUTES|SYNCHRONIZE,FALSE,0,"legacy.metadata_windows.DuplicateHandle.1"))
             return failure<std::unique_ptr<WindowsMetadataChannel>>(GetLastError(),"target_read.channel_duplicate");
         OwnedHandle owned(raw);
         return R::available(std::make_unique<WindowsMetadataChannel>(std::move(owned),scope_,identifier_,owner_,false));
@@ -869,20 +920,20 @@ public:
         if (!content_write_access_)
             return Observation<bool>::unavailable(ObservationState::Denied,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidAccess), "content.flush_access"});
-        if (!FlushFileBuffers(handle_.get())) return failure<bool>(GetLastError(), "content.FlushFileBuffers");
+        if (!detail::flush_windows_metadata_file(handle_.get(),"content.FlushFileBuffers")) return failure<bool>(GetLastError(), "content.FlushFileBuffers");
         return Observation<bool>::available(true);
     }
     Observation<bool> prepare_archive(std::uint64_t size,bool sparse) {
         if(!content_write_access_||finish_started_||!publication_||directory_metadata_target_||!channel_writers_.empty())
             return failure<bool>(ERROR_ACCESS_DENIED,"archive.creator_required");
         FILE_STANDARD_INFO info{};
-        if(!GetFileInformationByHandleEx(handle_.get(),FileStandardInfo,&info,sizeof(info)))return failure<bool>(GetLastError(),"archive.FileStandardInfo");
+        if(!detail::legacy_query(handle_.get(),FileStandardInfo,&info,sizeof(info),"legacy.metadata_windows.GetFileInformationByHandleEx.7"))return failure<bool>(GetLastError(),"archive.FileStandardInfo");
         if(info.Directory||info.EndOfFile.QuadPart!=0||info.NumberOfLinks!=1||size>static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()))
             return failure<bool>(ERROR_INVALID_DATA,"archive.creator_shape");
         if(sparse){FILE_SET_SPARSE_BUFFER input{TRUE};DWORD returned=0;
             if(!DeviceIoControl(handle_.get(),FSCTL_SET_SPARSE,&input,sizeof(input),nullptr,0,&returned,nullptr))return failure<bool>(GetLastError(),"archive.FSCTL_SET_SPARSE");}
         FILE_END_OF_FILE_INFO eof{};eof.EndOfFile.QuadPart=static_cast<LONGLONG>(size);
-        if(!SetFileInformationByHandle(handle_.get(),FileEndOfFileInfo,&eof,sizeof(eof)))return failure<bool>(GetLastError(),"archive.FileEndOfFileInfo");
+        if(!detail::legacy_set_info(handle_.get(),FileEndOfFileInfo,&eof,sizeof(eof),"legacy.metadata_windows.SetFileInformationByHandle.2"))return failure<bool>(GetLastError(),"archive.FileEndOfFileInfo");
         layout_access_=true;return Observation<bool>::available(true);
     }
     std::optional<MetadataCaptureCleanupError> finish_archive() noexcept {
@@ -891,9 +942,9 @@ public:
         // Archive creator has no metadata replay/channel owners. Consume both
         // native handles before formatting any diagnostics.
         const HANDLE security=security_handle_.release(),writer=handle_.release();
-        const DWORD se=!security||security==INVALID_HANDLE_VALUE||CloseHandle(security)?0:GetLastError();
-        const DWORD fe=!writer||writer==INVALID_HANDLE_VALUE||FlushFileBuffers(writer)?0:GetLastError();
-        const DWORD ce=!writer||writer==INVALID_HANDLE_VALUE||CloseHandle(writer)?0:GetLastError();
+        const DWORD se=!security||security==INVALID_HANDLE_VALUE||detail::legacy_close_handle(security,"legacy.metadata_windows.CloseHandle.1")?0:GetLastError();
+        const DWORD fe=!writer||writer==INVALID_HANDLE_VALUE||detail::legacy_flush(writer,"legacy.metadata_windows.FlushFileBuffers.1")?0:GetLastError();
+        const DWORD ce=!writer||writer==INVALID_HANDLE_VALUE||detail::legacy_close_handle(writer,"legacy.metadata_windows.CloseHandle.2")?0:GetLastError();
         if(se)return MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,se,"archive.security_CloseHandle"};
         if(fe)return MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,fe,"archive.finish_FlushFileBuffers"};
         if(ce)return MetadataCaptureCleanupError{ObservationState::Failed,ErrorDomain::Win32,ce,"archive.finish_CloseHandle"};
@@ -920,7 +971,7 @@ public:
         const HANDLE security=security_handle_.release();
         const HANDLE writer=handle_.release();
         const DWORD security_error=!security || security==INVALID_HANDLE_VALUE || close_native_consumer_handle(security,"content.finish_security_close") ? ERROR_SUCCESS : GetLastError();
-        const DWORD flush_error=FlushFileBuffers(writer) ? ERROR_SUCCESS : GetLastError();
+        const DWORD flush_error=detail::flush_windows_metadata_file(writer,"content.finish_FlushFileBuffers") ? ERROR_SUCCESS : GetLastError();
         const DWORD close_error=close_native_consumer_handle(writer,"content.finish_CloseHandle") ? ERROR_SUCCESS : GetLastError();
         if(channel_error)finish_result_=std::move(*channel_error);
         else if(channel_exception)finish_result_=Observation<bool>::unavailable(ObservationState::Failed,
@@ -972,7 +1023,7 @@ public:
             auto lease=target_read_manifest_->acquire(sizeof(WindowsOpenedEntry));
             if(!lease.value()){const auto&e=*lease.unavailable_detail();return Result::unavailable(e.state,e.error);}
             HANDLE raw=nullptr;
-            if(!DuplicateHandle(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+            if(!detail::legacy_duplicate(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS,"legacy.metadata_windows.DuplicateHandle.2"))
                 return failure<std::shared_ptr<const OpenedEntry>>(GetLastError(),"target_read.source_duplicate");
             OwnedHandle owned(raw);auto clone=std::make_shared<WindowsOpenedEntry>(std::move(owned),scope_,false,content_access_);
             clone->target_read_manifest_=target_read_manifest_;
@@ -1083,7 +1134,7 @@ public:
         // flag never proves the namespace policy of this held directory.
         if(directory&&policy.scope==RegularMetadataScope::CompleteMetadataV1) {
             FILE_CASE_SENSITIVE_INFO case_info{};
-            if(!GetFileInformationByHandleEx(handle_.get(),FileCaseSensitiveInfo,&case_info,sizeof(case_info)))
+            if(!detail::legacy_query(handle_.get(),FileCaseSensitiveInfo,&case_info,sizeof(case_info),"legacy.metadata_windows.GetFileInformationByHandleEx.8"))
                 return Result::unavailable(ObservationState::Unsupported,
                     {ErrorDomain::Win32,GetLastError(),"metadata_replay.directory_case_query_unqualified"});
             if(case_info.Flags!=0)return refuse("metadata_replay.directory_case_flags_unimplemented");
@@ -1508,7 +1559,7 @@ public:
         native.ChangeTime.QuadPart = *changed.value();
         native.FileAttributes = *source.windows_attributes.value()&~FILE_ATTRIBUTE_DIRECTORY;
         if(!native.FileAttributes)native.FileAttributes=FILE_ATTRIBUTE_NORMAL;
-        if (!SetFileInformationByHandle(handle_.get(), FileBasicInfo, &native, sizeof(native)))
+        if (!detail::legacy_set_info(handle_.get(), FileBasicInfo, &native, sizeof(native),"legacy.metadata_windows.SetFileInformationByHandle.3"))
             return failure<bool>(GetLastError(), "metadata.portable_basic.FileBasicInfo");
         return Result::available(true);
     }
@@ -1726,7 +1777,7 @@ public:
             result.windows_compression = Observation<WindowsCompressionDetails>::unavailable(guarded->state, guarded->error);
         else if (metadata.value()->kind.value() && *metadata.value()->kind.value() == ObjectKind::RegularFile) {
             FILE_COMPRESSION_INFO native{};
-            if (GetFileInformationByHandleEx(handle_.get(), FileCompressionInfo, &native, sizeof(native))) {
+            if (detail::legacy_query(handle_.get(), FileCompressionInfo, &native, sizeof(native),"legacy.metadata_windows.GetFileInformationByHandleEx.9")) {
                 if (native.CompressedFileSize.QuadPart >= 0)
                     result.windows_compression = Observation<WindowsCompressionDetails>::available({
                         static_cast<std::uint64_t>(native.CompressedFileSize.QuadPart), native.CompressionFormat,
@@ -1762,8 +1813,8 @@ public:
             // supplied byte count is exact; rounding storage costs at most 7 bytes.
             std::vector<std::uint64_t> buffer((capacity + 7) / 8, 0);
             SetLastError(ERROR_SUCCESS);
-            const bool success = GetFileInformationByHandleEx(handle_.get(), FileStreamInfo,
-                buffer.data(), static_cast<DWORD>(capacity)) != 0;
+            const bool success = detail::legacy_query(handle_.get(), FileStreamInfo,
+                buffer.data(), static_cast<DWORD>(capacity),"legacy.metadata_windows.GetFileInformationByHandleEx.10") != 0;
             const DWORD code = GetLastError();
             // FileStreamInfo documents HANDLE_EOF when no streams are returned,
             // including its special success/no-streams outcome.
@@ -1915,10 +1966,10 @@ private:
         name.Length=static_cast<USHORT>(spelling.size()*sizeof(WCHAR));name.MaximumLength=name.Length;name.Buffer=spelling.data();
         OBJECT_ATTRIBUTES attributes{};attributes.Length=sizeof(attributes);attributes.RootDirectory=handle_.get();attributes.ObjectName=&name;
         IO_STATUS_BLOCK io{};HANDLE raw=nullptr;
-        const auto status=NtCreateFile(&raw,create?FILE_GENERIC_READ|FILE_GENERIC_WRITE:
+        const auto status=detail::legacy_nt_create(&raw,create?FILE_GENERIC_READ|FILE_GENERIC_WRITE:
             FILE_READ_DATA|FILE_READ_ATTRIBUTES|SYNCHRONIZE|(suppress_read_times?FILE_WRITE_ATTRIBUTES:0),
             &attributes,&io,nullptr,FILE_ATTRIBUTE_NORMAL,FILE_SHARE_READ|FILE_SHARE_DELETE,
-            create?FILE_CREATE:FILE_OPEN,(directory?0:FILE_NON_DIRECTORY_FILE)|FILE_OPEN_REPARSE_POINT|FILE_OPEN_NO_RECALL|FILE_SYNCHRONOUS_IO_NONALERT,nullptr,0);
+            create?FILE_CREATE:FILE_OPEN,(directory?0:FILE_NON_DIRECTORY_FILE)|FILE_OPEN_REPARSE_POINT|FILE_OPEN_NO_RECALL|FILE_SYNCHRONOUS_IO_NONALERT,nullptr,0,"legacy.metadata_windows.NtCreateFile.1");
         OwnedHandle opened(raw);
         if(status!=0)return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
             {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"metadata_channels.NtCreateFile.relative"});
@@ -1929,7 +1980,7 @@ private:
             // file's times. Suppress updates from this specific file object;
             // final base-object timestamp replay still sets the actual values.
             const FILETIME suppressed{MAXDWORD,MAXDWORD};
-            if(!SetFileTime(opened.get(),nullptr,&suppressed,&suppressed))
+            if(!detail::set_windows_metadata_times(opened.get(),nullptr,&suppressed,&suppressed,"metadata_channels.suppress_automatic_times"))
                 return failure<std::unique_ptr<WindowsMetadataChannel>>(GetLastError(),"metadata_channels.suppress_automatic_times");
         }
         auto channel=std::make_unique<WindowsMetadataChannel>(std::move(opened),scope_,identifier,*owner.value(),create);
@@ -1951,7 +2002,7 @@ private:
         if (!event || event.get()==INVALID_HANDLE_VALUE) return failure<DWORD>(GetLastError(),"content.guard_read_event");
         OVERLAPPED io{};io.hEvent=event.get();io.Offset=static_cast<DWORD>(offset);io.OffsetHigh=static_cast<DWORD>(offset>>32U);
         DWORD copied=0;
-        if (!ReadFile(handle_.get(),bytes.data(),static_cast<DWORD>(bytes.size()),&copied,&io)) {
+        if (!read_native_consumer_file(handle_.get(),bytes.data(),static_cast<DWORD>(bytes.size()),&copied,"content.guard_ReadFile",&io)) {
             const DWORD code=GetLastError();
             if (code!=ERROR_IO_PENDING) return failure<DWORD>(code,"content.guard_ReadFile");
             bool cancelled=false,broken=false;DWORD wait_error=0;
@@ -1965,14 +2016,25 @@ private:
                     CancelIoEx(handle_.get(),&io);
                     // Cancellation is a request, not completion. Drain this
                     // read before its buffer, event or OVERLAPPED can unwind.
-                    GetOverlappedResult(handle_.get(),&io,&copied,TRUE);
+                    complete_native_consumer_read(handle_.get(),&io,static_cast<DWORD>(bytes.size()),&copied,TRUE,detail::NativeReadPhase::Drain,"content.guard_read_drain");
                     if (cancelled) return Result::unavailable(ObservationState::Unknown,
                         {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InterruptedRead),"content.guard_read_cancelled"});
                     if (broken) {const auto e=content_lease_->check();return Result::unavailable(e.state(),e.unavailable_detail()->error);}
                     return failure<DWORD>(wait_error,"content.guard_read_wait");
                 }
             }
-            if (!GetOverlappedResult(handle_.get(),&io,&copied,FALSE)) return failure<DWORD>(GetLastError(),"content.guard_read_completion");
+            if (!complete_native_consumer_read(handle_.get(),&io,static_cast<DWORD>(bytes.size()),&copied,FALSE,detail::NativeReadPhase::Completion,"content.guard_read_completion")) {
+                const DWORD completion_error=GetLastError();
+                if(completion_error==ERROR_IO_INCOMPLETE){
+                    // An unexpected event/result disagreement is not terminal.
+                    // Keep this buffer and OVERLAPPED alive until actual drain;
+                    // preserve the first completion error rather than guess.
+                    CancelIoEx(handle_.get(),&io);
+                    complete_native_consumer_read(handle_.get(),&io,static_cast<DWORD>(bytes.size()),&copied,TRUE,
+                        detail::NativeReadPhase::Drain,"content.guard_read_incomplete_drain");
+                }
+                return failure<DWORD>(completion_error,"content.guard_read_completion");
+            }
         }
         if (content_lease_) {const auto stable=content_lease_->check();if(!stable.value()){const auto& e=*stable.unavailable_detail();return Result::unavailable(e.state,e.error);}}
         return Result::available(copied);
@@ -2020,8 +2082,8 @@ private:
             id.Type=FileIdType;std::memcpy(&id.FileId.QuadPart,held.value()->object.bytes.data(),8);
         } else return Result::unavailable(ObservationState::Unsupported,
             {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),"metadata_replay.windows_id_scheme"});
-        OwnedHandle opened(OpenFileById(handle_.get(),&id,rights|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-            nullptr,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL|FILE_FLAG_BACKUP_SEMANTICS));
+        OwnedHandle opened(detail::legacy_open_by_id(handle_.get(),&id,rights|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+            nullptr,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL|FILE_FLAG_BACKUP_SEMANTICS,"legacy.metadata_windows.OpenFileById.1"));
         if (!opened || opened.get()==INVALID_HANDLE_VALUE) return failure<OwnedHandle>(GetLastError(),"metadata_replay.OpenFileById.security");
         const auto checked=identity(opened.get(),scope_);
         if (!checked.value() || compare_identity(*held.value(),*checked.value())!=IdentityComparison::Same)
@@ -2342,8 +2404,8 @@ Observation<std::unique_ptr<OpenedEntry>> open_windows_parent(HANDLE child, cons
     else { descriptor.Type = FileIdType; std::memcpy(&descriptor.FileId.QuadPart, ids.value()->parent.bytes.data(), 8); }
     // Original live directory supplies the volume hint. No basename/path open,
     // enumeration, FILE_READ_DATA, backup intent, elevation or journal mutation.
-    OwnedHandle parent(OpenFileById(child, &descriptor, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL));
+    OwnedHandle parent(detail::legacy_open_by_id(child, &descriptor, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,"legacy.metadata_windows.OpenFileById.2"));
     if (parent.get() == INVALID_HANDLE_VALUE || parent.get() == nullptr) return failure<std::unique_ptr<OpenedEntry>>(GetLastError(), "OpenFileById.parent");
     auto opened = std::make_unique<WindowsOpenedEntry>(std::move(parent), scope);
     const auto metadata = opened->inspect_basic();
@@ -2404,7 +2466,7 @@ class WindowsDirectoryCursor final : public DirectoryCursor {
 public:
     Observation<std::shared_ptr<const OpenedEntry>> open_progressive_directory_source(const MetadataReplayPolicy& policy)const {
         using R=Observation<std::shared_ptr<const OpenedEntry>>;HANDLE h=nullptr;
-        if(!DuplicateHandle(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&h,0,FALSE,DUPLICATE_SAME_ACCESS))
+        if(!detail::legacy_duplicate(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&h,0,FALSE,DUPLICATE_SAME_ACCESS,"legacy.metadata_windows.DuplicateHandle.3"))
             return failure<std::shared_ptr<const OpenedEntry>>(GetLastError(),"metadata_capture.directory_query_dup");
         WindowsOpenedEntry held(OwnedHandle(h),scope_);
         return held.open_progressive_metadata_source(policy);
@@ -2447,7 +2509,7 @@ public:
     Observation<AdapterScope> source_scope() const override { return Observation<AdapterScope>::available(scope_); }
     Observation<WindowsTrashHandle> duplicate_trash_parent() const {
         HANDLE raw=nullptr;
-        if(!DuplicateHandle(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+        if(!detail::legacy_duplicate(GetCurrentProcess(),handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS,"legacy.metadata_windows.DuplicateHandle.4"))
             return Observation<WindowsTrashHandle>::unavailable(error_state(GetLastError()),
                 {ErrorDomain::Win32,GetLastError(),"trash.duplicate_parent"});
         return Observation<WindowsTrashHandle>::available(WindowsTrashHandle(raw));
@@ -2480,8 +2542,8 @@ public:
         spelling.reserve(units->size());
         for (const auto unit : *units) spelling.push_back(static_cast<wchar_t>(unit));
         HANDLE retained_raw = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), handle_.get(), GetCurrentProcess(), &retained_raw,
-                             0, FALSE, DUPLICATE_SAME_ACCESS))
+        if (!detail::legacy_duplicate(GetCurrentProcess(), handle_.get(), GetCurrentProcess(), &retained_raw,
+                             0, FALSE, DUPLICATE_SAME_ACCESS,"legacy.metadata_windows.DuplicateHandle.5"))
             return failure<std::unique_ptr<OpenedEntry>>(GetLastError(), "create_child_file.parent_handle");
         OwnedHandle retained_parent(retained_raw);
         auto parent_identity = ::ck::files::identity(handle_.get(), scope_);
@@ -2499,14 +2561,14 @@ public:
         attributes.ObjectName = &native_name;
         IO_STATUS_BLOCK io{};
         HANDLE raw = nullptr;
-        const NTSTATUS status = NtCreateFile(&raw, FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | DELETE,
+        const NTSTATUS status = detail::legacy_nt_create(&raw, FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | DELETE,
             &attributes, &io, nullptr, FILE_ATTRIBUTE_NORMAL,
             // Exclusion starts atomically with creation. No external writer
             // or DELETE-bearing opener can race staged data/metadata or the
             // held-handle publication; the original handle already has DELETE.
             FILE_SHARE_READ, FILE_CREATE,
             FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_WRITE_THROUGH,
-            nullptr, 0);
+            nullptr, 0,"legacy.metadata_windows.NtCreateFile.2");
         OwnedHandle opened(raw);
         if (status < 0)
             return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
@@ -2515,7 +2577,7 @@ public:
             return Result::unavailable(ObservationState::Failed,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidNativeResult), "create_child_file.result"});
         FILE_BASIC_INFO basic{};
-        if (!GetFileInformationByHandleEx(opened.get(), FileBasicInfo, &basic, sizeof(basic)))
+        if (!detail::legacy_query(opened.get(), FileBasicInfo, &basic, sizeof(basic),"legacy.metadata_windows.GetFileInformationByHandleEx.11"))
             return failure<std::unique_ptr<OpenedEntry>>(GetLastError(), "create_child_file.info");
         if ((basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
             return Result::unavailable(ObservationState::Failed,
@@ -2601,7 +2663,7 @@ public:
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged),
                  "create_hard_link.published_identity"});
-        if (!FlushFileBuffers(destination_access.value()->get()))
+        if (!detail::legacy_flush(destination_access.value()->get(),"legacy.metadata_windows.FlushFileBuffers.2"))
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "create_hard_link.directory_flush"});
         return Result::available(true);
@@ -2626,11 +2688,11 @@ public:
         attributes.ObjectName = &native_name;
         IO_STATUS_BLOCK io{};
         HANDLE raw = nullptr;
-        const NTSTATUS status = NtCreateFile(&raw, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        const NTSTATUS status = detail::legacy_nt_create(&raw, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             &attributes, &io, nullptr, FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE,
             FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_WRITE_THROUGH,
-            nullptr, 0);
+            nullptr, 0,"legacy.metadata_windows.NtCreateFile.3");
         OwnedHandle opened(raw);
         if (status < 0) {
             const DWORD code = RtlNtStatusToDosError(status);
@@ -2644,7 +2706,7 @@ public:
             return Result::unavailable(ObservationState::Failed,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidNativeResult), "create_child_directory.result"});
         FILE_BASIC_INFO basic{};
-        if (!GetFileInformationByHandleEx(opened.get(), FileBasicInfo, &basic, sizeof(basic)))
+        if (!detail::legacy_query(opened.get(), FileBasicInfo, &basic, sizeof(basic),"legacy.metadata_windows.GetFileInformationByHandleEx.12"))
             return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(), "create_child_directory.info");
         if ((basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
             (basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
@@ -2660,7 +2722,7 @@ public:
             const auto& error = *parent_access.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
-        if (!FlushFileBuffers(parent_access.value()->get()))
+        if (!detail::legacy_flush(parent_access.value()->get(),"legacy.metadata_windows.FlushFileBuffers.3"))
             return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),
                 "FlushFileBuffers.create_child_directory_parent");
         return Result::available(std::make_unique<WindowsDirectoryCursor>(std::move(opened), std::move(observed), scope_));
@@ -2721,7 +2783,7 @@ public:
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::NotApplicable), "retire_child.kind"});
 
         FILE_STANDARD_INFO standard{};
-        if (!GetFileInformationByHandleEx(source.get(), FileStandardInfo, &standard, sizeof(standard)))
+        if (!detail::legacy_query(source.get(), FileStandardInfo, &standard, sizeof(standard),"legacy.metadata_windows.GetFileInformationByHandleEx.13"))
             return failure<bool>(GetLastError(), "retire_child.standard_info");
         // A selected hard-link alias is not a removable single-source object;
         // preserve the link group until the planner supplies its full policy.
@@ -2731,7 +2793,7 @@ public:
 
         FILE_DISPOSITION_INFO disposition{};
         disposition.DeleteFile = TRUE;
-        if (!SetFileInformationByHandle(source.get(), FileDispositionInfo, &disposition, sizeof(disposition))) {
+        if (!detail::legacy_set_info(source.get(), FileDispositionInfo, &disposition, sizeof(disposition),"legacy.metadata_windows.SetFileInformationByHandle.4")) {
             const DWORD code = GetLastError();
             return Result::unavailable(code == ERROR_IO_PENDING ? ObservationState::Unknown : error_state(code),
                 {ErrorDomain::Win32, code, "retire_child.disposition"});
@@ -2741,7 +2803,7 @@ public:
             const auto& error = *parent_access.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
-        if (!FlushFileBuffers(parent_access.value()->get()))
+        if (!detail::legacy_flush(parent_access.value()->get(),"legacy.metadata_windows.FlushFileBuffers.4"))
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "retire_child.directory_flush"});
         return Result::available(true);
@@ -2784,7 +2846,7 @@ public:
             return Result::unavailable(ObservationState::Unsupported,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::NotApplicable), "trash_child.kind"});
         FILE_STANDARD_INFO standard{};
-        if (!GetFileInformationByHandleEx(source.get(), FileStandardInfo, &standard, sizeof(standard)))
+        if (!detail::legacy_query(source.get(), FileStandardInfo, &standard, sizeof(standard),"legacy.metadata_windows.GetFileInformationByHandleEx.14"))
             return failure<bool>(GetLastError(), "trash_child.standard_info");
         if (*metadata.value()->kind.value() == ObjectKind::RegularFile && standard.NumberOfLinks != 1)
             return Result::unavailable(ObservationState::Unsupported,
@@ -2820,14 +2882,14 @@ public:
             return failure<bool>(GetLastError(), "trash_child.recycle_user_directory");
 
         auto open_recycle_directory = [&]() -> Observation<OwnedHandle> {
-            HANDLE raw = CreateFileW(recycle_directory_path.c_str(),
+            HANDLE raw = detail::legacy_create(recycle_directory_path.c_str(),
                 FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr,"legacy.metadata_windows.CreateFileW.1");
             if (raw == INVALID_HANDLE_VALUE) return failure<OwnedHandle>(GetLastError(), "trash_child.recycle_directory");
             OwnedHandle directory(raw);
             FILE_BASIC_INFO basic{};
-            if (!GetFileInformationByHandleEx(directory.get(), FileBasicInfo, &basic, sizeof(basic)))
+            if (!detail::legacy_query(directory.get(), FileBasicInfo, &basic, sizeof(basic),"legacy.metadata_windows.GetFileInformationByHandleEx.15"))
                 return failure<OwnedHandle>(GetLastError(), "trash_child.recycle_directory_info");
             if ((basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
                 (basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
@@ -2854,19 +2916,19 @@ public:
             i_name = L"$I" + suffix;
             r_path = recycle_directory_path + L"\\" + r_name;
             i_path = recycle_directory_path + L"\\" + i_name;
-            HANDLE existing = CreateFileW(r_path.c_str(), FILE_READ_ATTRIBUTES,
+            HANDLE existing = detail::legacy_create(r_path.c_str(), FILE_READ_ATTRIBUTES,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr,"legacy.metadata_windows.CreateFileW.2");
             if (existing != INVALID_HANDLE_VALUE) {
-                CloseHandle(existing);
+                detail::legacy_close_handle(existing,"legacy.metadata_windows.CloseHandle.3");
                 continue;
             }
             const DWORD existing_error = GetLastError();
             if (existing_error != ERROR_FILE_NOT_FOUND && existing_error != ERROR_PATH_NOT_FOUND)
                 return failure<bool>(existing_error, "trash_child.recycle_name_probe");
-            HANDLE raw = CreateFileW(i_path.c_str(), GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
+            HANDLE raw = detail::legacy_create(i_path.c_str(), GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
-                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, nullptr);
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, nullptr,"legacy.metadata_windows.CreateFileW.3");
             if (raw != INVALID_HANDLE_VALUE) metadata_file.reset(raw);
             else if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS)
                 return failure<bool>(GetLastError(), "trash_child.metadata_create");
@@ -2891,11 +2953,11 @@ public:
             deletion_time.dwLowDateTime);
         std::memcpy(metadata_bytes.data() + 24, original_path.data(), original_path.size() * sizeof(wchar_t));
         DWORD written = 0;
-        if (!WriteFile(metadata_file.get(), metadata_bytes.data(), static_cast<DWORD>(metadata_bytes.size()), &written, nullptr) ||
-            written != metadata_bytes.size() || !FlushFileBuffers(metadata_file.get())) {
+        if (!detail::legacy_write_file(metadata_file.get(), metadata_bytes.data(), static_cast<DWORD>(metadata_bytes.size()), &written, nullptr,"legacy.metadata_windows.WriteFile.1") ||
+            written != metadata_bytes.size() || !detail::legacy_flush(metadata_file.get(),"legacy.metadata_windows.FlushFileBuffers.5")) {
             const DWORD code = GetLastError();
             FILE_DISPOSITION_INFO cleanup{TRUE};
-            SetFileInformationByHandle(metadata_file.get(), FileDispositionInfo, &cleanup, sizeof(cleanup));
+            detail::legacy_set_info(metadata_file.get(), FileDispositionInfo, &cleanup, sizeof(cleanup),"legacy.metadata_windows.SetFileInformationByHandle.5");
             return failure<bool>(code, "trash_child.metadata_write");
         }
 
@@ -2912,15 +2974,15 @@ public:
         if (!set_file_rename_information(source.get(), rename, static_cast<ULONG>(rename_buffer.size()))) {
             const DWORD code = GetLastError();
             FILE_DISPOSITION_INFO cleanup{TRUE};
-            if (!SetFileInformationByHandle(metadata_file.get(), FileDispositionInfo, &cleanup, sizeof(cleanup)))
+            if (!detail::legacy_set_info(metadata_file.get(), FileDispositionInfo, &cleanup, sizeof(cleanup),"legacy.metadata_windows.SetFileInformationByHandle.6"))
                 return Result::unavailable(ObservationState::Unknown,
                     {ErrorDomain::Win32, GetLastError(), "trash_child.metadata_cleanup"});
             return Result::unavailable(error_state(code), {ErrorDomain::Win32, code, "trash_child.native_rename"});
         }
 
-        HANDLE raw_published = CreateFileW(r_path.c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        HANDLE raw_published = detail::legacy_create(r_path.c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr,"legacy.metadata_windows.CreateFileW.4");
         if (raw_published == INVALID_HANDLE_VALUE)
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "trash_child.recycle_identity"});
@@ -2935,8 +2997,8 @@ public:
         if (!parent_access.value())
             return Result::unavailable(ObservationState::Unknown,
                 parent_access.unavailable_detail()->error);
-        if (!FlushFileBuffers(parent_access.value()->get()) ||
-            !FlushFileBuffers(recycle_directory.value()->get()))
+        if (!detail::legacy_flush(parent_access.value()->get(),"legacy.metadata_windows.FlushFileBuffers.6") ||
+            !detail::legacy_flush(recycle_directory.value()->get(),"legacy.metadata_windows.FlushFileBuffers.7"))
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "trash_child.directory_flush"});
         return Result::available(true);
@@ -3124,7 +3186,7 @@ public:
             compare_identity(*published_metadata.value()->identity.value(), *source_metadata.value()->identity.value()) != IdentityComparison::Same)
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "rename_child_noreplace.destination_identity"});
-        if (!FlushFileBuffers(source_parent) || !FlushFileBuffers(destination_parent))
+        if (!detail::legacy_flush(source_parent,"legacy.metadata_windows.FlushFileBuffers.8") || !detail::legacy_flush(destination_parent,"legacy.metadata_windows.FlushFileBuffers.9"))
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "rename_child_noreplace.directory_flush"});
         return Result::available(true);
@@ -3159,7 +3221,7 @@ public:
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "rename_child_case_only.source_identity"});
         if (source_metadata.value()->kind.value() && *source_metadata.value()->kind.value() == ObjectKind::RegularFile) {
             FILE_STANDARD_INFO standard{};
-            if (!GetFileInformationByHandleEx(source, FileStandardInfo, &standard, sizeof(standard)))
+            if (!detail::legacy_query(source, FileStandardInfo, &standard, sizeof(standard),"legacy.metadata_windows.GetFileInformationByHandleEx.16"))
                 return failure<bool>(GetLastError(), "rename_child_case_only.standard_info");
             if (standard.NumberOfLinks != 1)
                 return Result::unavailable(ObservationState::Unsupported,
@@ -3227,7 +3289,7 @@ public:
             compare_identity(*renamed_metadata.value()->identity.value(), *source_metadata.value()->identity.value()) != IdentityComparison::Same)
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "rename_child_case_only.destination_identity"});
-        if (!FlushFileBuffers(destination_parent))
+        if (!detail::legacy_flush(destination_parent,"legacy.metadata_windows.FlushFileBuffers.10"))
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "rename_child_case_only.directory_flush"});
         return Result::available(true);
@@ -3280,7 +3342,7 @@ public:
             !destination_metadata.value()->kind.value() || *destination_metadata.value()->kind.value() != ObjectKind::RegularFile)
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "publish_noreplace.destination_identity"});
-        if (!FlushFileBuffers(destination_access.value()->get()))
+        if (!detail::legacy_flush(destination_access.value()->get(),"legacy.metadata_windows.FlushFileBuffers.11"))
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "publish_noreplace.directory_flush"});
         return Result::available(true);
@@ -3303,8 +3365,8 @@ public:
         const DWORD mask = right | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
         // A temporary access-bearing handle, no content/namespace write. No
         // backup intent or privilege enablement; unsupported drivers may refuse.
-        OwnedHandle checked(OpenFileById(handle_.get(), &descriptor, mask,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL));
+        OwnedHandle checked(detail::legacy_open_by_id(handle_.get(), &descriptor, mask,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,"legacy.metadata_windows.OpenFileById.3"));
         if (checked.get() == INVALID_HANDLE_VALUE || checked.get() == nullptr) return failure<DirectoryAccessCheck>(GetLastError(), "OpenFileById.directory_access");
         const auto opened = detail::qualify_access_directory(before, handle_metadata(checked.get(), scope_), StorageModel::WindowsHandleAttributes);
         if (!opened.value()) { const auto& e = *opened.unavailable_detail(); return Result::unavailable(e.state, e.error); }
@@ -3358,7 +3420,7 @@ public:
             result.read_only_mount = result.case_preserving_names = Observation<bool>::unavailable(error_state(code), error);
         }
         FILE_CASE_SENSITIVE_INFO case_info{};
-        if (GetFileInformationByHandleEx(handle_.get(), FileCaseSensitiveInfo, &case_info, sizeof(case_info))) {
+        if (detail::legacy_query(handle_.get(), FileCaseSensitiveInfo, &case_info, sizeof(case_info),"legacy.metadata_windows.GetFileInformationByHandleEx.17")) {
             result.windows_directory_case_flags = Observation<std::uint32_t>::available(case_info.Flags);
             result.case_sensitive_directory = Observation<bool>::available((case_info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR) != 0);
         } else {
@@ -3398,7 +3460,7 @@ public:
         }
         auto child = std::move(result).take_value();
         FILE_BASIC_INFO basic{};
-        if (!GetFileInformationByHandleEx(child.get(), FileBasicInfo, &basic, sizeof(basic)))
+        if (!detail::legacy_query(child.get(), FileBasicInfo, &basic, sizeof(basic),"legacy.metadata_windows.GetFileInformationByHandleEx.18"))
             return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(), "FileBasicInfo.directory_child");
         if ((basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
             return Result::unavailable(ObservationState::Failed,
@@ -3476,9 +3538,9 @@ private:
         // A live original handle supplies the volume/share hint and prevents ID
         // reuse. Native identity open avoids a basename-replacement race. No
         // backup privilege, elevation, name fallback or content read is used.
-        OwnedHandle readable(OpenFileById(original->handle_.get(), &descriptor, rights | FILE_READ_DATA,
+        OwnedHandle readable(detail::legacy_open_by_id(original->handle_.get(), &descriptor, rights | FILE_READ_DATA,
             requests_rename_source(access) ? FILE_SHARE_READ :
-            requests_move_source(access) ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL));
+            requests_move_source(access) ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,"legacy.metadata_windows.OpenFileById.4"));
         if (readable.get() == nullptr || readable.get() == INVALID_HANDLE_VALUE) return failure<std::unique_ptr<OpenedEntry>>(GetLastError(), "OpenFileById.layout");
         auto opened = std::make_unique<WindowsOpenedEntry>(std::move(readable), scope_, true,
                                                            requests_content_read(access), false, nullptr, requests_rename_source(access));
@@ -3512,11 +3574,11 @@ private:
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity),
                  "publish_noreplace.directory_scheme"});
         }
-        OwnedHandle opened(OpenFileById(handle_.get(), &descriptor,
+        OwnedHandle opened(detail::legacy_open_by_id(handle_.get(), &descriptor,
             FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD |
                 FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL));
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,"legacy.metadata_windows.OpenFileById.5"));
         if (opened.get() == nullptr || opened.get() == INVALID_HANDLE_VALUE)
             return failure<OwnedHandle>(GetLastError(), "publish_noreplace.directory_access");
         const auto observed = ::ck::files::identity(opened.get(), scope_);
@@ -3555,9 +3617,9 @@ private:
         HANDLE raw = nullptr;
         const auto sharing = rename_guard ? FILE_SHARE_READ :
             exclusive ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-        const NTSTATUS status = NtCreateFile(&raw, rights, &attributes, &io, nullptr, 0,
+        const NTSTATUS status = detail::legacy_nt_create(&raw, rights, &attributes, &io, nullptr, 0,
             sharing, FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | (rename_guard?0:FILE_SYNCHRONOUS_IO_NONALERT), nullptr, 0);
+            FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | (rename_guard?0:FILE_SYNCHRONOUS_IO_NONALERT), nullptr, 0,"legacy.metadata_windows.NtCreateFile.4");
         OwnedHandle opened(raw);
         if (status < 0 || status == 0x00000103L)
             return Result::unavailable(status < 0 ? error_state(RtlNtStatusToDosError(status)) : ObservationState::Failed,
@@ -3577,7 +3639,7 @@ private:
         if (!offset_) {
             buffer_.fill(std::byte{});
             const auto info_class = started_ ? FileIdBothDirectoryInfo : FileIdBothDirectoryRestartInfo;
-            if (!GetFileInformationByHandleEx(handle_.get(), info_class, buffer_.data(), static_cast<DWORD>(buffer_.size()))) {
+            if (!detail::legacy_query(handle_.get(), info_class, buffer_.data(), static_cast<DWORD>(buffer_.size()),"legacy.metadata_windows.GetFileInformationByHandleEx.19")) {
                 const DWORD code = GetLastError();
                 if (code == ERROR_NO_MORE_FILES) {
                     if(target_read_enumeration_lease_){target_read_enumeration_finished_=true;target_read_enumeration_lease_.reset();}
@@ -3698,7 +3760,7 @@ public:
         auto lease=manifest_->acquire(sizeof(WindowsDirectoryCursor));
         if(!lease.value()){const auto&e=*lease.unavailable_detail();return R::unavailable(e.state,e.error);}
         HANDLE raw=nullptr;
-        if(!DuplicateHandle(GetCurrentProcess(),enumeration_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+        if(!detail::legacy_duplicate(GetCurrentProcess(),enumeration_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS,"legacy.metadata_windows.DuplicateHandle.6"))
             return failure<std::shared_ptr<const DirectoryCursor>>(GetLastError(),"target_read.cursor_duplicate");
         OwnedHandle owned(raw);auto current=identity(owned.get(),source_->scope_);
         if(!current.value()){const auto&e=*current.unavailable_detail();return R::unavailable(e.state,e.error);}
@@ -3749,7 +3811,7 @@ private:
         std::unique_ptr<WindowsOpenedEntry> container_view;
         if(container_){
             HANDLE raw=nullptr;
-            if(!directory_||!DuplicateHandle(GetCurrentProcess(),container_->handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+            if(!directory_||!detail::legacy_duplicate(GetCurrentProcess(),container_->handle_.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS,"legacy.metadata_windows.DuplicateHandle.7"))
                 return failure<bool>(GetLastError(),"target_read.container_duplicate");
             OwnedHandle owned(raw);container_view=std::make_unique<WindowsOpenedEntry>(std::move(owned),container_->scope_);
             auto current=container_view->inspect_basic();if(!current.value()){const auto&e=*current.unavailable_detail();return Observation<bool>::unavailable(e.state,e.error);}
@@ -3782,7 +3844,7 @@ private:
         auto bootstrap=std::move(opened).take_value();const FILETIME suppressed{MAXDWORD,MAXDWORD};
         if(!SetFileTime(bootstrap.get(),nullptr,&suppressed,&suppressed))return failure<bool>(GetLastError(),"target_read.base_suppress_times");
         HANDLE raw=nullptr;
-        if(!DuplicateHandle(GetCurrentProcess(),bootstrap.get(),GetCurrentProcess(),&raw,read,FALSE,0))
+        if(!detail::legacy_duplicate(GetCurrentProcess(),bootstrap.get(),GetCurrentProcess(),&raw,read,FALSE,0,"legacy.metadata_windows.DuplicateHandle.8"))
             return failure<bool>(GetLastError(),"target_read.base_reduce_rights");
         OwnedHandle readonly(raw);auto prepared=std::make_shared<WindowsOpenedEntry>(std::move(readonly),target_->scope_,false,!directory_);
         bootstrap.reset();if(close_error_)return Observation<bool>::unavailable(close_error_->state,
@@ -3797,8 +3859,8 @@ private:
             auto enum_bootstrap=std::move(fresh).take_value();
             if(!SetFileTime(enum_bootstrap.get(),nullptr,&suppressed,&suppressed))return failure<bool>(GetLastError(),"target_read.enumeration_suppress_times");
             HANDLE raw_enum=nullptr;
-            if(!DuplicateHandle(GetCurrentProcess(),enum_bootstrap.get(),GetCurrentProcess(),&raw_enum,
-                FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|SYNCHRONIZE,FALSE,0))return failure<bool>(GetLastError(),"target_read.enumeration_reduce_rights");
+            if(!detail::legacy_duplicate(GetCurrentProcess(),enum_bootstrap.get(),GetCurrentProcess(),&raw_enum,
+                FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|SYNCHRONIZE,FALSE,0,"legacy.metadata_windows.DuplicateHandle.9"))return failure<bool>(GetLastError(),"target_read.enumeration_reduce_rights");
             OwnedHandle reduced_enum(raw_enum);enum_bootstrap.reset();
             if(close_error_)return Observation<bool>::unavailable(close_error_->state,{close_error_->domain,close_error_->code,close_error_->operation});
             enumeration_=std::move(reduced_enum);
@@ -3859,7 +3921,7 @@ Observation<bool> WindowsOpenedEntry::rename_noreplace(const DirectoryCursor& so
     if (!source_flush.value()) {const auto& e=*source_flush.unavailable_detail();return Result::unavailable(e.state,e.error);}
     auto renamed=to->publish_noreplace(handle_.get(),name);
     if (!renamed.value() || !*renamed.value()) return renamed;
-    if (!FlushFileBuffers(source_flush.value()->get())) return Result::unavailable(ObservationState::Unknown,
+    if (!detail::legacy_flush(source_flush.value()->get(),"legacy.metadata_windows.FlushFileBuffers.12")) return Result::unavailable(ObservationState::Unknown,
         {ErrorDomain::Win32,GetLastError(),"rename_noreplace.held_source_directory_flush"});
     if (content_lease_) {const auto stable=content_lease_->check();if(!stable.value()) return Result::unavailable(ObservationState::Unknown,stable.unavailable_detail()->error);}
     return Result::available(true);
@@ -3893,9 +3955,9 @@ Observation<bool> WindowsOpenedEntry::publish_noreplace(const DirectoryCursor& d
     attributes.ObjectName = &native_name;
     IO_STATUS_BLOCK io{};
     HANDLE raw = nullptr;
-    const NTSTATUS status = NtCreateFile(&raw, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attributes, &io, nullptr, 0,
+    const NTSTATUS status = detail::legacy_nt_create(&raw, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attributes, &io, nullptr, 0,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
-        FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
+        FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0,"legacy.metadata_windows.NtCreateFile.5");
     OwnedHandle named(raw);
     if (status < 0)
         return Result::unavailable(ObservationState::Changed,
@@ -4223,9 +4285,9 @@ Observation<OwnedHandle> readonly_created_directory(HANDLE created,const ObjectI
     if(expected.scheme!=IdentityScheme::WindowsFileId128)return failure<OwnedHandle>(ERROR_NOT_SUPPORTED,"directory_creation.identity_scheme");
     FILE_ID_DESCRIPTOR id{};id.dwSize=sizeof(id);id.Type=ExtendedFileIdType;
     std::memcpy(id.ExtendedFileId.Identifier,expected.object.bytes.data(),16);
-    OwnedHandle opened(OpenFileById(created,&id,rights|FILE_READ_ATTRIBUTES|SYNCHRONIZE,
+    OwnedHandle opened(detail::legacy_open_by_id(created,&id,rights|FILE_READ_ATTRIBUTES|SYNCHRONIZE,
         FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,
-        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL,"legacy.metadata_windows.OpenFileById.6"));
     if(!opened||opened.get()==INVALID_HANDLE_VALUE)return failure<OwnedHandle>(GetLastError(),"directory_creation.OpenFileById.readonly");
     const auto current=handle_metadata(opened.get(),scope);
     if(!current.value()){const auto& e=*current.unavailable_detail();return Result::unavailable(e.state,e.error);}
@@ -4284,7 +4346,7 @@ Observation<bool> qualify_native_directory_creation(const DirectoryCursor& paren
         // New directories can inherit the parent's case-sensitive state.
         // Refuse unknown/nonzero state before FILE_CREATE, not afterwards.
         FILE_CASE_SENSITIVE_INFO case_info{};
-        if(!GetFileInformationByHandleEx(cursor->handle_.get(),FileCaseSensitiveInfo,&case_info,sizeof(case_info)))
+        if(!detail::legacy_query(cursor->handle_.get(),FileCaseSensitiveInfo,&case_info,sizeof(case_info),"legacy.metadata_windows.GetFileInformationByHandleEx.20"))
             return Result::unavailable(ObservationState::Unsupported,
                 {ErrorDomain::Win32,GetLastError(),"directory_creation.parent_case_query_unqualified"});
         if(case_info.Flags!=0)return unsupported("directory_creation.parent_case_flags_unimplemented");
@@ -4296,7 +4358,7 @@ Observation<bool> qualify_native_directory_creation(const DirectoryCursor& paren
     auto access=cursor->open_namespace_write_handle();
     if(!access.value()){const auto& e=*access.unavailable_detail();return Result::unavailable(e.state,e.error);}
     const HANDLE handle=std::move(access).take_value().release();
-    if(!CloseHandle(handle))return failure<bool>(GetLastError(),"directory_creation.qualify_parent_close");
+    if(!detail::legacy_close_handle(handle,"legacy.metadata_windows.CloseHandle.4"))return failure<bool>(GetLastError(),"directory_creation.qualify_parent_close");
     return Result::available(true);
 }
 Observation<std::unique_ptr<NativeCreatedDirectory>> create_native_directory(
@@ -4321,8 +4383,8 @@ Observation<std::unique_ptr<NativeCreatedDirectory>> create_native_directory(
     IO_STATUS_BLOCK io{};HANDLE raw=nullptr;
     const DWORD rights=FILE_GENERIC_READ|FILE_GENERIC_WRITE|READ_CONTROL|WRITE_DAC|WRITE_OWNER|DELETE|
         (policy.scope==RegularMetadataScope::CompleteMetadataV1?ACCESS_SYSTEM_SECURITY:0);
-    const auto status=NtCreateFile(&raw,rights,&attributes,&io,nullptr,FILE_ATTRIBUTE_NORMAL,FILE_SHARE_READ|FILE_SHARE_WRITE,
-        FILE_CREATE,FILE_DIRECTORY_FILE|FILE_OPEN_REPARSE_POINT|FILE_SYNCHRONOUS_IO_NONALERT|FILE_WRITE_THROUGH,nullptr,0);
+    const auto status=detail::legacy_nt_create(&raw,rights,&attributes,&io,nullptr,FILE_ATTRIBUTE_NORMAL,FILE_SHARE_READ|FILE_SHARE_WRITE,
+        FILE_CREATE,FILE_DIRECTORY_FILE|FILE_OPEN_REPARSE_POINT|FILE_SYNCHRONOUS_IO_NONALERT|FILE_WRITE_THROUGH,nullptr,0,"legacy.metadata_windows.NtCreateFile.6");
     OwnedHandle created(raw);
     if(status!=0)return Result::unavailable(error_state(RtlNtStatusToDosError(status)),
         {ErrorDomain::NtStatus,static_cast<std::uint32_t>(status),"directory_creation.NtCreateFile"});
@@ -4349,8 +4411,8 @@ Observation<std::unique_ptr<NativeCreatedDirectory>> create_native_directory(
     auto verifier=std::make_unique<WindowsOpenedEntry>(std::move(verify_view).take_value(),cursor->scope_);
     // Consume the temporary namespace writer and report its close error too.
     const HANDLE parent_writer=std::move(parent_access).take_value().release();
-    const DWORD flush_error=FlushFileBuffers(parent_writer)?ERROR_SUCCESS:GetLastError();
-    const DWORD close_error=CloseHandle(parent_writer)?ERROR_SUCCESS:GetLastError();
+    const DWORD flush_error=detail::legacy_flush(parent_writer,"legacy.metadata_windows.FlushFileBuffers.13")?ERROR_SUCCESS:GetLastError();
+    const DWORD close_error=detail::legacy_close_handle(parent_writer,"legacy.metadata_windows.CloseHandle.5")?ERROR_SUCCESS:GetLastError();
     if(flush_error)return failure<std::unique_ptr<NativeCreatedDirectory>>(flush_error,"directory_creation.parent_flush_after_create");
     if(close_error)return failure<std::unique_ptr<NativeCreatedDirectory>>(close_error,"directory_creation.parent_close_after_create");
     return Result::available(std::unique_ptr<NativeCreatedDirectory>(new NativeCreatedDirectory(std::move(parent),std::move(name),
@@ -4372,9 +4434,9 @@ Observation<BasicMetadata> NativeFileSystem::inspect_basic(const std::filesystem
     if (!address.value()) { const auto& e = *address.unavailable_detail(); return Observation<BasicMetadata>::unavailable(e.state, e.error); }
     const auto native_path = windows_extended_path(path.native());
     if (!native_path) return failure<BasicMetadata>(ERROR_INVALID_NAME, "CreateFileW.metadata.path");
-    const std::unique_ptr<void, HandleCloser> handle(CreateFileW(native_path->c_str(), FILE_READ_ATTRIBUTES,
+    const std::unique_ptr<void, HandleCloser> handle(detail::legacy_create(native_path->c_str(), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL, nullptr));
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL, nullptr,"legacy.metadata_windows.CreateFileW.5"));
     if (handle.get() == INVALID_HANDLE_VALUE) return failure<BasicMetadata>(GetLastError(), "CreateFileW.metadata");
 
     return handle_metadata(handle.get(), scope_);
@@ -4391,12 +4453,12 @@ Observation<std::unique_ptr<DirectoryCursor>> NativeFileSystem::open_directory(
     const DWORD link_flag = policy == DirectoryLinkPolicy::RejectFinalLink ? FILE_FLAG_OPEN_REPARSE_POINT : 0;
     const auto native_path = windows_extended_path(path.native());
     if (!native_path) return failure<std::unique_ptr<DirectoryCursor>>(ERROR_INVALID_NAME, "CreateFileW.directory.path");
-    OwnedHandle handle(CreateFileW(native_path->c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+    OwnedHandle handle(detail::legacy_create(native_path->c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL | link_flag, nullptr));
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL | link_flag, nullptr,"legacy.metadata_windows.CreateFileW.6"));
     if (handle.get() == INVALID_HANDLE_VALUE) return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(), "CreateFileW.directory");
     FILE_BASIC_INFO basic{};
-    if (!GetFileInformationByHandleEx(handle.get(), FileBasicInfo, &basic, sizeof(basic)))
+    if (!detail::legacy_query(handle.get(), FileBasicInfo, &basic, sizeof(basic),"legacy.metadata_windows.GetFileInformationByHandleEx.21"))
         return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(), "FileBasicInfo.directory");
     if (policy == DirectoryLinkPolicy::RejectFinalLink && (basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
         return Result::unavailable(ObservationState::Failed,
@@ -4414,9 +4476,9 @@ Observation<std::unique_ptr<DirectoryCursor>> open_native_operation_journal_dire
     const auto path=windows_extended_path(host.value()->native());
     if(!path)return failure<std::unique_ptr<DirectoryCursor>>(ERROR_INVALID_NAME,"journal_reader.root_path");
     // Initial acquisition, never an upgrade through the same-access bridge.
-    OwnedHandle handle(CreateFileW(path->c_str(),FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL|SYNCHRONIZE,
+    OwnedHandle handle(detail::legacy_create(path->c_str(),FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL|SYNCHRONIZE,
         FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL,nullptr));
+        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL,nullptr,"legacy.metadata_windows.CreateFileW.7"));
     if(handle.get()==INVALID_HANDLE_VALUE)return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"journal_reader.open_root");
     AdapterScope scope;
     auto id=identity(handle.get(),scope);
@@ -4469,20 +4531,20 @@ Observation<std::unique_ptr<DirectoryCursor>> detail::open_native_session_root(c
     // ReOpenFile requires CreateFile origin; this Session handle is native-created.
     const auto original=reinterpret_cast<HANDLE>(*source.value());
     FILE_ID_INFO before{};
-    if(!GetFileInformationByHandleEx(original,FileIdInfo,&before,sizeof(before)))
+    if(!detail::legacy_query(original,FileIdInfo,&before,sizeof(before),"legacy.metadata_windows.GetFileInformationByHandleEx.22"))
         return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"session_lease.held_root_id");
     FILE_ID_DESCRIPTOR descriptor{};descriptor.dwSize=sizeof(descriptor);descriptor.Type=ExtendedFileIdType;
     std::memcpy(descriptor.ExtendedFileId.Identifier,before.FileId.Identifier,16);
-    OwnedHandle opened(OpenFileById(original,&descriptor,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|SYNCHRONIZE,
+    OwnedHandle opened(detail::legacy_open_by_id(original,&descriptor,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|SYNCHRONIZE,
         FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,
-        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+        FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL,"legacy.metadata_windows.OpenFileById.7"));
     if(!opened||opened.get()==INVALID_HANDLE_VALUE)return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"session_lease.OpenFileById_root");
     FILE_ID_INFO after{};
-    if(!GetFileInformationByHandleEx(opened.get(),FileIdInfo,&after,sizeof(after)))
+    if(!detail::legacy_query(opened.get(),FileIdInfo,&after,sizeof(after),"legacy.metadata_windows.GetFileInformationByHandleEx.23"))
         return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"session_lease.opened_root_id");
     if(before.VolumeSerialNumber!=after.VolumeSerialNumber||std::memcmp(before.FileId.Identifier,after.FileId.Identifier,16)!=0)
         return R::unavailable(ObservationState::Changed,{ErrorDomain::Adapter,19,"session_lease.held_root_identity_changed"});
-    FILE_ATTRIBUTE_TAG_INFO tag{};if(!GetFileInformationByHandleEx(opened.get(),FileAttributeTagInfo,&tag,sizeof(tag)))return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"session_lease.root_tag");
+    FILE_ATTRIBUTE_TAG_INFO tag{};if(!detail::legacy_query(opened.get(),FileAttributeTagInfo,&tag,sizeof(tag),"legacy.metadata_windows.GetFileInformationByHandleEx.24"))return failure<std::unique_ptr<DirectoryCursor>>(GetLastError(),"session_lease.root_tag");
     constexpr DWORD unsafe=FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_OFFLINE;
     if(!(tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)||(tag.FileAttributes&unsafe))return R::unavailable(ObservationState::Unsupported,{ErrorDomain::Adapter,18,"session_lease.root_kind"});
     auto id=identity(opened.get(),lease.scope_);

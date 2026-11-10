@@ -14,8 +14,15 @@ namespace detail {
 // Failure-only worker seam for native contract tests. Invoked after all retry
 // finalizers return; tests can start a genuine Root failure writer here. No
 // public C callback, native success, or authority can be supplied through it.
+#if defined(CK_FS_INTERNAL_TEST_HOOKS) && CK_FS_INTERNAL_TEST_HOOKS
 using VerifiedCopyRetryAfterDrain=void(*)()noexcept;
 inline std::atomic<VerifiedCopyRetryAfterDrain> verified_copy_retry_test_after_drain{nullptr};
+inline void verified_copy_retry_after_drain_checkpoint() noexcept {
+    if(const auto hook=verified_copy_retry_test_after_drain.load(std::memory_order_acquire))hook();
+}
+#else
+inline void verified_copy_retry_after_drain_checkpoint() noexcept {}
+#endif
 }
 // This is an explicitly reviewed NEW copy, not adoption of a reopened stage.
 // The old journal/staging object is never changed, cleaned or replayed. An

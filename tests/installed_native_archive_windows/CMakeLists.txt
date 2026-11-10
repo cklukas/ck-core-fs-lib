@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.25)
 project(archive_installed_ctest LANGUAGES CXX)
+option(CK_CORE_FS_CONSUMER_MATCH_TEST_PRODUCER
+  "Private qualification only: match a BUILD_TESTING=ON producer" OFF)
+if(CK_CORE_FS_CONSUMER_MATCH_TEST_PRODUCER)
+  # Only this controlled client's TUs. Never export test definitions from SDK
+  # targets or mix these clients with a production BUILD_TESTING=OFF prefix.
+  add_compile_definitions(CK_FS_INTERNAL_TEST_HOOKS=1 CK_FS_LEGACY_NATIVE_TEST_OBSERVERS)
+  if(WIN32)
+    add_compile_definitions(CK_FS_NATIVE_CLOSE_TEST_HOOKS)
+  endif()
+endif()
 include(CTest)
 find_package(ck-core-fs CONFIG REQUIRED)
 if(NOT IS_ABSOLUTE "${ARCHIVE_TEST_SOURCE_ROOT}")

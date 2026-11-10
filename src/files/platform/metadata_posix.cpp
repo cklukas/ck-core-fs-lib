@@ -43,6 +43,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "legacy_native_fixture_posix.hpp"
 #include <sys/xattr.h>
 #if defined(__APPLE__)
 #include <sys/acl.h>
@@ -144,7 +145,7 @@ void platform_fields(BasicMetadata& result) {
 
 Observation<BasicMetadata> stat_metadata(int descriptor, const char* path, bool from_handle, const AdapterScope& scope, int path_flags = AT_SYMLINK_NOFOLLOW) {
     struct stat native{};
-    if ((from_handle ? fstat(descriptor, &native) : fstatat(descriptor, path, &native, path_flags)) != 0) {
+    if ((from_handle ? ::ck::files::detail::legacy_fstat(descriptor, &native,"legacy.metadata_posix.fstat.147") : fstatat(descriptor, path, &native, path_flags)) != 0) {
         const int code = errno;
         return Observation<BasicMetadata>::unavailable(errno_state(code), {ErrorDomain::Posix, code, from_handle ? "fstat" : "fstatat"});
     }
@@ -320,7 +321,7 @@ Observation<bool> linux_full_environment() {
     how.flags=O_PATH|O_NOFOLLOW|O_CLOEXEC;how.resolve=RESOLVE_NO_XDEV|RESOLVE_NO_SYMLINKS;
     OwnedDescriptor link(static_cast<int>(syscall(SYS_openat2,task.get(),"ns/user",&how,sizeof(how))));
     if(link.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.full_userns_link"});
-    if(fstat(link.get(),&st)||fstatfs(link.get(),&fs))return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.full_userns_link_stat"});
+    if(::ck::files::detail::legacy_fstat(link.get(),&st,"legacy.metadata_posix.fstat.323")||fstatfs(link.get(),&fs))return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.full_userns_link_stat"});
     if(!S_ISLNK(st.st_mode)||static_cast<unsigned long>(fs.f_type)!=static_cast<unsigned long>(PROC_SUPER_MAGIC))
         return unsupported("metadata_replay.full_userns_link_provider");
     char identity[64];const auto n=readlinkat(link.get(),"",identity,sizeof(identity));
@@ -329,7 +330,7 @@ Observation<bool> linux_full_environment() {
         return unsupported("metadata_replay.initial_user_namespace_unqualified");
     OwnedDescriptor ns(openat(task.get(),"ns/user",O_RDONLY|O_CLOEXEC));
     if(ns.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.full_userns_open"});
-    if(fstat(ns.get(),&st)||fstatfs(ns.get(),&fs))return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.full_userns_stat"});
+    if(::ck::files::detail::legacy_fstat(ns.get(),&st,"legacy.metadata_posix.fstat.332")||fstatfs(ns.get(),&fs))return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"metadata_replay.full_userns_stat"});
     if(static_cast<unsigned long>(fs.f_type)!=static_cast<unsigned long>(NSFS_MAGIC)||
        st.st_ino!=linux_initial_user_namespace_inode||ioctl(ns.get(),NS_GET_NSTYPE)!=CLONE_NEWUSER)
         return unsupported("metadata_replay.initial_user_namespace_unqualified");
@@ -439,7 +440,7 @@ Observation<std::string> mount_root_path(int source_descriptor, dev_t source_dev
         return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, operation});
     for (std::size_t depth = 0; depth < 4096; ++depth) {
         struct stat current_stat{};
-        if (fstat(current.get(), &current_stat) != 0)
+        if (::ck::files::detail::legacy_fstat(current.get(), &current_stat,"legacy.metadata_posix.fstat.442") != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, operation});
         const auto parent_path = descriptor_path(current.get(), operation);
         if (!parent_path.value()) {
@@ -450,7 +451,7 @@ Observation<std::string> mount_root_path(int source_descriptor, dev_t source_dev
         if (parent.get() < 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, operation});
         struct stat parent_stat{};
-        if (fstat(parent.get(), &parent_stat) != 0)
+        if (::ck::files::detail::legacy_fstat(parent.get(), &parent_stat,"legacy.metadata_posix.fstat.453") != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, operation});
         if (current_stat.st_dev == source_device &&
             (parent_stat.st_dev != source_device ||
@@ -518,7 +519,7 @@ Observation<TrashDirectories> open_trash_root(std::string_view root_path, dev_t 
         return Result::unavailable(e.state, e.error);
     }
     struct stat trash_stat{};
-    if (fstat(root.value()->get(), &trash_stat) != 0)
+    if (::ck::files::detail::legacy_fstat(root.value()->get(), &trash_stat,"legacy.metadata_posix.fstat.521") != 0)
         return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, operation});
     if (trash_stat.st_dev != source_device)
         return Result::unavailable(ObservationState::Unsupported,
@@ -555,7 +556,7 @@ Observation<TrashDirectories> open_trash_directories(int source_parent_descripto
         return Result::unavailable(e.state, e.error);
     }
     struct stat home_stat{};
-    if (fstat(home_directory.value()->get(), &home_stat) != 0)
+    if (::ck::files::detail::legacy_fstat(home_directory.value()->get(), &home_stat,"legacy.metadata_posix.fstat.558") != 0)
         return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, operation});
     const auto source_device = source_parent.st_dev;
     const bool home_matches = home_stat.st_dev == source_device;
@@ -568,7 +569,7 @@ Observation<TrashDirectories> open_trash_directories(int source_parent_descripto
         auto configured_directory = open_directory_path(configured, false, operation);
         if (configured_directory.value()) {
             struct stat configured_stat{};
-            if (fstat(configured_directory.value()->get(), &configured_stat) != 0)
+            if (::ck::files::detail::legacy_fstat(configured_directory.value()->get(), &configured_stat,"legacy.metadata_posix.fstat.571") != 0)
                 return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, operation});
             if (configured_stat.st_dev == source_device) candidate = std::string(configured) + "/Trash";
             else if (!home_matches)
@@ -968,7 +969,7 @@ public:
         if(!content_write_access_||finish_started_||!publication_||directory_metadata_target_)
             return R::unavailable(ObservationState::Denied,adapter_error(AdapterError::InvalidAccess,"archive.creator_required"));
         struct stat info{};
-        if(fstat(descriptor_.get(),&info)!=0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"archive.fstat"});
+        if(::ck::files::detail::legacy_fstat(descriptor_.get(),&info,"legacy.metadata_posix.fstat.971")!=0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"archive.fstat"});
         if(!S_ISREG(info.st_mode)||info.st_size!=0||info.st_nlink!=(publication_->anonymous?0:1))
             return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,"archive.creator_shape"));
         if(size>static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))
@@ -1039,7 +1040,7 @@ public:
         const auto ownership=qualify_ownership_semantics();
         if (!ownership.value()) {const auto& e=*ownership.unavailable_detail();return Result::unavailable(e.state,e.error);}
         struct stat native{};
-        if (fstat(descriptor_.get(), &native) != 0)
+        if (::ck::files::detail::legacy_fstat(descriptor_.get(), &native,"legacy.metadata_posix.fstat.1042") != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "regular_metadata.ownership_before"});
         if ((!S_ISREG(native.st_mode)&&!(directory_metadata_target_&&S_ISDIR(native.st_mode))) ||
             (directory_metadata_target_?native.st_nlink<1:!metadata_link_count_qualified(native.st_nlink)))
@@ -1051,7 +1052,7 @@ public:
         // writable here, and the source's uid/gid are never replayed.
         if ((native.st_uid != uid || native.st_gid != gid) && fchown(descriptor_.get(), uid, gid) != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "regular_metadata.fchown_caller"});
-        if (fstat(descriptor_.get(), &native) != 0)
+        if (::ck::files::detail::legacy_fstat(descriptor_.get(), &native,"legacy.metadata_posix.fstat.1054") != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "regular_metadata.ownership_after"});
         if (native.st_uid != uid || native.st_gid != gid)
             return Result::unavailable(ObservationState::Changed,
@@ -1091,7 +1092,7 @@ public:
         readable = OwnedDescriptor(open(proxy.value()->c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC));
         if (readable.get() < 0) return refuse("regular_metadata.held_descriptor_read_access");
         struct stat original{}, reopened{};
-        if (fstat(descriptor_.get(), &original) != 0 || fstat(readable.get(), &reopened) != 0 ||
+        if (::ck::files::detail::legacy_fstat(descriptor_.get(), &original,"legacy.metadata_posix.fstat.1094") != 0 || ::ck::files::detail::legacy_fstat(readable.get(), &reopened,"legacy.metadata_posix.fstat.1094") != 0 ||
             original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino || !S_ISREG(reopened.st_mode))
             return refuse("regular_metadata.held_handle_identity");
         int flags = 0;
@@ -1249,7 +1250,7 @@ public:
         readable = OwnedDescriptor(open(proxy.value()->c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC));
         if (readable.get() < 0) return refuse("regular_metadata.held_descriptor_read_access");
         struct stat original{}, reopened{};
-        if (fstat(descriptor_.get(), &original) != 0 || fstat(readable.get(), &reopened) != 0 ||
+        if (::ck::files::detail::legacy_fstat(descriptor_.get(), &original,"legacy.metadata_posix.fstat.1252") != 0 || ::ck::files::detail::legacy_fstat(readable.get(), &reopened,"legacy.metadata_posix.fstat.1252") != 0 ||
             original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino || (directory?!S_ISDIR(reopened.st_mode):!S_ISREG(reopened.st_mode)))
             return refuse("regular_metadata.held_handle_identity");
         int flags = 0;
@@ -2201,7 +2202,7 @@ public:
             return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,"directory_reader.held_identity"));
         OwnedDescriptor fd(openat(dirfd(directory_.get()),".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
         if(fd.get()<0)return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"directory_reader.open_self"});
-        struct stat st{};if(fstat(fd.get(),&st))return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"directory_reader.fstat"});
+        struct stat st{};if(::ck::files::detail::legacy_fstat(fd.get(),&st,"legacy.metadata_posix.fstat.2204"))return R::unavailable(errno_state(errno),{ErrorDomain::Posix,errno,"directory_reader.fstat"});
         if(!S_ISDIR(st.st_mode))return R::unavailable(ObservationState::Changed,adapter_error(AdapterError::MetadataChanged,"directory_reader.kind"));
         std::optional<std::uint64_t> generation;
 #if defined(__APPLE__)
@@ -2339,7 +2340,7 @@ public:
             return Result::unavailable(errno_state(code), {ErrorDomain::Posix, code, "openat.create_child_file"});
         }
         struct stat native{};
-        if (fstat(descriptor.get(), &native) != 0)
+        if (::ck::files::detail::legacy_fstat(descriptor.get(), &native,"legacy.metadata_posix.fstat.2342") != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "fstat.create_child_file"});
         if (!S_ISREG(native.st_mode) || native.st_nlink != 1)
             return Result::unavailable(ObservationState::Failed, adapter_error(AdapterError::InvalidNativeResult, "create_child_file.kind"));
@@ -2476,7 +2477,7 @@ public:
             return Result::unavailable(errno_state(code), {ErrorDomain::Posix, code, "openat.create_child_directory"});
         }
         struct stat actual{};
-        if (fstat(dirfd(opened.get()), &actual) != 0)
+        if (::ck::files::detail::legacy_fstat(dirfd(opened.get()), &actual,"legacy.metadata_posix.fstat.2479") != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "fstat.create_child_directory"});
         if (!S_ISDIR(actual.st_mode) || actual.st_dev != expected.st_dev || actual.st_ino != expected.st_ino)
             return Result::unavailable(ObservationState::Changed,
@@ -2507,7 +2508,7 @@ public:
 
         const int source_parent = dirfd(directory_.get());
         struct stat source_parent_stat{};
-        if (fstat(source_parent, &source_parent_stat) != 0)
+        if (::ck::files::detail::legacy_fstat(source_parent, &source_parent_stat,"legacy.metadata_posix.fstat.2510") != 0)
             return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "trash_child.parent"});
         const auto source_path = descriptor_path(source_parent, "trash_child.original_parent");
         if (!source_path.value()) {
@@ -2990,7 +2991,7 @@ public:
                 {ErrorDomain::Posix, code, "openat.directory_child"});
         }
         struct stat native{};
-        if (fstat(fd.get(), &native) != 0) {
+        if (::ck::files::detail::legacy_fstat(fd.get(), &native,"legacy.metadata_posix.fstat.2993") != 0) {
             const int code = errno;
             return Result::unavailable(errno_state(code), {ErrorDomain::Posix, code, "fstat.directory_child"});
         }
@@ -3587,7 +3588,7 @@ Observation<std::unique_ptr<DirectoryCursor>> NativeFileSystem::open_directory(
         return Result::unavailable(state, {ErrorDomain::Posix, code, "open.directory"});
     }
     struct stat native{};
-    if (fstat(fd.get(), &native) != 0) {
+    if (::ck::files::detail::legacy_fstat(fd.get(), &native,"legacy.metadata_posix.fstat.3590") != 0) {
         const int code = errno;
         return Result::unavailable(errno_state(code), {ErrorDomain::Posix, code, "fstat.directory"});
     }
@@ -3743,7 +3744,7 @@ Observation<std::unique_ptr<DirectoryCursor>> detail::open_native_session_root(c
     // A fresh open description of the same held directory, never its old path.
     OwnedDescriptor fd(openat(static_cast<int>(*source.value()),".",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW));
     if(fd.get()<0){const int e=errno;return R::unavailable(errno_state(e),{ErrorDomain::Posix,e,"session_lease.openat_held_root"});}
-    struct stat info{};if(fstat(fd.get(),&info)!=0){const int e=errno;return R::unavailable(errno_state(e),{ErrorDomain::Posix,e,"session_lease.root_fstat"});}
+    struct stat info{};if(::ck::files::detail::legacy_fstat(fd.get(),&info,"legacy.metadata_posix.fstat.3746")!=0){const int e=errno;return R::unavailable(errno_state(e),{ErrorDomain::Posix,e,"session_lease.root_fstat"});}
     if(!S_ISDIR(info.st_mode))return R::unavailable(ObservationState::Unsupported,{ErrorDomain::Adapter,5,"session_lease.root_kind"});
     std::optional<std::uint64_t> generation;
 #ifdef __APPLE__
@@ -3754,3 +3755,12 @@ Observation<std::unique_ptr<DirectoryCursor>> detail::open_native_session_root(c
     return R::available(std::make_unique<PosixDirectoryCursor>(std::move(directory),std::move(id),lease.scope_));
 }
 } // namespace ck::files
+
+#ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
+namespace ck::files::detail {
+// Test instrumentation closure only, not native authority/async completion.
+std::uint64_t legacy_native_metadata_coverage()noexcept {
+    return legacy_operation_bit(LegacyNativeOperation::Query);
+}
+}
+#endif

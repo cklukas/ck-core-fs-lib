@@ -11,11 +11,14 @@
 #include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "windows_test_runtime_self_report.hpp"
+#include "native_read_close_capture_fixture.hpp"
 #include <sddl.h>
 #else
 #include <fcntl.h>
@@ -37,26 +40,61 @@ NativeName component(const char* n){
 }
 #ifdef _WIN32
 std::atomic<bool> read_armed{false};std::atomic<unsigned> read_calls{0};FILE_ID_INFO read_target{};
-std::stop_source* cancel_reads=nullptr;std::function<void()> mutate_on_read;unsigned mutation_read_number=2;
-BOOL WINAPI watched_read(HANDLE h,LPVOID data,DWORD n,LPDWORD count,LPOVERLAPPED io){
-    using Native=BOOL(WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED);
-    static const auto native=std::bit_cast<Native>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"ReadFile"));
-    const BOOL result=native(h,data,n,count,io);const DWORD saved=GetLastError();
-    if(result&&read_armed.load()) {FILE_ID_INFO id{};
-        if(GetFileInformationByHandleEx(h,FileIdInfo,&id,sizeof(id))&&id.VolumeSerialNumber==read_target.VolumeSerialNumber&&
+// The adversarial namespace actor is prepared BEFORE capture. Its boundary
+// action uses only pre-existing wide buffers and POD/native calls: no function
+// object move, C++ allocation, throwing assertion, or diagnostic in a callback.
+struct NativeMembershipMutation final {
+ const wchar_t* original;const wchar_t* moved;FILE_BASIC_INFO saved;bool* changed;
+ const char* failure_operation=nullptr;DWORD failure_code=ERROR_SUCCESS;
+ void failed(const char* operation,DWORD code)noexcept {if(!failure_operation){failure_operation=operation;failure_code=code;}}
+ bool close(HANDLE h,const char* operation)noexcept {
+  if(CloseHandle(h))return true;failed(operation,GetLastError());return false;
+ }
+ bool restore(const wchar_t* path,const FILE_BASIC_INFO& basic)noexcept {
+  HANDLE h=CreateFileW(path,FILE_WRITE_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+   nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+  if(h==INVALID_HANDLE_VALUE){failed("restore native fixture times",GetLastError());return false;}
+  if(!SetFileInformationByHandle(h,FileBasicInfo,const_cast<FILE_BASIC_INFO*>(&basic),sizeof(basic)))failed("restore exact basic times",GetLastError());
+  close(h,"restore times close");return !failure_operation;
+ }
+ void run()noexcept {
+  if(!MoveFileExW(original,moved,0)){failed("native attacker rename",GetLastError());return;}
+  if(!restore(moved,saved))return;
+  HANDLE h=CreateFileW(original,GENERIC_WRITE|FILE_WRITE_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+   nullptr,CREATE_ALWAYS,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+  if(h==INVALID_HANDLE_VALUE){failed("native fixture create/write",GetLastError());return;}
+  constexpr char bytes[]="base";DWORD written=0;
+  if(!WriteFile(h,bytes,4,&written,nullptr))failed("native fixture write",GetLastError());
+  else if(written!=4)failed("native fixture short write",ERROR_SUCCESS);
+  if(!failure_operation&&!FlushFileBuffers(h))failed("native fixture flush",GetLastError());
+  close(h,"native fixture close");if(failure_operation)return;
+  h=CreateFileW(original,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+   nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+  if(h==INVALID_HANDLE_VALUE){failed("read native fixture times",GetLastError());return;}
+  FILE_BASIC_INFO replacement{};
+  if(!GetFileInformationByHandleEx(h,FileBasicInfo,&replacement,sizeof(replacement)))failed("native basic times",GetLastError());
+  close(h,"native times close");if(failure_operation)return;
+  replacement.CreationTime.QuadPart=125911584000000000LL;replacement.LastAccessTime.QuadPart=replacement.CreationTime.QuadPart;
+  replacement.LastWriteTime.QuadPart=replacement.CreationTime.QuadPart;replacement.FileAttributes=FILE_ATTRIBUTE_ARCHIVE;
+  if(restore(original,replacement))*changed=true;
+ }
+};
+std::stop_source* cancel_reads=nullptr;thread_local NativeMembershipMutation* mutate_on_read=nullptr;unsigned mutation_read_number=2;
+bool read_actor_failed=false;
+void capture_read_after(void* raw,detail::NativeReadPhase phase,std::uint32_t,std::uint32_t,bool succeeded,std::uint32_t,const char*) noexcept {
+    if(phase==detail::NativeReadPhase::Completion&&succeeded&&read_armed.load()) {FILE_ID_INFO id{};
+        if(GetFileInformationByHandleEx(static_cast<HANDLE>(raw),FileIdInfo,&id,sizeof(id))&&id.VolumeSerialNumber==read_target.VolumeSerialNumber&&
            !std::memcmp(id.FileId.Identifier,read_target.FileId.Identifier,16)){
             const auto hits=read_calls.fetch_add(1)+1;
             if(hits==2&&cancel_reads)cancel_reads->request_stop();
-            if(hits==mutation_read_number&&mutate_on_read){auto callback=std::move(mutate_on_read);mutate_on_read={};callback();}
-        }}SetLastError(saved);return result;
+            if(hits==mutation_read_number&&mutate_on_read){auto* actor=std::exchange(mutate_on_read,nullptr);
+                actor->run();if(actor->failure_operation)read_actor_failed=true;}
+        }}
 }
+
 #endif
 }
-#ifdef _WIN32
-// Test executable import interception only; production calls still perform the
-// actual native read. It counts real source bytes and deterministic boundaries.
-extern "C" {decltype(&ReadFile) __imp_ReadFile=&watched_read;}
-#endif
+
 namespace {
 struct Fixture {
     NativeFileSystem fs;
@@ -166,11 +204,13 @@ void budgets_unknown_and_cancel(){Fixture f;f.data("left",u"a","base");f.data("l
 void final_membership_test(){Fixture f;f.data("left",u"a","base");f.data("left",u"a",std::string(192*1024,'x'),u":large:$DATA");f.fixed("left",u"a");
     unsigned reads=0;f.arm("left",u"a");{auto probe=f.proof("left");reads=read_calls.load();}read_armed=false;
     check(reads>3,"native final-digest read trace missing");const auto stamp=f.times("left",u"a");
-    f.arm("left",u"a");mutation_read_number=reads-1;bool changed=false;mutate_on_read=[&]{
-        check(MoveFileExW(f.path("left",u"a").c_str(),f.path("left",u"moved").c_str(),0)!=0,"native attacker rename");
-        f.restore("left",u"moved",stamp);f.data("left",u"a","base");f.fixed("left",u"a");changed=true;};
+    f.arm("left",u"a");mutation_read_number=reads-1;bool changed=false;
+    const auto original=f.path("left",u"a"),moved=f.path("left",u"moved");
+    NativeMembershipMutation actor{original.c_str(),moved.c_str(),stamp,&changed};mutate_on_read=&actor;
     NativeSyncProofBudget budget;auto result=observe_native_sync_file(f.directory("left"),component("a"),policy(),{},budget);
-    read_armed=false;mutate_on_read={};mutation_read_number=2;
+    read_armed=false;mutate_on_read=nullptr;mutation_read_number=2;
+    if(actor.failure_operation)std::cerr<<"read-boundary actor failed: "<<actor.failure_operation<<" code="<<actor.failure_code<<'\n';
+    check(!actor.failure_operation,"native attacker rename");
     if(!result.value())std::cout<<"final membership refusal: "<<result.unavailable_detail()->error.operation<<'\n';
     check(changed&&!result.value()&&result.unavailable_detail()->error.operation=="native_sync.member_changed","late final-digest name replacement published stale source facts");
     std::cout<<"native parent/name membership revalidated after final ADS digest passed\n";
@@ -199,12 +239,20 @@ struct SecurityPrivilege{HANDLE token=nullptr;TOKEN_PRIVILEGES old{};bool enable
 void ordinary_smoke(){Fixture f;success(qualify_native_sync_root_channels(*f.directory("left")));f.data("left",u"a","base");f.data("right",u"a","base");auto a=f.proof("left"),b=f.proof("right");check(a.status.content_digest==b.status.content_digest&&a.status.required_metadata_digest==b.status.required_metadata_digest,"POSIX native canonical regression");check(!a.channel_facts.all_stream_logical_bytes&&a.channel_facts.coverage==DataChannelCoverage::Unknown,"POSIX ordinary claimed hidden all-stream total");auto bad=a.metadata;bad.channels.push_back({*NativeFeatureIdentifier::from_windows(u":fake:$DATA"),0,{},{}});check(!native_sync_metadata_digest(*a.native_source,bad).value(),"foreign stream payload accepted on POSIX");std::cout<<"POSIX native ordinary digest/source and unknown all-stream scope regression passed\n";}
 #endif
 }
-int main(){try{
+int main(){
+#ifdef _WIN32
+ if(!ckfs_test::report_runtime_self("native-sync-channels"))return 1;
+ NativeCaptureFixtureScope native_capture_scope(capture_read_after);
+#endif
+try{
 #ifdef _WIN32
     canonical_tests(false);budgets_unknown_and_cancel();final_membership_test();mutation_and_root();coordinator_tests();SecurityPrivilege privilege;
     if(privilege.enabled)canonical_tests(true);else {check(!std::getenv("CK_NATIVE_SYNC_CHANNELS_REQUIRE_FULL"),"required Full privilege unavailable");std::cout<<"Full native coverage not qualified: SeSecurityPrivilege unavailable\n";}
 #else
     ordinary_smoke();
+#endif
+#ifdef _WIN32
+    check(!read_actor_failed,"actual read-boundary mutation actor failed");
 #endif
     std::cout<<"native_sync_channels_tests passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

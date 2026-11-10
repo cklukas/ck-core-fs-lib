@@ -9,6 +9,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <filesystem>
 #include <source_location>
 #include <cstdlib>
@@ -22,6 +23,11 @@
 #include <sddl.h>
 #include <winternl.h>
 #include "windows_name.hpp"
+#include "platform/native_windows_checked_metadata_io.hpp"
+#include "windows_test_runtime_self_report.hpp"
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+#error This native Windows fixture requires the coherent compiled native test seam
+#endif
 #else
 #include <cerrno>
 #include <dlfcn.h>
@@ -107,18 +113,22 @@ std::optional<ObjectIdentity> flush_target;
 std::atomic<bool> inject_writer_flush{false};
 std::atomic<unsigned> injected_flushes{0};
 #ifdef _WIN32
-BOOL WINAPI observed_flush(HANDLE handle) {
-    using Fn=BOOL(WINAPI*)(HANDLE);
-    static const auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"FlushFileBuffers"));
-    const BOOL result=real(handle);
-    if(result&&inject_writer_flush.load()&&flush_target) {
-        FILE_ID_INFO id{};CHECK(GetFileInformationByHandleEx(handle,FileIdInfo,&id,sizeof(id)));
+thread_local HANDLE selected_flush_handle=nullptr;
+thread_local bool flush_selection_failed=false;
+void observe_writer_flush_before(HANDLE handle,const char*) noexcept {
+    selected_flush_handle=nullptr;
+    if(inject_writer_flush.load()&&flush_target) {
+        FILE_ID_INFO id{};
+        if(!GetFileInformationByHandleEx(handle,FileIdInfo,&id,sizeof(id))){flush_selection_failed=true;return;}
         NativeIdentifier object;std::memcpy(object.bytes.data(),id.FileId.Identifier,16);
-        if(flush_target->volume==NativeIdentifier::from_u64(id.VolumeSerialNumber)&&flush_target->object==object) {
-            ++injected_flushes;SetLastError(ERROR_ACCESS_DENIED);return FALSE;
-        }
+        if(flush_target->volume==NativeIdentifier::from_u64(id.VolumeSerialNumber)&&flush_target->object==object)
+            selected_flush_handle=handle;
     }
-    return result;
+}
+DWORD observe_writer_flush_after(HANDLE handle,bool succeeded,DWORD,const char*) noexcept {
+    const bool selected=std::exchange(selected_flush_handle,nullptr)==handle;
+    if(succeeded&&selected){++injected_flushes;return ERROR_ACCESS_DENIED;}
+    return ERROR_SUCCESS;
 }
 #else
 int observed_fsync(int fd) {
@@ -351,14 +361,29 @@ std::optional<std::int64_t> journal_close_oom(detail::JournalRootFaultPoint poin
 void finish_failure(const std::filesystem::path& path,bool writer_failure,bool oom=false) {
     Fixture f(path);auto job=take(NativeDirectoryReplayJob::create(f.request(true,[](std::stop_token){return Observation<bool>::available(true);})));job->advance();
     CHECK(job->progress().phase==DirectoryReplayPhase::AwaitingChildren);CHECK(take(job->children_finished()));await(*job,DirectoryReplayPhase::ClosingWriter);
-    if(writer_failure) {auto held=take(HeldChild::observe(f.parent,f.target));flush_target=*held->metadata().identity.value();injected_flushes=0;inject_writer_flush=true;}
+    if(writer_failure) {auto held=take(HeldChild::observe(f.parent,f.target));flush_target=*held->metadata().identity.value();injected_flushes=0;inject_writer_flush=true;
+#ifdef _WIN32
+        flush_selection_failed=false;
+#endif
+    }
     else {allocation_failures=0;detail::journal_root_test_fault=oom?journal_close_oom:journal_close_fault;}
+#ifdef _WIN32
+    const auto previous_flush_before=detail::native_metadata_flush_before.exchange(observe_writer_flush_before,std::memory_order_acq_rel);
+    const auto previous_flush_after=detail::native_metadata_flush_after.exchange(observe_writer_flush_after,std::memory_order_acq_rel);
+#endif
     for(unsigned i=0;i<30&&!terminal(job->progress().phase);++i)job->advance();
     inject_writer_flush=false;detail::journal_root_test_fault=nullptr;
+#ifdef _WIN32
+    detail::native_metadata_flush_before.store(previous_flush_before,std::memory_order_release);
+    detail::native_metadata_flush_after.store(previous_flush_after,std::memory_order_release);
+#endif
     CHECK(!fail_next_allocation);if(oom)CHECK(allocation_failures==1);
     CHECK(job->progress().phase==DirectoryReplayPhase::ReviewRequired&&job->progress().worker_drained&&job->progress().recovery_required);
     CHECK(job->progress().finish_failure.present&&job->progress().finish_failure.code==5);
     if(writer_failure)CHECK(injected_flushes==1);
+#ifdef _WIN32
+    CHECK(!flush_selection_failed);
+#endif
     const auto root_result=f.root->finish_io();CHECK(!root_result.value()&&root_result.unavailable_detail()->error.code==5);
     const auto count=injected_flushes.load();job->advance();job.reset();CHECK(injected_flushes==count);
 }
@@ -434,8 +459,10 @@ void operator delete[](void* pointer)noexcept{std::free(pointer);}
 void operator delete(void* pointer,std::size_t)noexcept{std::free(pointer);}
 void operator delete[](void* pointer,std::size_t)noexcept{std::free(pointer);}
 #if defined(_WIN32) && !defined(CKFS_DIRECTORY_FIXTURE_NO_RUNTIME_OVERRIDES)
-extern "C" BOOL (WINAPI* __imp_FlushFileBuffers)(HANDLE)=observed_flush;
-int wmain(int argc,wchar_t** argv){CHECK(argc==2);run(std::filesystem::path(argv[1]));return 0;}
+int wmain(int argc,wchar_t** argv){
+    if(!ckfs_test::report_runtime_self("native_directory_replay_job"))return 2;
+    CHECK(argc==2);run(std::filesystem::path(argv[1]));return 0;
+}
 #elif !defined(_WIN32)
 extern "C" int fsync(int fd){return observed_fsync(fd);}
 int main(int argc,char** argv){CHECK(argc==2);run(std::filesystem::path(argv[1]));return 0;}

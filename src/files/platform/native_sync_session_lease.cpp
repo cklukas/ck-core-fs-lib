@@ -22,7 +22,7 @@ Observation<std::shared_ptr<NativeSessionLease>> NativeSessionLease::borrow(Sync
         static std::atomic<std::uint64_t> next{1};auto id=next.load(std::memory_order_relaxed);
         while(id&&id!=UINT64_MAX&&!next.compare_exchange_weak(id,id+1,std::memory_order_relaxed)){}
         if(!id||id==UINT64_MAX)return rejected<std::shared_ptr<NativeSessionLease>>("session_lease.epoch_exhausted",ObservationState::Unsupported);
-        if(session_epoch_before_construct_test)session_epoch_before_construct_test();
+        session_epoch_before_construct_checkpoint();
         session.reader_epoch_=std::shared_ptr<SessionReaderEpoch>(new SessionReaderEpoch(&session,id));
     }
     auto epoch=session.reader_epoch_;

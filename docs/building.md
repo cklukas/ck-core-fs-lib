@@ -37,9 +37,12 @@ absolute `QUALIFICATION_OUTPUT`, explicit `QUALIFICATION_NATIVE_TEST_ROOT`, and
 The driver propagates the selected actual provider to archive and metadata
 fixtures, admits output ancestry before creating it, and checks for known unsafe
 legacy runtime-hook fixtures **before configure or native execution**. That
-preflight currently refuses 48 findings in 14 retained fixture sources. Windows
-full qualification remains blocked until their compiled-hook migration is
-complete; do not bypass the gate or run the generic full Windows test set.
+preflight now reports zero unsafe runtime-hook findings, with all fourteen
+legacy fixture entrypoints retained. This source scan permits coherent
+compilation; it does not establish native correctness. Full Windows runtime
+qualification remains open while the independent workspace-wrapper handle-count
+prerequisite, matching normal/ASan cohorts and production-OFF artifact proof are
+resolved. Do not bypass these gates or claim a full Windows pass from the scan.
 The independently qualified, scoped journal-close target is described in
 [the native contracts](native-contracts.md#windows-journal-temporary-close-errors).
 
@@ -53,6 +56,27 @@ runtime symbol is suppressed or stubbed. Platform qualification targets the
 same project on Linux, macOS, and Windows; a platform admission or runtime
 failure remains an open gate. Add path, identity, cancellation,
 and reparse/security regression tests before changing a native boundary.
+
+## Private test profiles and installed consumers
+
+`BUILD_TESTING=ON` enables the private INTERNAL and LEGACY observation hooks
+uniformly for the SDK and its fixtures. Windows also uses its private native
+close hooks. These definitions are not exported by the installed targets.
+Production packages use `BUILD_TESTING=OFF` and omit private callback storage.
+Source guards alone do not prove absence in compiled production artifacts.
+
+The controlled `tests/consumer`, `tests/installed_layers` and Windows installed
+archive projects default to the production profile. When qualifying an installed
+`BUILD_TESTING=ON` SDK, explicitly configure each with
+`-DCK_CORE_FS_CONSUMER_MATCH_TEST_PRODUCER=ON` and matching compiler, headers,
+CRT and sanitizer flags. Leave that option OFF for production-OFF prefixes.
+Do not mix the two profiles or add test macros to public SDK usage requirements.
+
+The combined observer migration passed all 67 normal macOS SDK tests and five
+installed-consumer tests, with zero skips. The fresh serial build compiled 189
+translation units in 538.12 seconds. Its source, object and installed-client
+profile checks are recorded in `docs/evidence/compiled-native-observers-mac-20261110.json`.
+This does not qualify Windows, sanitizer or production-OFF configurations.
 
 ## Independent installed-C capability gates
 

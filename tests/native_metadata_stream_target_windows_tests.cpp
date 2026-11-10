@@ -4,6 +4,12 @@
 #include "platform/native_metadata_stream_target.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
 #include "windows_name.hpp"
+#include "platform/native_close_test_faults.hpp"
+#include "platform/native_windows_checked_metadata_io.hpp"
+#include "windows_test_runtime_self_report.hpp"
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+#error This native Windows fixture requires the coherent compiled native test seam
+#endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -42,24 +48,21 @@ template<class T> T take(Observation<T> result) {
 }
 thread_local unsigned suppressed_time_calls=0;
 thread_local bool opening_independent_reader=false,reader_rights_ok=false;
-BOOL WINAPI watched_set_times(HANDLE handle,const FILETIME* creation,const FILETIME* access,const FILETIME* write) {
-    using Set=BOOL(WINAPI*)(HANDLE,const FILETIME*,const FILETIME*,const FILETIME*);
-    static const auto real=std::bit_cast<Set>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"SetFileTime"));
-    const BOOL result=real(handle,creation,access,write);const DWORD error=GetLastError();
-    if(result&&!creation&&access&&write&&access->dwLowDateTime==MAXDWORD&&access->dwHighDateTime==MAXDWORD&&
+using QueryAccess=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,ULONG);
+QueryAccess query_native_access=nullptr; // Resolved before observers/OOM, never in a callback.
+void watched_set_times(HANDLE handle,const FILETIME* creation,const FILETIME* access,
+        const FILETIME* write,bool succeeded,DWORD,const char*) noexcept {
+    if(succeeded&&!creation&&access&&write&&access->dwLowDateTime==MAXDWORD&&access->dwHighDateTime==MAXDWORD&&
        write->dwLowDateTime==MAXDWORD&&write->dwHighDateTime==MAXDWORD) {
         ++suppressed_time_calls;
         if(opening_independent_reader) {
-            using Query=NTSTATUS(NTAPI*)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,ULONG);
-            static const auto query=std::bit_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryInformationFile"));
             struct Access {ACCESS_MASK rights;} granted{};IO_STATUS_BLOCK io{};
-            const auto status=query(handle,&io,&granted,sizeof(granted),8); // FileAccessInformation.
+            const auto status=query_native_access?query_native_access(handle,&io,&granted,sizeof(granted),8):NTSTATUS(-1);
             reader_rights_ok=status==0&&io.Status==0&&io.Information==sizeof(granted)&&
                 (granted.rights&FILE_WRITE_ATTRIBUTES)&&
                 !(granted.rights&(FILE_WRITE_DATA|FILE_APPEND_DATA|FILE_WRITE_EA|DELETE|WRITE_DAC|WRITE_OWNER));
         }
     }
-    SetLastError(error);return result;
 }
 struct Handle {
     HANDLE value;
@@ -608,57 +611,63 @@ struct Watch {
     Fault fault;
     unsigned flush_calls = 0, close_calls = 0, injected_flush = 0, injected_close = 0;
     HANDLE consumed = nullptr;
+    HANDLE selected_flush = nullptr, selected_close = nullptr;
     bool retried = false, fail_allocation = false, threw = false;
     detail::PreparedJournalConsumerFailure at_allocation{};
 };
 thread_local Watch* watching = nullptr;
-bool selected(HANDLE h, const Watch& w) {
+bool selected(HANDLE h, const Watch& w) noexcept {
     FILE_ID_INFO actual{};
     return GetFileInformationByHandleEx(h, FileIdInfo, &actual, sizeof(actual)) && same_id(actual, w.id);
 }
-BOOL WINAPI watched_flush(HANDLE h) {
-    using Fn = BOOL(WINAPI*)(HANDLE);
-    static const auto real = std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "FlushFileBuffers"));
-    auto* w = watching;
-    const bool match = w && selected(h, *w);
-    if (w && h == w->consumed) w->retried = true;
-    const BOOL ok = real(h);
-    const DWORD error = GetLastError();
-    if (match) {
-        ++w->flush_calls;
-        if (ok && w->fault == Fault::FlushAndClose && !w->injected_flush) {
-            ++w->injected_flush;
-            SetLastError(ERROR_WRITE_FAULT);
-            return FALSE;
-        }
-    }
-    SetLastError(error);
-    return ok;
+void watched_flush_before(HANDLE h,const char*) noexcept {
+    auto* w=watching;if(!w)return;
+    if(h==w->consumed)w->retried=true;
+    w->selected_flush=selected(h,*w)?h:nullptr;
 }
-BOOL WINAPI watched_close(HANDLE h) {
-    using Fn = BOOL(WINAPI*)(HANDLE);
-    static const auto real = std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CloseHandle"));
-    auto* w = watching;
-    if (w && h == w->consumed) w->retried = true;
-    const bool match = w && selected(h, *w);
-    const BOOL ok = real(h);
-    const DWORD error = GetLastError();
-    if (match) {
-        ++w->close_calls;
-        if (ok && !w->injected_close) {
-            ++w->injected_close;
-            w->consumed = h;
-            w->fail_allocation = true;
-            SetLastError(ERROR_READ_FAULT);
-            return FALSE;
+DWORD watched_flush_after(HANDLE h,bool succeeded,DWORD,const char*) noexcept {
+    auto* w=watching;if(!w)return ERROR_SUCCESS;
+    if(std::exchange(w->selected_flush,nullptr)==h) {
+        ++w->flush_calls;
+        if(succeeded&&w->fault==Fault::FlushAndClose&&!w->injected_flush) {
+            ++w->injected_flush;return ERROR_WRITE_FAULT;
         }
     }
-    SetLastError(error);
-    return ok;
+    return ERROR_SUCCESS;
+}
+void watched_close_before(void* h,const char*,const char*) noexcept {
+    auto* w=watching;if(!w)return;
+    if(h==w->consumed)w->retried=true;
+    w->selected_close=selected(h,*w)?h:nullptr;
+}
+std::uint32_t watched_close_after(void* h,const char*,bool succeeded,std::uint32_t) noexcept {
+    auto* w=watching;if(!w)return ERROR_SUCCESS;
+    if(std::exchange(w->selected_close,nullptr)==h) {
+        ++w->close_calls;
+        if(succeeded&&!w->injected_close) {
+            ++w->injected_close;w->consumed=h;w->fail_allocation=true;
+            return ERROR_READ_FAULT;
+        }
+    }
+    return ERROR_SUCCESS;
 }
 struct WatchScope {
-    explicit WatchScope(Watch& w) { watching = &w; }
-    ~WatchScope() { watching = nullptr; }
+    detail::NativeMetadataFlushBefore before_flush;
+    detail::NativeMetadataFlushAfter after_flush;
+    detail::NativeCloseBefore before_close;
+    detail::NativeCloseAfter after_close;
+    explicit WatchScope(Watch& w) noexcept:
+        before_flush(detail::native_metadata_flush_before.exchange(watched_flush_before,std::memory_order_acq_rel)),
+        after_flush(detail::native_metadata_flush_after.exchange(watched_flush_after,std::memory_order_acq_rel)),
+        before_close(detail::native_close_test_before.exchange(watched_close_before,std::memory_order_acq_rel)),
+        after_close(detail::native_close_test_after.exchange(watched_close_after,std::memory_order_acq_rel)) {watching=&w;}
+    ~WatchScope() {
+        detail::native_metadata_flush_before.store(before_flush,std::memory_order_release);
+        detail::native_metadata_flush_after.store(after_flush,std::memory_order_release);
+        detail::native_close_test_before.store(before_close,std::memory_order_release);
+        detail::native_close_test_after.store(after_close,std::memory_order_release);
+        watching=nullptr;
+    }
 };
 } // namespace
 
@@ -675,13 +684,72 @@ void* operator new(std::size_t n) {
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-extern "C" {
-decltype(&CloseHandle) __imp_CloseHandle = &watched_close;
-decltype(&FlushFileBuffers) __imp_FlushFileBuffers = &watched_flush;
-decltype(&SetFileTime) __imp_SetFileTime = &watched_set_times;
-}
 
 namespace {
+// Boundary controls use each actual failing syscall's captured tuple, not a
+// second-call oracle. Misbehaving observers cannot replace it or alter errno.
+struct BoundaryWitness {
+    unsigned before=0,after=0;
+    bool native_succeeded=false;
+    DWORD native_error=ERROR_SUCCESS;
+    int native_errno=0;
+};
+BoundaryWitness boundary_witness;
+void boundary_flush_before(HANDLE,const char*) noexcept {
+    ++boundary_witness.before;errno=ERANGE;SetLastError(ERROR_ACCESS_DENIED);
+}
+DWORD boundary_flush_after(HANDLE,bool succeeded,DWORD error,const char*) noexcept {
+    ++boundary_witness.after;boundary_witness.native_succeeded=succeeded;
+    boundary_witness.native_error=error;boundary_witness.native_errno=errno;
+    errno=EDOM;SetLastError(ERROR_READ_FAULT);return ERROR_WRITE_FAULT;
+}
+void boundary_times_after(HANDLE,const FILETIME*,const FILETIME*,const FILETIME*,
+        bool succeeded,DWORD error,const char*) noexcept {
+    ++boundary_witness.after;boundary_witness.native_succeeded=succeeded;
+    boundary_witness.native_error=error;boundary_witness.native_errno=errno;
+    errno=EDOM;SetLastError(ERROR_WRITE_FAULT);
+}
+void boundary_write_before(void*,detail::NativeTestIo op,std::uint32_t,const char*) noexcept {
+    if(op!=detail::NativeTestIo::Write)return;
+    ++boundary_witness.before;errno=ERANGE;SetLastError(ERROR_ACCESS_DENIED);
+}
+void boundary_write_after(void*,detail::NativeTestIo op,bool succeeded,std::uint32_t error,const char*) noexcept {
+    if(op!=detail::NativeTestIo::Write)return;
+    ++boundary_witness.after;boundary_witness.native_succeeded=succeeded;
+    boundary_witness.native_error=error;boundary_witness.native_errno=errno;
+    errno=EDOM;SetLastError(ERROR_WRITE_FAULT);
+}
+void observer_error_precedence_tests() {
+    const auto write_before=detail::native_file_test_before.exchange(boundary_write_before,std::memory_order_acq_rel);
+    const auto write_after=detail::native_file_test_after.exchange(boundary_write_after,std::memory_order_acq_rel);
+    boundary_witness={};errno=E2BIG;SetLastError(ERROR_SUCCESS);const char byte='x';DWORD count=0;
+    const BOOL wrote=detail::write_windows_metadata_file(nullptr,&byte,1,&count,"test.actual_invalid_write");
+    const DWORD write_error=GetLastError();const int write_errno=errno;
+    detail::native_file_test_before.store(write_before,std::memory_order_release);
+    detail::native_file_test_after.store(write_after,std::memory_order_release);
+    CHECK(!wrote&&!boundary_witness.native_succeeded&&boundary_witness.before==1&&boundary_witness.after==1);
+    CHECK(boundary_witness.native_error!=ERROR_SUCCESS&&boundary_witness.native_error!=ERROR_WRITE_FAULT);
+    CHECK(write_error==boundary_witness.native_error&&write_errno==boundary_witness.native_errno);
+    const auto before=detail::native_metadata_flush_before.exchange(boundary_flush_before,std::memory_order_acq_rel);
+    const auto after=detail::native_metadata_flush_after.exchange(boundary_flush_after,std::memory_order_acq_rel);
+    boundary_witness={};errno=E2BIG;SetLastError(ERROR_SUCCESS);
+    const BOOL flushed=detail::flush_windows_metadata_file(nullptr,"test.actual_invalid_flush");
+    const DWORD flush_error=GetLastError();const int flush_errno=errno;
+    detail::native_metadata_flush_before.store(before,std::memory_order_release);
+    detail::native_metadata_flush_after.store(after,std::memory_order_release);
+    CHECK(!flushed&&!boundary_witness.native_succeeded&&boundary_witness.before==1&&boundary_witness.after==1);
+    CHECK(boundary_witness.native_error!=ERROR_SUCCESS&&boundary_witness.native_error!=ERROR_WRITE_FAULT);
+    CHECK(flush_error==boundary_witness.native_error&&flush_errno==boundary_witness.native_errno);
+    const auto times=detail::native_metadata_times_after.exchange(boundary_times_after,std::memory_order_acq_rel);
+    boundary_witness={};errno=E2BIG;SetLastError(ERROR_SUCCESS);const FILETIME ticks{};
+    const BOOL changed=detail::set_windows_metadata_times(nullptr,nullptr,&ticks,&ticks,"test.actual_invalid_times");
+    const DWORD time_error=GetLastError();const int time_errno=errno;
+    detail::native_metadata_times_after.store(times,std::memory_order_release);
+    CHECK(!changed&&!boundary_witness.native_succeeded&&boundary_witness.after==1);
+    CHECK(boundary_witness.native_error!=ERROR_SUCCESS&&boundary_witness.native_error!=ERROR_WRITE_FAULT);
+    CHECK(time_error==boundary_witness.native_error&&time_errno==boundary_witness.native_errno);
+}
+
 void first_error(const Observation<bool>& result, DWORD code, std::string_view operation) {
     CHECK(!result.value() && result.state() == ObservationState::Failed);
     const auto& error = result.unavailable_detail()->error;
@@ -849,7 +917,12 @@ void zero_ads_qualifier(const std::wstring& base,bool directory,bool full,bool p
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if(!ckfs_test::report_runtime_self("native_metadata_stream_target"))return 2;
+    query_native_access=std::bit_cast<QueryAccess>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryInformationFile"));
+    if(!query_native_access)return 2;
+    detail::native_metadata_times_after.store(watched_set_times,std::memory_order_release);
     try {
+        observer_error_precedence_tests();
         const auto base = test_base(options(argc, argv));
         for (bool directory : {false, true}) exercise(base, directory, false, false);
         refusals(base);

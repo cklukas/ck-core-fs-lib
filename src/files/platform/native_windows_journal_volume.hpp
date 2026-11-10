@@ -7,6 +7,7 @@
 #endif
 #include <windows.h>
 #include <winternl.h>
+#include "legacy_native_fixture_windows.hpp"
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -29,7 +30,7 @@ inline WindowsJournalVolumeProof prove_windows_journal_volume(HANDLE handle) noe
     auto& code=proof.code;
     auto& operation=proof.operation;
     FILE_ATTRIBUTE_TAG_INFO tag{};
-    if(!GetFileInformationByHandleEx(handle,FileAttributeTagInfo,&tag,sizeof(tag))) {
+    if(!::ck::files::detail::legacy_query(handle,FileAttributeTagInfo,&tag,sizeof(tag),"legacy.native_windows_journal_volume.GetFileInformationByHandleEx.32")) {
         state=ObservationState::Unknown;domain=ErrorDomain::Win32;code=GetLastError();
         operation="journal_scope.cursor_attributes";
     } else {

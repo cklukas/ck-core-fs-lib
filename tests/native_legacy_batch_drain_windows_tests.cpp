@@ -1,11 +1,18 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 // Real three-item native legacy batch drainage and persistent-OOM regression.
-// Executable-local failure-only seams always forward the actual native I/O.
+// Compiled POD observation and failure-only close seams; native operations stay real.
 #include "native_operation_copy_job.hpp"
 #include "native_filesystem.hpp"
 #include "metadata_capture_job.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
+#include "platform/native_close_test_faults.hpp"
+#include "platform/legacy_native_fixture_observation.hpp"
+#include "platform/legacy_native_fixture_windows.hpp"
+#include <cerrno>
+#if !defined(CK_FS_NATIVE_CLOSE_TEST_HOOKS) || !defined(CK_FS_LEGACY_NATIVE_TEST_OBSERVERS)
+#error Rebuild the complete matching SDK and all clients with both compiled test seams
+#endif
 #include <windows.h>
 
 #include <dbghelp.h>
@@ -336,14 +343,13 @@ struct BatchWatch {
  std::array<LONGLONG,batch_items> journal_sizes{};
  std::array<WatchedHandle,512> handles{};unsigned handle_count=0,journal_count=0,current_item=0,journal_item=0;
  bool setup_read=false,capture_journal=false,active=false,armed=false,source_fault=false,journal_fault=false,oom=false,fault_consumed=false,reuse_guard=false,retried=false;
- unsigned io_calls=0,writes=0,denied=0,prepared_named_readers=0;
+ unsigned io_calls=0,writes=0,denied=0,prepared_named_readers=0,pending_native_creates=0;
  detail::PreparedJournalConsumerFailure first_denied{};
+ WatchedHandle* closing_owner=nullptr;HANDLE closing_handle=nullptr;bool close_observed=false;
  std::array<HANDLE,512> guarded{};unsigned guarded_count=0;const HANDLE* reserved_events=nullptr;unsigned reserved_event_count=0;
 };
 thread_local BatchWatch* batch_watch=nullptr;
-using InfoFn=BOOL(WINAPI*)(HANDLE,FILE_INFO_BY_HANDLE_CLASS,LPVOID,DWORD);
-InfoFn actual_info(){static auto f=std::bit_cast<InfoFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"GetFileInformationByHandleEx"));return f;}
-bool handle_id(HANDLE h,FILE_ID_INFO& out)noexcept{return actual_info()(h,FileIdInfo,&out,sizeof(out))!=0;}
+bool handle_id(HANDLE h,FILE_ID_INFO& out)noexcept{return ::GetFileInformationByHandleEx(h,FileIdInfo,&out,sizeof(out))!=0;}
 FILE_ID_INFO batch_id(const ObjectIdentity& v){FILE_ID_INFO r{};std::memcpy(&r.VolumeSerialNumber,v.volume.bytes.data(),8);std::memcpy(r.FileId.Identifier,v.object.bytes.data(),16);return r;}
 void batch_io()noexcept{if(batch_watch&&batch_watch->active)++batch_watch->io_calls;}
 WatchedHandle* live_owner(HANDLE h)noexcept{if(!batch_watch)return nullptr;for(unsigned n=batch_watch->handle_count;n;--n){auto& o=batch_watch->handles[n-1];if(o.handle==h&&!o.closes)return &o;}return nullptr;}
@@ -351,38 +357,147 @@ void remember_handle(HANDLE h,const FILE_ID_INFO& id,BatchOwner kind,unsigned it
  auto* w=batch_watch;if(!w||live_owner(h))return;if(w->handle_count==w->handles.size()||item>=batch_items)std::abort();w->handles[w->handle_count++]={h,id,kind,item,0};
 }
 void observe_created_handle(HANDLE h,bool duplicated=false)noexcept{
- auto*w=batch_watch;if(!w||!h||h==INVALID_HANDLE_VALUE)return;FILE_ID_INFO identity{};FILE_ATTRIBUTE_TAG_INFO tag{};if(!handle_id(h,identity)||!actual_info()(h,FileAttributeTagInfo,&tag,sizeof(tag)))return;
+ auto*w=batch_watch;if(!w||!h||h==INVALID_HANDLE_VALUE)return;FILE_ID_INFO identity{};FILE_ATTRIBUTE_TAG_INFO tag{};if(!handle_id(h,identity)||!::GetFileInformationByHandleEx(h,FileAttributeTagInfo,&tag,sizeof(tag)))return;
  for(unsigned i=0;i<batch_items;++i)if(w->source_ids[i].VolumeSerialNumber&&same_id(identity,w->source_ids[i])){if(w->active)++w->source_opens[i];remember_handle(h,identity,w->active?BatchOwner::BaseSource:BatchOwner::SourceChannel,i);return;}
  if(w->capture_journal){if(tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY){if(duplicated&&same_id(identity,w->root_id))remember_handle(h,identity,BatchOwner::JournalParent,w->journal_item);}else{w->journal_ids[w->journal_item]=identity;remember_handle(h,identity,BatchOwner::Journal,w->journal_item);}return;}
  if(w->active&&!(tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)){
   const auto i=w->current_item;remember_handle(h,identity,BatchOwner::Staging,i);bool known_journal=false;for(const auto& j:w->journal_ids)if(j.VolumeSerialNumber&&same_id(identity,j))known_journal=true;
-  if(!known_journal&&!w->stage_owner_bytes[i]){PSID owner=nullptr;PSECURITY_DESCRIPTOR sd=nullptr;const DWORD status=GetSecurityInfo(h,SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION,&owner,nullptr,nullptr,nullptr,&sd);w->stage_owner_status[i]=status;if(status==ERROR_SUCCESS&&owner&&IsValidSid(owner)){const auto bytes=GetLengthSid(owner);if(bytes<=w->stage_owners[i].size()&&CopySid(DWORD(w->stage_owners[i].size()),w->stage_owners[i].data(),owner)){w->stage_owner_bytes[i]=bytes;w->stage_ids[i]=identity;}}if(sd)LocalFree(sd);}
+  if(!known_journal&&!w->stage_owner_bytes[i]){
+   // Fixed native output storage, no GetSecurityInfo allocation in a noexcept
+   // observer and no Debug allocator/proxy exception. This is a genuine query
+   // of the newly opened staging object, never a caller-SID substitute.
+   alignas(SECURITY_DESCRIPTOR) std::array<std::byte,2048> descriptor{};DWORD needed=0;
+   if(!GetKernelObjectSecurity(h,OWNER_SECURITY_INFORMATION,descriptor.data(),DWORD(descriptor.size()),&needed))
+    w->stage_owner_status[i]=GetLastError();
+   else {PSID owner=nullptr;BOOL defaulted=FALSE;
+    if(!GetSecurityDescriptorOwner(descriptor.data(),&owner,&defaulted)||!owner||!IsValidSid(owner))
+     w->stage_owner_status[i]=ERROR_INVALID_SECURITY_DESCR;
+    else {const auto count=GetLengthSid(owner);
+     if(count>w->stage_owners[i].size()||!CopySid(DWORD(w->stage_owners[i].size()),w->stage_owners[i].data(),owner))
+      w->stage_owner_status[i]=ERROR_INSUFFICIENT_BUFFER;
+     else {w->stage_owner_status[i]=ERROR_SUCCESS;w->stage_owner_bytes[i]=count;w->stage_ids[i]=identity;}
+    }
+   }
+  }
  }
 }
 void observe_oom_allocation()noexcept{if(auto*w=batch_watch){if(!w->denied++)detail::read_prepared_journal_consumer_failure(*w->root,w->first_denied);}}
 void report_native_fatal()noexcept{if(auto*w=batch_watch){detail::PreparedJournalConsumerFailure e;const bool found=detail::read_prepared_journal_consumer_failure(*w->root,e);std::fprintf(stderr,"batch fatal handles=%u journals=%u io=%u writes=%u denied=%u RootError=%d domain=%u code=%lld operation=%s\n",w->handle_count,w->journal_count,w->io_calls,w->writes,w->denied,int(found),unsigned(e.domain),static_cast<long long>(e.code),e.operation.data());for(unsigned i=0;i<w->handle_count;++i){const auto&o=w->handles[i];std::fprintf(stderr,"owner%u kind=%u item=%u closes=%u\n",i,unsigned(o.kind),o.item,o.closes);}}}
-BOOL WINAPI capture_read(HANDLE h,LPVOID data,DWORD size,LPDWORD count,LPOVERLAPPED ov){
- using Fn=BOOL(WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED);static auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"ReadFile"));batch_io();auto saved=GetLastError();auto*w=batch_watch;FILE_ID_INFO id{};
- if(w&&size&&handle_id(h,id))for(unsigned i=0;i<batch_items;++i)if(same_id(id,w->source_ids[i])){if(w->setup_read){w->legacy_handles[i]=h;remember_handle(h,id,BatchOwner::LegacySource,i);}else if(w->active){++w->source_reads[i];remember_handle(h,id,BatchOwner::BaseSource,i);}else {remember_handle(h,id,BatchOwner::SourceChannel,i);if(auto* owner=live_owner(h);owner&&h!=w->legacy_handles[i]&&owner->kind==BatchOwner::SourceChannel)owner->named_channel_read=true;}}
- SetLastError(saved);return real(h,data,size,count,ov);
+void observed_native(const detail::LegacyNativeEvent& event)noexcept {
+ using Op=detail::LegacyNativeOperation;using Phase=detail::LegacyNativePhase;
+ auto*w=batch_watch;if(!w)return;
+ // This baseline has no owning pending-NtCreate drain. Observe its actual
+ // request but do not query pending output or certify ownership completion.
+ if(event.operation==Op::NativeCreate&&event.phase==Phase::After&&event.pending)++w->pending_native_creates;
+ if(event.phase==Phase::OpenCompleted)std::abort(); // no fabricated/double completion in this cohort
+ const auto handle=reinterpret_cast<HANDLE>(event.handle);
+ if(event.phase==Phase::Before) {
+  batch_io();
+  if(event.operation==Op::Write&&w->active)++w->writes;
+  if(event.operation==Op::Read&&event.count) {
+   FILE_ID_INFO identity{};
+   if(handle_id(handle,identity))for(unsigned i=0;i<batch_items;++i)if(same_id(identity,w->source_ids[i])) {
+    if(w->setup_read){w->legacy_handles[i]=handle;remember_handle(handle,identity,BatchOwner::LegacySource,i);}
+    else if(w->active){++w->source_reads[i];remember_handle(handle,identity,BatchOwner::BaseSource,i);}
+    else {remember_handle(handle,identity,BatchOwner::SourceChannel,i);
+     if(auto*owner=live_owner(handle);owner&&handle!=w->legacy_handles[i]&&owner->kind==BatchOwner::SourceChannel)owner->named_channel_read=true;}
+   }
+  }
+  if(event.operation==Op::Close) {
+   w->closing_handle=handle;w->closing_owner=live_owner(handle);w->close_observed=false;
+   if(!w->closing_owner)for(unsigned i=0;i<w->handle_count;++i)if(w->handles[i].handle==handle&&w->handles[i].closes){
+    DWORD flags=0;if(!GetHandleInformation(handle,&flags)&&GetLastError()==ERROR_INVALID_HANDLE)w->retried=true;break;
+   }
+   if(w->reuse_guard)for(unsigned i=0;i<w->reserved_event_count;++i)if(w->reserved_events[i]==handle)w->retried=true;
+  }
+ } else if(event.operation==Op::Close&&event.phase==Phase::After) {
+  if(w->closing_handle!=handle||w->close_observed)std::abort();
+  w->close_observed=true;if(w->closing_owner)++w->closing_owner->closes;
+ } else if(event.succeeded&&!event.pending) {
+  // One logical native open is counted once. Pending NtCreateFile does not
+  // expose an output handle until the provider emits exact OpenCompleted.
+  if(event.operation==Op::Duplicate||event.operation==Op::Create||event.operation==Op::OpenById||event.operation==Op::NativeCreate)
+   observe_created_handle(handle,event.operation==Op::Duplicate);
+ }
 }
-BOOL WINAPI capture_write(HANDLE h,LPCVOID data,DWORD size,LPDWORD count,LPOVERLAPPED ov){using Fn=BOOL(WINAPI*)(HANDLE,LPCVOID,DWORD,LPDWORD,LPOVERLAPPED);static auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"WriteFile"));batch_io();if(batch_watch&&batch_watch->active)++batch_watch->writes;return real(h,data,size,count,ov);}
-BOOL WINAPI capture_close(HANDLE h){
- using Fn=BOOL(WINAPI*)(HANDLE);static auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"CloseHandle"));batch_io();auto*w=batch_watch;auto saved=GetLastError();auto*o=live_owner(h);if(w&&!o)for(unsigned i=0;i<w->handle_count;++i)if(w->handles[i].handle==h&&w->handles[i].closes){DWORD flags=0;if(!GetHandleInformation(h,&flags)&&GetLastError()==ERROR_INVALID_HANDLE)w->retried=true;break;}
- if(w&&w->reuse_guard)for(unsigned i=0;i<w->reserved_event_count;++i)if(w->reserved_events[i]==h)w->retried=true;
- SetLastError(saved);const BOOL ok=real(h);const auto error=GetLastError();if(o){++o->closes;const bool selected=w->armed&&!w->fault_consumed&&o->item==0&&((w->source_fault&&o->kind==BatchOwner::LegacySource)||(w->journal_fault&&o->kind==BatchOwner::Journal));if(ok&&selected){w->fault_consumed=true;persistent_oom=w->oom;SetLastError(ERROR_READ_FAULT);return FALSE;}}
- SetLastError(error);return ok;
+std::uint32_t consumed_close_failure(void* raw,const char*,bool native_ok,std::uint32_t)noexcept {
+ auto*w=batch_watch;if(!w)return 0;
+ const auto h=static_cast<HANDLE>(raw);auto*owner=w->closing_owner;
+ const bool selected=w->close_observed&&w->closing_handle==h&&owner&&native_ok&&w->armed&&!w->fault_consumed&&owner->item==0&&
+  ((w->source_fault&&owner->kind==BatchOwner::LegacySource)||(w->journal_fault&&owner->kind==BatchOwner::Journal));
+ w->closing_owner=nullptr;w->closing_handle=nullptr;w->close_observed=false;
+ if(!selected)return 0;
+ w->fault_consumed=true;persistent_oom=w->oom;return ERROR_READ_FAULT;
 }
-BOOL WINAPI capture_duplicate(HANDLE a,HANDLE b,HANDLE c,LPHANDLE out,DWORD access,BOOL inherit,DWORD flags){using Fn=BOOL(WINAPI*)(HANDLE,HANDLE,HANDLE,LPHANDLE,DWORD,BOOL,DWORD);static auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"DuplicateHandle"));batch_io();const auto ok=real(a,b,c,out,access,inherit,flags);const auto error=GetLastError();if(ok&&out)observe_created_handle(*out,true);SetLastError(error);return ok;}
-using NativeCreateFileFn=LONG(NTAPI*)(PHANDLE,ACCESS_MASK,PVOID,PVOID,PLARGE_INTEGER,ULONG,ULONG,ULONG,ULONG,PVOID,ULONG);
-LONG NTAPI capture_nt_create(PHANDLE out,ACCESS_MASK access,PVOID attributes,PVOID io,PLARGE_INTEGER allocation,ULONG file_attributes,ULONG sharing,ULONG disposition,ULONG options,PVOID ea,ULONG ea_size){
- using Fn=NativeCreateFileFn;static auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtCreateFile"));batch_io();const auto status=real(out,access,attributes,io,allocation,file_attributes,sharing,disposition,options,ea,ea_size);const auto error=GetLastError();if(status>=0&&out)observe_created_handle(*out);SetLastError(error);return status;
+struct CompiledBatchSeams final {
+ detail::LegacyNativeObserver old_observer;
+ detail::NativeCloseAfter old_after;
+ CompiledBatchSeams():old_observer(detail::legacy_native_test_observer.exchange(observed_native)),
+  old_after(detail::native_close_test_after.exchange(consumed_close_failure)){}
+ ~CompiledBatchSeams(){detail::legacy_native_test_observer.store(old_observer);detail::native_close_test_after.store(old_after);}
+};
+void require_compiled_provider_coverage(){
+ // Each provider defines its coverage function only after ALL corresponding
+ // native call sites are migrated. Missing owner integration is a link error;
+ // a partial mask is an assertion failure, never silent missing observations.
+ constexpr auto all=detail::legacy_all_operations;
+ CHECK((detail::legacy_native_metadata_coverage()&all)==all);
+ constexpr auto journal=detail::legacy_operation_bit(detail::LegacyNativeOperation::Read)|detail::legacy_operation_bit(detail::LegacyNativeOperation::Write)|
+  detail::legacy_operation_bit(detail::LegacyNativeOperation::Close)|detail::legacy_operation_bit(detail::LegacyNativeOperation::Duplicate)|
+  detail::legacy_operation_bit(detail::LegacyNativeOperation::NativeCreate)|detail::legacy_operation_bit(detail::LegacyNativeOperation::Create)|
+  detail::legacy_operation_bit(detail::LegacyNativeOperation::OpenById)|detail::legacy_operation_bit(detail::LegacyNativeOperation::Query)|detail::legacy_operation_bit(detail::LegacyNativeOperation::Flush);
+ CHECK((detail::legacy_native_journal_coverage()&journal)==journal);
 }
-HANDLE WINAPI capture_create(LPCWSTR path,DWORD access,DWORD sharing,LPSECURITY_ATTRIBUTES security,DWORD disposition,DWORD flags,HANDLE template_file){using Fn=decltype(&CreateFileW);static auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"CreateFileW"));batch_io();const auto h=real(path,access,sharing,security,disposition,flags,template_file);const auto error=GetLastError();observe_created_handle(h);SetLastError(error);return h;}
-HANDLE WINAPI capture_open_id(HANDLE volume,LPFILE_ID_DESCRIPTOR descriptor,DWORD access,DWORD sharing,LPSECURITY_ATTRIBUTES security,DWORD flags){using Fn=decltype(&OpenFileById);static auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"OpenFileById"));batch_io();const auto h=real(volume,descriptor,access,sharing,security,flags);const auto error=GetLastError();observe_created_handle(h);SetLastError(error);return h;}
-BOOL WINAPI capture_info(HANDLE h,FILE_INFO_BY_HANDLE_CLASS kind,LPVOID data,DWORD size){batch_io();return actual_info()(h,kind,data,size);}
-BOOL WINAPI capture_flush(HANDLE h){using Fn=decltype(&FlushFileBuffers);static auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"FlushFileBuffers"));batch_io();return real(h);}
-BOOL WINAPI capture_set_info(HANDLE h,FILE_INFO_BY_HANDLE_CLASS kind,LPVOID data,DWORD size){using Fn=decltype(&SetFileInformationByHandle);static auto real=std::bit_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"SetFileInformationByHandle"));batch_io();return real(h,kind,data,size);}
+// Real same-call native controls: dirty every callback's two error channels.
+// No fake native result, allocation exemption, OS hook or failure-to-success.
+struct DirtyCallbackState {
+ unsigned before=0,after=0,close_before=0,close_after=0;
+ int incoming_errno=0,native_errno=0;
+ DWORD incoming_last=0,native_last=0;
+ detail::LegacyNativeEvent actual{};
+};
+thread_local DirtyCallbackState* dirty_state=nullptr;
+void dirty_observer(const detail::LegacyNativeEvent& event)noexcept {
+ if(!dirty_state)std::abort();auto& state=*dirty_state;
+ if(event.phase==detail::LegacyNativePhase::Before){++state.before;state.incoming_errno=errno;state.incoming_last=GetLastError();}
+ else {++state.after;state.native_errno=errno;state.native_last=GetLastError();state.actual=event;}
+ errno=ERANGE;SetLastError(ERROR_WRITE_FAULT);
+}
+void dirty_before_close(void*,const char*,const char*)noexcept {
+ if(!dirty_state)std::abort();++dirty_state->close_before;errno=E2BIG;SetLastError(ERROR_DISK_FULL);
+}
+std::uint32_t dirty_after_close(void*,const char*,bool,std::uint32_t)noexcept {
+ if(!dirty_state)std::abort();++dirty_state->close_after;errno=ENOSPC;SetLastError(ERROR_NOT_READY);
+ return ERROR_READ_FAULT; // only after the genuine OS close; real error wins
+}
+void actual_dirty_callback_controls(){
+ DirtyCallbackState state;dirty_state=&state;
+ const auto observer=detail::legacy_native_test_observer.exchange(dirty_observer);
+ const auto before=detail::native_close_test_before.exchange(dirty_before_close);
+ const auto after=detail::native_close_test_after.exchange(dirty_after_close);
+ struct Restore {detail::LegacyNativeObserver observer;detail::NativeCloseBefore before;detail::NativeCloseAfter after;
+  ~Restore(){detail::legacy_native_test_observer.store(observer);detail::native_close_test_before.store(before);detail::native_close_test_after.store(after);dirty_state=nullptr;}}restore{observer,before,after};
+ FILE_ID_INFO direct_output{},observed_output{};
+ errno=EDOM;SetLastError(ERROR_CRC);
+ const BOOL native=::GetFileInformationByHandleEx(INVALID_HANDLE_VALUE,FileIdInfo,&direct_output,sizeof(direct_output));
+ const DWORD native_error=GetLastError();const int native_errno=errno;
+ state={};errno=EDOM;SetLastError(ERROR_CRC);
+ const BOOL observed=detail::legacy_query(INVALID_HANDLE_VALUE,FileIdInfo,&observed_output,sizeof(observed_output),"legacy.control.query");
+ const DWORD observed_error=GetLastError();const int observed_errno=errno;
+ CHECK(!native&&!observed&&observed==native&&observed_error==native_error&&observed_errno==native_errno);
+ CHECK(observed==state.actual.native_result&&observed_error==state.actual.native_error&&observed_errno==state.native_errno);
+ CHECK(state.before==1&&state.after==1&&state.incoming_errno==EDOM&&state.incoming_last==ERROR_CRC);
+ CHECK(!state.actual.succeeded&&!state.actual.pending&&state.actual.native_error==native_error&&state.native_errno==native_errno);
+ // A fresh owned event is consumed by one real CloseHandle. The captured
+ // native TRUE is the consumption proof; never retry or guess slot reuse.
+ HANDLE event=CreateEventW(nullptr,TRUE,FALSE,nullptr);CHECK(event);
+ state={};errno=EDOM;SetLastError(ERROR_CRC);
+ const BOOL closed=detail::legacy_close_handle(event,"legacy.control.consumed_close");
+ const DWORD close_error=GetLastError();const int close_errno=errno;
+ CHECK(!closed&&close_error==ERROR_READ_FAULT&&close_errno==state.native_errno);
+ CHECK(state.before==1&&state.after==1&&state.close_before==1&&state.close_after==1);
+ CHECK(state.incoming_errno==EDOM&&state.incoming_last==ERROR_CRC&&state.actual.succeeded&&!state.actual.pending&&state.actual.native_error==ERROR_SUCCESS);
+}
 struct BatchFixture {
  OwnedTree tree;std::wstring path;NativeFileSystem fs;std::shared_ptr<const DirectoryCursor> parent,source,target;PreparedJournalRoot::Pointer root;
  std::array<NativeName,batch_items> inputs{name(u"src0"),name(u"src1"),name(u"src2")},outputs{name(u"dst0"),name(u"dst1"),name(u"dst2")};
@@ -400,7 +515,7 @@ OperationBatchJob::Pointer create_batch(BatchFixture& f,BatchWatch& w){
  for(unsigned i=0;i<batch_items;++i){auto source=take(HeldChild::observe_with_access(f.source,f.inputs[i],EntryAccess::ContentRead|EntryAccess::MetadataAndAttributes|EntryAccess::MetadataAndSecurity));w.source_ids[i]=batch_id(*source->metadata().identity.value());w.setup_read=true;const auto read=take(source->read_content({1}));w.setup_read=false;CHECK(read.bytes.size()==1&&w.legacy_handles[i]);aliases.push_back(source);request.sources.push_back(std::move(source));request.destination_names.push_back(f.outputs[i]);}
  request.destination=f.target;request.destination_address=take(NativeAbsolutePath::from_host(f.path+L"\\targets"));request.journal_root=take(NativeAbsolutePath::from_host(f.path+L"\\journal"));request.journal_id.bytes[0]=std::byte{91};request.policy.copy_limits.chunk_bytes=257;MetadataReplayPolicy policy;policy.scope=RegularMetadataScope::OrdinaryCallerVisibleV1;policy.ownership=MetadataOwnership::CurrentCaller;request.policy.metadata_scope=policy.scope;request.policy.metadata_policy=policy;request.policy.allow_unhandled_metadata_loss=false;
  request.open_journal=[&](const NativeAbsolutePath&,const NativeName& leaf,bool fresh){CHECK(fresh&&w.journal_count<batch_items&&leaf.windows_units());const auto i=w.journal_count++;w.journal_item=i;w.journal_names[i]=std::wstring(leaf.windows_units()->begin(),leaf.windows_units()->end());w.capture_journal=true;auto file=f.root->open_journal(leaf,fresh);w.capture_journal=false;return file;};
- auto job=take(create_native_operation_copy_batch(std::move(request)));request.sources.clear();aliases.clear();CHECK(w.journal_count==batch_items);
+ auto job=take(create_native_operation_copy_batch(std::move(request)));request.sources.clear();aliases.clear();CHECK(w.journal_count==batch_items);CHECK(w.pending_native_creates==0);
  for(unsigned i=0;i<batch_items;++i){unsigned journals=0,parents=0;for(unsigned j=0;j<w.handle_count;++j){auto& owner=w.handles[j];if(owner.item!=i)continue;if(owner.kind==BatchOwner::Journal){CHECK(GetFileSizeEx(owner.handle,reinterpret_cast<PLARGE_INTEGER>(&w.journal_sizes[i]))&&w.journal_sizes[i]>0);++journals;}if(owner.kind==BatchOwner::JournalParent&&!owner.closes)++parents;}unsigned named=0;for(unsigned j=0;j<w.handle_count;++j){const auto&o=w.handles[j];if(o.item==i&&o.named_channel_read&&!o.closes)++named;}CHECK(journals==1&&parents==1&&live_owner(w.legacy_handles[i])&&named>=1);w.prepared_named_readers+=named;}
  w.source_reads={};w.source_opens={};w.io_calls=w.writes=0;return job;
 }
@@ -408,7 +523,7 @@ bool batch_terminal(OperationBatchState s){return s!=OperationBatchState::Ready&
 void run_batch(const std::wstring& base,std::wstring_view mode){
  const bool complete=mode==L"complete";const bool started=mode==L"started-cancel"||mode==L"started-cancel-source-error-oom";const bool uncertain=mode==L"uncertain-first-source-error";const bool prior=mode.find(L"prior-root")!=mode.npos;const bool source_error=mode.find(L"source-error")!=mode.npos;const bool journal_error=mode.find(L"journal-error")!=mode.npos;const bool oom=mode.find(L"oom")!=mode.npos;
  BatchFixture f(base);BatchWatch w;w.root=f.root.get();w.root_id=batch_id(f.root->identity());batch_watch=&w;struct Reset{~Reset(){persistent_oom=false;batch_watch=nullptr;}}reset;auto job=create_batch(f,w);w.source_fault=source_error;w.journal_fault=journal_error;w.oom=oom;w.armed=true;if(prior)CHECK(detail::record_prepared_journal_consumer_failure(*f.root,ObservationState::Failed,ErrorDomain::Win32,ERROR_CRC,"test.batch.prior_root"));const bool pending=!complete&&!started&&!uncertain;std::stop_source stop;if(pending)stop.request_stop();if(prior&&oom)persistent_oom=true;unsigned advances=0;
- for(;advances<20000&&!batch_terminal(job->state());++advances){if(started&&w.source_reads[0])stop.request_stop();CHECK(detail::current_metadata_capture_cleanup()==nullptr);w.current_item=unsigned(job->current_item());w.active=true;job->advance(stop.get_token());w.active=false;}CHECK(advances<20000);const auto terminal=job->state();const auto calls=w.io_calls,denied=w.denied;for(unsigned i=0;i<3;++i){w.active=true;CHECK(job->advance(stop.get_token())==terminal);w.active=false;}CHECK(w.io_calls==calls&&w.denied==denied);const bool was_oom=persistent_oom.exchange(false);CHECK(!oom||was_oom);const bool fault=source_error||journal_error||prior;
+ for(;advances<20000&&!batch_terminal(job->state());++advances){if(started&&w.source_reads[0])stop.request_stop();CHECK(detail::current_metadata_capture_cleanup()==nullptr);w.current_item=unsigned(job->current_item());w.active=true;job->advance(stop.get_token());w.active=false;}CHECK(advances<20000);const auto terminal=job->state();const auto calls=w.io_calls,denied=w.denied;for(unsigned i=0;i<3;++i){w.active=true;CHECK(job->advance(stop.get_token())==terminal);w.active=false;}CHECK(w.io_calls==calls&&w.denied==denied);const bool was_oom=persistent_oom.exchange(false);CHECK(!oom||was_oom);CHECK(w.pending_native_creates==0);const bool fault=source_error||journal_error||prior;
  detail::PreparedJournalConsumerFailure root_error;const bool has_error=detail::read_prepared_journal_consumer_failure(*f.root,root_error);std::printf("OBSERVE batch terminal=%u handles=%u prepared=%u reads=%u/%u/%u writes=%u denied=%u RootError=%d domain=%u code=%lld pending=%d operation=%s refs=%ld\n",unsigned(terminal),w.handle_count,w.journal_count,w.source_reads[0],w.source_reads[1],w.source_reads[2],w.writes,w.denied,int(has_error),unsigned(root_error.domain),static_cast<long long>(root_error.code),int(root_error.pending),root_error.operation.data(),long(f.root.use_count()));if(w.denied)std::printf("FIRST_DENIED domain=%u code=%lld pending=%d operation=%s\n",unsigned(w.first_denied.domain),static_cast<long long>(w.first_denied.code),int(w.first_denied.pending),w.first_denied.operation.data());std::fflush(stdout);
  std::array<unsigned,6> closes{};for(unsigned i=0;i<w.handle_count;++i){auto&o=w.handles[i];CHECK(o.closes==1);++closes[unsigned(o.kind)];}CHECK(closes[unsigned(BatchOwner::LegacySource)]==3&&closes[unsigned(BatchOwner::SourceChannel)]>=3&&closes[unsigned(BatchOwner::Journal)]==3&&closes[unsigned(BatchOwner::JournalParent)]>=3&&!w.retried);
  for(unsigned i=0;i<batch_items;++i)std::printf("ITEM%u outcome=%u failurePresent=%d\n",i,unsigned(job->result().items[i].outcome),int(bool(job->result().items[i].failure)));std::fflush(stdout);
@@ -420,17 +535,4 @@ void run_batch(const std::wstring& base,std::wstring_view mode){
  std::array<HANDLE,8192> events{};unsigned event_count=0;for(;event_count<events.size()&&w.guarded_count<batch_items;){auto event=CreateEventW(nullptr,TRUE,FALSE,nullptr);CHECK(event);events[event_count++]=event;for(unsigned i=0;i<batch_items;++i)if(w.legacy_handles[i]==event){w.guarded[w.guarded_count++]=event;break;}}CHECK(w.guarded_count==batch_items);w.reserved_events=events.data();w.reserved_event_count=event_count;w.reuse_guard=true;w.armed=true;for(unsigned i=0;i<3;++i)CHECK(job->advance()==terminal);job.reset();CHECK(!w.retried);for(unsigned i=0;i<w.guarded_count;++i)CHECK(SetEvent(w.guarded[i])&&WaitForSingleObject(w.guarded[i],0)==WAIT_OBJECT_0&&ResetEvent(w.guarded[i]));for(unsigned i=0;i<event_count;++i){DWORD flags=0;CHECK(GetHandleInformation(events[i],&flags));}w.reuse_guard=false;w.armed=false;for(unsigned i=0;i<event_count;++i)CHECK(CloseHandle(events[i]));CHECK(f.root.use_count()==1);auto finished=f.root->finish_io();if(fault)CHECK(!finished.value()&&finished.unavailable_detail()->error.code==expected);else CHECK(take(std::move(finished)));std::printf("PASS actual legacy NativeCopyBatch prepared3 mode=%.*ls legacyClose=%u channelClose=%u baseClose=%u journalClose=%u parentClose=%u stageClose=%u preparedNamedReaders=%u BEFOREterminal=1 noCallerAlias=1 repeatNoIO/noAlloc=1 noRetry=1 OrdinaryCurrentCaller=1 sourceADSallModes=1 targetADS/mtime/creationOwnerWhenPublished=1\n",int(mode.size()),mode.data(),closes[0],closes[1],closes[2],closes[3],closes[4],closes[5],w.prepared_named_readers);
 }
 }
-extern "C" {
-decltype(&ReadFile) __imp_ReadFile=&capture_read;
-decltype(&WriteFile) __imp_WriteFile=&capture_write;
-decltype(&CloseHandle) __imp_CloseHandle=&capture_close;
-decltype(&DuplicateHandle) __imp_DuplicateHandle=&capture_duplicate;
-LONG NTAPI NtCreateFile(PHANDLE out,ACCESS_MASK access,PVOID attributes,PVOID io,PLARGE_INTEGER allocation,ULONG file_attributes,ULONG sharing,ULONG disposition,ULONG options,PVOID ea,ULONG ea_size){return capture_nt_create(out,access,attributes,io,allocation,file_attributes,sharing,disposition,options,ea,ea_size);}
-NativeCreateFileFn __imp_NtCreateFile=&capture_nt_create;
-decltype(&CreateFileW) __imp_CreateFileW=&capture_create;
-decltype(&OpenFileById) __imp_OpenFileById=&capture_open_id;
-decltype(&GetFileInformationByHandleEx) __imp_GetFileInformationByHandleEx=&capture_info;
-decltype(&FlushFileBuffers) __imp_FlushFileBuffers=&capture_flush;
-decltype(&SetFileInformationByHandle) __imp_SetFileInformationByHandle=&capture_set_info;
-}
-int wmain(int argc,wchar_t** argv){std::set_terminate(fatal);try{CHECK(argc>=4&&std::wstring_view(argv[1])==L"--mode");const std::wstring mode=argv[2];argc-=2;argv+=2;const std::array<std::wstring_view,10> modes{L"cancel-before-start",L"cancel-source-error",L"cancel-source-error-oom",L"cancel-journal-error-oom",L"cancel-prior-root-oom",L"cancel-prior-root-source-error-oom",L"started-cancel",L"started-cancel-source-error-oom",L"uncertain-first-source-error",L"complete"};CHECK(std::find(modes.begin(),modes.end(),mode)!=modes.end());run_batch(test_base(options(argc,argv)),mode);CHECK(!OwnedTree::cleanup_failed);return 0;}catch(const std::exception&e){persistent_oom=false;std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}
+int wmain(int argc,wchar_t** argv){std::set_terminate(fatal);try{require_compiled_provider_coverage();CHECK(argc>=4&&std::wstring_view(argv[1])==L"--mode");const std::wstring mode=argv[2];argc-=2;argv+=2;const std::array<std::wstring_view,10> modes{L"cancel-before-start",L"cancel-source-error",L"cancel-source-error-oom",L"cancel-journal-error-oom",L"cancel-prior-root-oom",L"cancel-prior-root-source-error-oom",L"started-cancel",L"started-cancel-source-error-oom",L"uncertain-first-source-error",L"complete"};CHECK(std::find(modes.begin(),modes.end(),mode)!=modes.end());const auto base=test_base(options(argc,argv));actual_dirty_callback_controls();CompiledBatchSeams compiled_seams;run_batch(base,mode);CHECK(!OwnedTree::cleanup_failed);return 0;}catch(const std::exception&e){persistent_oom=false;std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}

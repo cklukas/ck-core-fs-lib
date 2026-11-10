@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "utc": "2026-11-10T20:25:52.636132+00:00",
+  "base_revision": "29b0e5c88c5b0592c595c728d963c8b50389415c",
+  "change": "Compiled native observations replace the remaining unsafe Windows fixture imports; BUILD_TESTING gates private fault state and controlled installed consumers match the producer profile.",
+  "source_frozen_manifest_sha256": "20d48b1bd669861910844dea471c0ac832d46b0be944848411d568474d37e992",
+  "source_archive_sha256": "3675926a38959b12d7a4eeaa59201d39d30e0f1d93f03fc8fd73b18d46d12911",
+  "source_scan": {
+    "unsafe_import_findings": 0,
+    "retained_legacy_entrypoints": 14,
+    "native_qualification": false
+  },
+  "macOS_normal": {
+    "utc": "2026-11-10T20:22:21.733684+00:00",
+    "source_files_verified": 531,
+    "manifest_sha256": "20d48b1bd669861910844dea471c0ac832d46b0be944848411d568474d37e992",
+    "producer_compile_rows": 189,
+    "producer_outputs_verified": 246,
+    "test_reports": {
+      "test.xml": {
+        "passed": 67,
+        "sha256": "0bdc421f53f30c948619fbead003e1366116285aa8c3efdcedd50aa9525644ee"
+      },
+      "consumer-test.xml": {
+        "passed": 1,
+        "sha256": "3a0616bf6f912441560ecfbd7acf374b7d96cc5846e8b592c9e3eec84f8791ba"
+      },
+      "layers-test.xml": {
+        "passed": 4,
+        "sha256": "43065dc7c1f72023090832d92b8b51453ea385328383a9e60a2d5ab22a976d0e"
+      }
+    },
+    "installed_clients": "Private ON profiles present only in controlled compilecommands; nohookexport; C11 remainsstdc11",
+    "build_seconds": 538.1202572920593,
+    "scope": "FullnormalmacOSSDK67+5 actualpassed; not Windows, sanitizer,OFFproduction or frontend/nativewindow qualification"
+  },
+  "durable_evidence": {
+    "packet": "mac-combined-normal-20261110-hubble-b4i1t7ez",
+    "files_verified": 68,
+    "manifest_sha256": "c8585a19733c8692d2fd77aed6d65ec6448ea57a41557a9d8c7400fec8aaff0b",
+    "receipt_sha256": "aeab2b1341c16ac7b1564b510581ad7128e1f03e7ec10e82e38b1b385f216483"
+  },
+  "remaining": [
+    "Full matching Windows normal/ASan native execution on NTFS/ReFS, installed clients and production-OFF artifact proof",
+    "Resolve unchanged wrapper-control 122-to-130 handle-count prerequisite; no count weakening or warmup",
+    "Qualify combined source on Linux/sanitizer configurations",
+    "Frontend adoption, native-window acceptance and remaining backend capabilities are separate open gates"
+  ]
+}

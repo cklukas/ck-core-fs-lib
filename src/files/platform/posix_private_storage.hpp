@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include "legacy_native_fixture_posix.hpp"
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/acl.h>
@@ -67,7 +68,7 @@ inline Observation<bool> qualify_posix_private_storage(int fd,PosixPrivateStorag
         if(found!=-1 || errno!=EINVAL) return failure(errno?errno:EIO,"posix_private_storage.acl_entry");
     }
 #else
-    if(fstat(fd,&info)) return failure(errno,"posix_private_storage.stat");
+    if(::ck::files::detail::legacy_fstat(fd,&info,"legacy.posix_private_storage.fstat.70")) return failure(errno,"posix_private_storage.stat");
     // POSIX access ACL masks are enforced by the exact 0700/0600 mode on the
     // existing Linux boundary. Darwin extended ACLs require the checks above.
 #endif

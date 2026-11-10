@@ -269,6 +269,15 @@ if(WIN32)
 endif()
 
 include(CTest)
+if(BUILD_TESTING)
+  # Internal failure seams must have one definition across every existing SDK
+  # target and every later fixture TU, on POSIX as well as Windows. Directory
+  # scope includes targets created above. This is deliberately NOT a PUBLIC or
+  # installed usage requirement: production (BUILD_TESTING=OFF) has no storage
+  # or loads, and private installed test consumers require a matching cohort.
+  add_compile_definitions(CK_FS_INTERNAL_TEST_HOOKS=1)
+  add_compile_definitions(CK_FS_LEGACY_NATIVE_TEST_OBSERVERS)
+endif()
 if(CK_CORE_FS_TEST_JOURNAL_TEMPORARY_CLEANUP)
   if(NOT BUILD_TESTING OR NOT WIN32)
     message(FATAL_ERROR "Journal temporary cleanup regression requires BUILD_TESTING on Windows")
@@ -298,6 +307,11 @@ if(BUILD_TESTING)
   endif()
   enable_testing()
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME internal_test_hook_source_guard COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_internal_test_hooks.py
+    --source ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(internal_test_hook_source_guard PROPERTIES
+    TIMEOUT 30 LABELS "source;internal-test-profile")
   # ELF export surface is checked independently of the interposition probe.
   if(CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF")
     add_test(NAME elf_export_surface COMMAND ${Python3_EXECUTABLE}
@@ -693,7 +707,10 @@ if(BUILD_TESTING)
     add_test(NAME native_copy_source_close_windows COMMAND ck_fs_native_copy_source_close_windows_tests
       --expect-filesystem "${CK_CORE_FS_METADATA_TARGET_NATIVE_FS}"
       --fixture-root "${CK_CORE_FS_NATIVE_TEST_ROOT}")
-    add_test(NAME target_read_seed COMMAND ck_fs_target_read_seed_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    add_test(NAME target_read_seed COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_seed_close_fixture_windows.py
+      $<TARGET_FILE:ck_fs_target_read_seed_tests> "${CK_CORE_FS_NATIVE_TEST_ROOT}"
+      "${CK_CORE_FS_METADATA_TARGET_NATIVE_FS}")
     add_test(NAME native_tree_execution COMMAND ck_fs_native_tree_execution_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
     add_test(NAME native_tree_execution_controls COMMAND ck_fs_native_tree_execution_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}" --controls)
     add_test(NAME tree_fixture_native_root COMMAND ck_fs_tree_fixture_native_root_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}")
@@ -701,7 +718,10 @@ if(BUILD_TESTING)
     # machine lacking that native test capability must not count a skip as PASS.
     option(CK_CORE_FS_TEST_PRIVILEGED_METADATA "Run native Complete security replay qualification" OFF)
     if(CK_CORE_FS_TEST_PRIVILEGED_METADATA)
-      add_test(NAME target_read_seed_complete COMMAND ck_fs_target_read_seed_tests "${CK_CORE_FS_NATIVE_TEST_ROOT}" --complete)
+      add_test(NAME target_read_seed_complete COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_seed_close_fixture_windows.py
+        $<TARGET_FILE:ck_fs_target_read_seed_tests> "${CK_CORE_FS_NATIVE_TEST_ROOT}"
+        "${CK_CORE_FS_METADATA_TARGET_NATIVE_FS}" --complete)
       set_tests_properties(target_read_seed_complete PROPERTIES TIMEOUT 300
         LABELS "windows;native;metadata;privileged"
         ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")

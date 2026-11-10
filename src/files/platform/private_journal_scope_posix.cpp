@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include "legacy_native_fixture_posix.hpp"
 #include <utility>
 #ifdef __APPLE__
 #include <sys/mount.h>
@@ -91,7 +92,7 @@ public:
         using R=Observation<ScopeDirectoryMetadata>;
 #ifdef __APPLE__
         struct stat value{};
-        if(fstat(fd_.get(),&value))return scope_error<ScopeDirectoryMetadata>(errno,"journal_scope.topology_fstat");
+        if(::ck::files::detail::legacy_fstat(fd_.get(),&value,"legacy.private_journal_scope_posix.fstat.94"))return scope_error<ScopeDirectoryMetadata>(errno,"journal_scope.topology_fstat");
         if(!S_ISDIR(value.st_mode)||!value.st_nlink)return scope_unqualified<ScopeDirectoryMetadata>("journal_scope.topology_kind");
         const auto modified=FileTimestamp::from_unix(value.st_mtimespec.tv_sec,static_cast<std::uint32_t>(value.st_mtimespec.tv_nsec));
         const auto changed=FileTimestamp::from_unix(value.st_ctimespec.tv_sec,static_cast<std::uint32_t>(value.st_ctimespec.tv_nsec));
@@ -159,3 +160,12 @@ Observation<ScopeDirectoryCursor::Pointer> open_scope_directory_cursor(PreparedJ
     return Observation<P>::available(std::make_unique<PosixScopeCursor>(std::move(fd),cursor->identity().value()->scope));
 }
 }
+
+#ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
+namespace ck::files::detail {
+// Test instrumentation closure only, not native authority/async completion.
+std::uint64_t legacy_native_scope_coverage()noexcept {
+    return legacy_operation_bit(LegacyNativeOperation::Query);
+}
+}
+#endif

@@ -24,6 +24,7 @@
 #include <dirent.h>
 #include <sys/param.h>
 #include <sys/stat.h>
+#include "legacy_native_fixture_posix.hpp"
 #ifdef __linux__
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
@@ -85,7 +86,7 @@ Observation<bool> private_regular(int fd,bool newly_created) {
     if(!private_check.value()) return private_check;
     if(newly_created) {
         struct stat info{};
-        if(fstat(fd,&info)) return failure<bool>(errno,"journal_file.created_stat");
+        if(::ck::files::detail::legacy_fstat(fd,&info,"legacy.operation_journal_file_posix.fstat.88")) return failure<bool>(errno,"journal_file.created_stat");
         if(info.st_size!=0) return rejected<bool>(AdapterError::InvalidAccess,"journal_file.created_nonempty",ObservationState::Denied);
     }
     return Observation<bool>::available(true);
@@ -111,7 +112,7 @@ public:
         auto checked=revalidate();
         if(!checked.value()) return unavailable_read<std::uint64_t>(checked);
         struct stat info{};
-        if (fstat(fd_.value(), &info) != 0) return io_failure<std::uint64_t>(errno, "journal_file.fstat");
+        if (::ck::files::detail::legacy_fstat(fd_.value(), &info,"legacy.operation_journal_file_posix.fstat.114") != 0) return io_failure<std::uint64_t>(errno, "journal_file.fstat");
         if (!S_ISREG(info.st_mode) || info.st_size < 0 || info.st_nlink != 1)
             return rejected<std::uint64_t>(AdapterError::InvalidNativeResult, "journal_file.size");
         if(read_only_) {auto after=revalidate();if(!after.value())return unavailable_read<std::uint64_t>(after);}
@@ -186,7 +187,7 @@ public:
         close_handles();finished_=true;return finish_result();
     }
     Observation<bool> bind_read_only() {
-        if(fstat(fd_.value(),&reader_file_) || fstat(directory_.value(),&reader_directory_))return io_failure<bool>(errno,"journal_reader.bind_identity");
+        if(::ck::files::detail::legacy_fstat(fd_.value(),&reader_file_,"legacy.operation_journal_file_posix.fstat.189") || ::ck::files::detail::legacy_fstat(directory_.value(),&reader_directory_,"legacy.operation_journal_file_posix.fstat.189"))return io_failure<bool>(errno,"journal_reader.bind_identity");
         reader_bound_=true;return revalidate();
     }
     bool record_consumer_failure(ObservationState observed,ErrorDomain domain,
@@ -277,7 +278,7 @@ private:
         if(read_only_) {
             auto provider=journal_storage(directory_.value(),false);if(!provider.value())return provider;
             struct stat file{},directory{};
-            if(fstat(fd_.value(),&file)||fstat(directory_.value(),&directory))return io_failure<bool>(errno,"journal_reader.identity");
+            if(::ck::files::detail::legacy_fstat(fd_.value(),&file,"legacy.operation_journal_file_posix.fstat.280")||::ck::files::detail::legacy_fstat(directory_.value(),&directory,"legacy.operation_journal_file_posix.fstat.280"))return io_failure<bool>(errno,"journal_reader.identity");
             bool same=reader_bound_ && directory.st_nlink && file.st_dev==reader_file_.st_dev && file.st_ino==reader_file_.st_ino &&
                 directory.st_dev==reader_directory_.st_dev && directory.st_ino==reader_directory_.st_ino &&
                 file.st_dev==directory.st_dev && file.st_size==reader_file_.st_size && file.st_nlink==1 &&
@@ -295,7 +296,7 @@ private:
         auto file=private_regular(fd_.value(),false);if(!file.value())return file;
         if(name_) {
             struct stat held{},named{};
-            if(fstat(fd_.value(),&held) || fstatat(directory_.value(),name_->posix_bytes()->c_str(),&named,AT_SYMLINK_NOFOLLOW))
+            if(::ck::files::detail::legacy_fstat(fd_.value(),&held,"legacy.operation_journal_file_posix.fstat.298") || fstatat(directory_.value(),name_->posix_bytes()->c_str(),&named,AT_SYMLINK_NOFOLLOW))
                 return io_failure<bool>(errno,"journal_file.membership");
             if(held.st_dev!=named.st_dev || held.st_ino!=named.st_ino || !S_ISREG(named.st_mode))
                 return rejected<bool>(AdapterError::MetadataChanged,"journal_file.membership_changed",ObservationState::Changed);
@@ -335,7 +336,7 @@ Observation<bool> detail::qualify_operation_journal_directory(const DirectoryCur
     Fd directory(*duplicate.value());
     auto checked=[&]() -> Observation<bool> {
         auto provider=journal_storage(directory.value(),false);if(!provider.value())return provider;
-        struct stat native{};if(fstat(directory.value(),&native))return failure<bool>(errno,"journal_reader.root_identity");
+        struct stat native{};if(::ck::files::detail::legacy_fstat(directory.value(),&native,"legacy.operation_journal_file_posix.fstat.338"))return failure<bool>(errno,"journal_reader.root_identity");
         const auto* old=cursor.identity().value();
         if(!native.st_nlink || !old || old->scheme!=IdentityScheme::PosixDeviceInode || old->volume!=NativeIdentifier::from_u64(native.st_dev) || old->object!=NativeIdentifier::from_u64(native.st_ino))
             return rejected<bool>(AdapterError::MetadataChanged,"journal_reader.root_identity_changed",ObservationState::Changed);
@@ -361,7 +362,7 @@ Observation<std::unique_ptr<OperationJournalFile>> open_held_operation_journal_f
     Fd file(openat(directory.value(),basename.posix_bytes()->c_str(),O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC));
     if(file.value()<0)return failure<Pointer>(errno,"journal_reader.openat");
     struct stat opened{};
-    if(fstat(file.value(),&opened))return failure<Pointer>(errno,"journal_reader.opened_stat");
+    if(::ck::files::detail::legacy_fstat(file.value(),&opened,"legacy.operation_journal_file_posix.fstat.364"))return failure<Pointer>(errno,"journal_reader.opened_stat");
     if(opened.st_dev!=named.st_dev||opened.st_ino!=named.st_ino)return rejected<Pointer>(AdapterError::MetadataChanged,"journal_reader.open_changed",ObservationState::Changed);
     auto result=std::make_unique<PosixOperationJournalFile>(file.value(),directory.value(),basename,PreparedJournalRoot::Pointer{},true);
     file.release();directory.release();
@@ -476,7 +477,7 @@ bool journal_node_matches(int fd,const char* name,int flags,const JournalDirecto
             return false;
         }
         struct stat target_stat{};
-        if(fstat(witness_fd,&target_stat)) {
+        if(::ck::files::detail::legacy_fstat(witness_fd,&target_stat,"legacy.operation_journal_file_posix.fstat.479")) {
             const int code=errno;
             error={state(code),ErrorDomain::Posix,code,"journal_root.ancestor_stat"};
             return false;
@@ -547,7 +548,7 @@ Observation<bool> journal_storage(int fd,bool writable) {
 Observation<JournalDirectory> journal_directory(Fd fd) {
     if(fd.value()<0)return failure<JournalDirectory>(errno,"journal_root.open_ancestor");
     struct stat s{};struct statfs fs{};
-    if(fstat(fd.value(),&s) || fstatfs(fd.value(),&fs))return failure<JournalDirectory>(errno,"journal_root.directory_identity");
+    if(::ck::files::detail::legacy_fstat(fd.value(),&s,"legacy.operation_journal_file_posix.fstat.550") || fstatfs(fd.value(),&fs))return failure<JournalDirectory>(errno,"journal_root.directory_identity");
     if(!S_ISDIR(s.st_mode) || !s.st_nlink)
         return rejected<JournalDirectory>(AdapterError::MetadataChanged,"journal_root.directory_kind",ObservationState::Changed);
 #ifdef __APPLE__
@@ -645,7 +646,7 @@ public:
         std::vector<ObjectIdentity> ids;ids.reserve(chain_.size());
         for(const auto& node:chain_) {
             struct stat value{};
-            if(fstat(node.fd.value(),&value))return failure<std::vector<ObjectIdentity>>(errno,"journal_root.ancestry_identity");
+            if(::ck::files::detail::legacy_fstat(node.fd.value(),&value,"legacy.operation_journal_file_posix.fstat.648"))return failure<std::vector<ObjectIdentity>>(errno,"journal_root.ancestry_identity");
             std::optional<std::uint64_t> generation;
 #ifdef __APPLE__
             generation=static_cast<std::uint64_t>(value.st_gen);
@@ -663,7 +664,7 @@ public:
         std::vector<detail::RootScopeIdentity> ids;ids.reserve(chain_.size());
         for(const auto& node:chain_) {
             struct stat value{};
-            if(fstat(node.fd.value(),&value))return failure<std::vector<detail::RootScopeIdentity>>(errno,"journal_root.scope_ancestry_identity");
+            if(::ck::files::detail::legacy_fstat(node.fd.value(),&value,"legacy.operation_journal_file_posix.fstat.666"))return failure<std::vector<detail::RootScopeIdentity>>(errno,"journal_root.scope_ancestry_identity");
             ids.push_back({{identity_.scope,IdentityScheme::PosixDeviceInode,
                 NativeIdentifier::from_u64(value.st_dev),NativeIdentifier::from_u64(value.st_ino),std::nullopt},
                 node.mount_root.mount_id});
@@ -759,7 +760,7 @@ private:
                 return failure.result();
 #else
             struct stat s{};
-            if(fstat(chain_[i].fd.value(),&s))return failure<bool>(errno,"journal_root.held_identity");
+            if(::ck::files::detail::legacy_fstat(chain_[i].fd.value(),&s,"legacy.operation_journal_file_posix.fstat.762"))return failure<bool>(errno,"journal_root.held_identity");
             if(!S_ISDIR(s.st_mode) || !s.st_nlink || s.st_dev!=chain_[i].device || s.st_ino!=chain_[i].object)
                 return rejected<bool>(AdapterError::MetadataChanged,"journal_root.held_identity_changed",ObservationState::Changed);
             if(i+1<chain_.size()) {
@@ -904,7 +905,7 @@ Observation<PreparedJournalRoot::Pointer> prepare_native_journal_root(
     if(!duplicate.value())return R::unavailable(duplicate.state(),duplicate.unavailable_detail()->error);
     Fd parent(std::move(duplicate).take_value());
     struct stat original{};
-    if(fstat(parent.value(),&original))return failure<PreparedJournalRoot::Pointer>(errno,"journal_root.parent_identity");
+    if(::ck::files::detail::legacy_fstat(parent.value(),&original,"legacy.operation_journal_file_posix.fstat.907"))return failure<PreparedJournalRoot::Pointer>(errno,"journal_root.parent_identity");
     const auto* identity=request.parent->identity().value();
     if(!identity || identity->scheme!=IdentityScheme::PosixDeviceInode ||
         identity->volume!=NativeIdentifier::from_u64(original.st_dev) || identity->object!=NativeIdentifier::from_u64(original.st_ino))
@@ -995,7 +996,7 @@ Observation<PreparedJournalRoot::Pointer> prepare_native_journal_root(
     std::optional<std::uint64_t> root_generation;
 #ifdef __APPLE__
     struct stat actual_root{};
-    if(fstat(chain.front().fd.value(),&actual_root))return failure<PreparedJournalRoot::Pointer>(errno,"journal_root.created_identity");
+    if(::ck::files::detail::legacy_fstat(chain.front().fd.value(),&actual_root,"legacy.operation_journal_file_posix.fstat.998"))return failure<PreparedJournalRoot::Pointer>(errno,"journal_root.created_identity");
     if(!S_ISDIR(actual_root.st_mode)||actual_root.st_dev!=chain.front().device||actual_root.st_ino!=chain.front().object)
         return rejected<PreparedJournalRoot::Pointer>(AdapterError::MetadataChanged,"journal_root.created_identity_changed",ObservationState::Changed);
     root_generation=static_cast<std::uint64_t>(actual_root.st_gen);
@@ -1022,3 +1023,12 @@ Observation<PreparedJournalRoot::Pointer> prepare_native_journal_root(
 }
 
 } // namespace ck::files
+
+#ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
+namespace ck::files::detail {
+// Test instrumentation closure only, not native authority/async completion.
+std::uint64_t legacy_native_journal_coverage()noexcept {
+    return legacy_operation_bit(LegacyNativeOperation::Query);
+}
+}
+#endif

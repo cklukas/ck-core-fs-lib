@@ -133,7 +133,7 @@ void run(std::shared_ptr<RootState> state,PreparedJournalRootRequest request) no
             state->cv.wait(lock,[&]{return state->finish;});
             collect_consumer_failure(*state,*state->root);
             try {
-                if(detail::journal_root_test_worker_exception.exchange(false))throw std::bad_alloc();
+                if(detail::take_journal_root_worker_test_exception())throw std::bad_alloc();
             } catch(...) {emergency(*state);++state->cache.sequence;state->cv.notify_all();}
             if(state->cache.state==CKFJR_READY)state->cache.state=CKFJR_FINISHING;
             if(state->root.use_count()!=1) {state->cv.wait_for(lock,std::chrono::milliseconds(20));continue;}

@@ -20,6 +20,7 @@
 #endif
 #include <windows.h>
 #include <winternl.h>
+#include "legacy_native_fixture_windows.hpp"
 #include <aclapi.h>
 #include <winioctl.h>
 #include <array>
@@ -37,14 +38,14 @@ namespace {
 // into success. Always preserve the OS result/error before invoking callbacks.
 bool close_native_consumer_handle(HANDLE handle,const char* operation)noexcept {
 #ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
-    (void)operation;return CloseHandle(handle)!=FALSE;
+    (void)operation;return ::ck::files::detail::legacy_close_native_call(handle,"legacy.operation_journal_file_windows.CloseHandle.40")!=FALSE;
 #else
     const DWORD before=GetLastError();
-    detail::observe_native_close(handle,operation);
-    SetLastError(before);const BOOL native_ok=CloseHandle(handle);
+    ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_close(handle,operation);});
+    SetLastError(before);const BOOL native_ok=::ck::files::detail::legacy_close_native_call(handle,"legacy.operation_journal_file_windows.CloseHandle.44");
     const DWORD saved=GetLastError();
     const DWORD native_error=native_ok?ERROR_SUCCESS:saved;
-    const auto injected=detail::inject_native_close_failure(handle,operation,native_ok!=FALSE,native_error);
+    const auto injected=::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::inject_native_close_failure(handle,operation,native_ok!=FALSE,native_error);});
     if(!native_ok){SetLastError(native_error);return false;}
     if(injected){SetLastError(injected);return false;}
     SetLastError(saved);return true;
@@ -52,13 +53,13 @@ bool close_native_consumer_handle(HANDLE handle,const char* operation)noexcept {
 }
 bool write_native_consumer_file(HANDLE handle,const void* bytes,DWORD count,DWORD* written,const char* operation)noexcept {
 #ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
-    (void)operation;return WriteFile(handle,bytes,count,written,nullptr)!=FALSE;
+    (void)operation;return ::ck::files::detail::legacy_write_file(handle,bytes,count,written,nullptr,"legacy.operation_journal_file_windows.WriteFile.55")!=FALSE;
 #else
     const DWORD before=GetLastError();
-    detail::observe_native_file_before(handle,detail::NativeTestIo::Write,count,operation);
-    SetLastError(before);const BOOL okay=WriteFile(handle,bytes,count,written,nullptr);
+    ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_file_before(handle,detail::NativeTestIo::Write,count,operation);});
+    SetLastError(before);const BOOL okay=::ck::files::detail::legacy_write_file(handle,bytes,count,written,nullptr,"legacy.operation_journal_file_windows.WriteFile.59");
     const DWORD error=GetLastError();
-    detail::observe_native_file_after(handle,detail::NativeTestIo::Write,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);
+    ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_file_after(handle,detail::NativeTestIo::Write,okay!=FALSE,okay?ERROR_SUCCESS:error,operation);});
     SetLastError(error);return okay!=FALSE;
 #endif
 }
@@ -66,11 +67,11 @@ struct Close {
     void operator()(void* value) const noexcept {
         if(value&&value!=INVALID_HANDLE_VALUE){
             constexpr const char* operation="journal_file.temporary_CloseHandle";
-            detail::observe_native_close(value,operation);
-            const BOOL native_ok=CloseHandle(value);
+            ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_close(value,operation);});
+            const BOOL native_ok=::ck::files::detail::legacy_close_native_call(value,"legacy.operation_journal_file_windows.CloseHandle.70");
             const DWORD saved=GetLastError();
             const DWORD native_error=native_ok?ERROR_SUCCESS:saved;
-            const auto injected=detail::inject_native_close_failure(value,operation,native_ok!=FALSE,native_error);
+            const auto injected=::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::inject_native_close_failure(value,operation,native_ok!=FALSE,native_error);});
             const DWORD error=native_ok?injected:native_error;
             if(error)detail::record_metadata_capture_close({ObservationState::Failed,ErrorDomain::Win32,error,operation});
             SetLastError(error?error:saved);
@@ -176,7 +177,7 @@ Observation<bool> verify_security(HANDLE file, PSID expected) {
 
 Observation<bool> verify_root(HANDLE directory, PSID expected) {
     FILE_ATTRIBUTE_TAG_INFO tag{};
-    if (!GetFileInformationByHandleEx(directory, FileAttributeTagInfo, &tag, sizeof(tag)))
+    if (!::ck::files::detail::legacy_query(directory, FileAttributeTagInfo, &tag, sizeof(tag),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.179"))
         return failure<bool>(GetLastError(), "journal_file.root_tag");
     if (!(tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
         return rejected<bool>(AdapterError::FinalLinkRejected, "journal_file.root_kind");
@@ -250,8 +251,8 @@ public:
         LARGE_INTEGER at{}; at.QuadPart = static_cast<LONGLONG>(offset);
         if (!SetFilePointerEx(file_.get(), at, nullptr, FILE_BEGIN)) return io_failure<std::size_t>(GetLastError(), "journal_file.read_seek");
         DWORD count{};
-        detail::observe_native_test_io(detail::NativeTestIo::Read);
-        if (!ReadFile(file_.get(), bytes.data(), static_cast<DWORD>(std::min(bytes.size(), static_cast<std::size_t>(MAXDWORD))), &count, nullptr))
+        ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_test_io(detail::NativeTestIo::Read);});
+        if (!::ck::files::detail::legacy_read_file(file_.get(), bytes.data(), static_cast<DWORD>(std::min(bytes.size(), static_cast<std::size_t>(MAXDWORD))), &count, nullptr,"legacy.operation_journal_file_windows.ReadFile.254"))
             return io_failure<std::size_t>(GetLastError(), "journal_file.ReadFile");
         auto after=revalidate();
         if(!after.value())return unavailable_read<std::size_t>(after);
@@ -265,7 +266,7 @@ public:
         LARGE_INTEGER at{}; at.QuadPart = static_cast<LONGLONG>(offset);
         if (!SetFilePointerEx(file_.get(), at, nullptr, FILE_BEGIN)) return io_failure<std::size_t>(GetLastError(), "journal_file.write_seek");
         DWORD count{};
-        detail::observe_native_test_io(detail::NativeTestIo::Write);
+        ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_test_io(detail::NativeTestIo::Write);});
         if (!write_native_consumer_file(file_.get(), bytes.data(), static_cast<DWORD>(std::min(bytes.size(), static_cast<std::size_t>(MAXDWORD))), &count, "journal_file.WriteFile"))
             return io_failure<std::size_t>(GetLastError(), "journal_file.WriteFile");
         auto after=revalidate();
@@ -275,10 +276,10 @@ public:
     Observation<bool> flush() override {
         if(read_only_)return rejected<bool>(AdapterError::InvalidAccess,"journal_reader.read_only_flush",ObservationState::Denied);
         const auto checked=revalidate();if(!checked.value()) return checked;
-        detail::observe_native_test_io(detail::NativeTestIo::Flush);
-        if (!FlushFileBuffers(file_.get())) return io_failure<bool>(GetLastError(), "journal_file.FlushFileBuffers");
-        detail::observe_native_test_io(detail::NativeTestIo::Flush);
-        if (!FlushFileBuffers(directory_.get())) return io_failure<bool>(GetLastError(),"journal_file.parent_FlushFileBuffers");
+        ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_test_io(detail::NativeTestIo::Flush);});
+        if (!::ck::files::detail::legacy_flush(file_.get(),"legacy.operation_journal_file_windows.FlushFileBuffers.279")) return io_failure<bool>(GetLastError(), "journal_file.FlushFileBuffers");
+        ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_test_io(detail::NativeTestIo::Flush);});
+        if (!::ck::files::detail::legacy_flush(directory_.get(),"legacy.operation_journal_file_windows.FlushFileBuffers.281")) return io_failure<bool>(GetLastError(),"journal_file.parent_FlushFileBuffers");
         return revalidate();
     }
     Observation<bool> finish_io() override {
@@ -318,10 +319,10 @@ public:
     }
     Observation<bool> bind_read_only(const NativeName& name) {
         reader_name_.emplace(name);
-        if(!GetFileInformationByHandleEx(file_.get(),FileIdInfo,&reader_file_,sizeof(reader_file_)) ||
-           !GetFileInformationByHandleEx(directory_.get(),FileIdInfo,&reader_directory_,sizeof(reader_directory_)) ||
-           !GetFileInformationByHandleEx(file_.get(),FileBasicInfo,&reader_basic_,sizeof(reader_basic_)) ||
-           !GetFileInformationByHandleEx(file_.get(),FileStandardInfo,&reader_standard_,sizeof(reader_standard_))) {
+        if(!::ck::files::detail::legacy_query(file_.get(),FileIdInfo,&reader_file_,sizeof(reader_file_),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.321") ||
+           !::ck::files::detail::legacy_query(directory_.get(),FileIdInfo,&reader_directory_,sizeof(reader_directory_),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.322") ||
+           !::ck::files::detail::legacy_query(file_.get(),FileBasicInfo,&reader_basic_,sizeof(reader_basic_),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.323") ||
+           !::ck::files::detail::legacy_query(file_.get(),FileStandardInfo,&reader_standard_,sizeof(reader_standard_),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.324")) {
             const auto code=GetLastError();remember_finish(state(code),ErrorDomain::Win32,code,"journal_reader.bind_identity");
             return io_failure<bool>(code,"journal_reader.bind_identity");
         }
@@ -360,13 +361,13 @@ private:
     }
     void finish_flush() {
         if(!finish_check())return;
-        detail::observe_native_test_io(detail::NativeTestIo::Flush);
-        if(!FlushFileBuffers(file_.get())) {
+        ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_test_io(detail::NativeTestIo::Flush);});
+        if(!::ck::files::detail::legacy_flush(file_.get(),"legacy.operation_journal_file_windows.FlushFileBuffers.364")) {
             const auto code=GetLastError();
             remember_finish(state(code),ErrorDomain::Win32,code,"journal_file.FlushFileBuffers");return;
         }
-        detail::observe_native_test_io(detail::NativeTestIo::Flush);
-        if(!FlushFileBuffers(directory_.get())) {
+        ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_test_io(detail::NativeTestIo::Flush);});
+        if(!::ck::files::detail::legacy_flush(directory_.get(),"legacy.operation_journal_file_windows.FlushFileBuffers.369")) {
             const auto code=GetLastError();
             remember_finish(state(code),ErrorDomain::Win32,code,"journal_file.parent_FlushFileBuffers");return;
         }
@@ -394,9 +395,9 @@ private:
         auto consume=[this](Handle& owner,const char* operation) noexcept {
             const auto raw=owner.release();
             if(!raw||raw==INVALID_HANDLE_VALUE)return false;
-            detail::observe_native_close(raw,operation);
-            const BOOL okay=CloseHandle(raw);const DWORD native_error=okay?ERROR_SUCCESS:GetLastError();
-            const auto injected=detail::inject_native_close_failure(raw,operation,okay!=FALSE,native_error);
+            ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_close(raw,operation);});
+            const BOOL okay=::ck::files::detail::legacy_close_native_call(raw,"legacy.operation_journal_file_windows.CloseHandle.398");const DWORD native_error=okay?ERROR_SUCCESS:GetLastError();
+            const auto injected=::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::inject_native_close_failure(raw,operation,okay!=FALSE,native_error);});
             const auto error=okay?injected:native_error;
             if(error)remember_close(error,operation);
             return true;
@@ -426,11 +427,11 @@ private:
         if(!reader_bound_ || !reader_name_ || !reader_name_->windows_units())
             return rejected<bool>(AdapterError::InvalidNativeResult,"journal_reader.unbound");
         FILE_ID_INFO file{},directory{};FILE_BASIC_INFO basic{};FILE_STANDARD_INFO standard{},root_standard{};
-        if(!GetFileInformationByHandleEx(file_.get(),FileIdInfo,&file,sizeof(file)) ||
-           !GetFileInformationByHandleEx(directory_.get(),FileIdInfo,&directory,sizeof(directory)) ||
-           !GetFileInformationByHandleEx(file_.get(),FileBasicInfo,&basic,sizeof(basic)) ||
-           !GetFileInformationByHandleEx(file_.get(),FileStandardInfo,&standard,sizeof(standard)) ||
-           !GetFileInformationByHandleEx(directory_.get(),FileStandardInfo,&root_standard,sizeof(root_standard))) {
+        if(!::ck::files::detail::legacy_query(file_.get(),FileIdInfo,&file,sizeof(file),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.429") ||
+           !::ck::files::detail::legacy_query(directory_.get(),FileIdInfo,&directory,sizeof(directory),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.430") ||
+           !::ck::files::detail::legacy_query(file_.get(),FileBasicInfo,&basic,sizeof(basic),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.431") ||
+           !::ck::files::detail::legacy_query(file_.get(),FileStandardInfo,&standard,sizeof(standard),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.432") ||
+           !::ck::files::detail::legacy_query(directory_.get(),FileStandardInfo,&root_standard,sizeof(root_standard),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.433")) {
             const auto code=GetLastError();remember_finish(state(code),ErrorDomain::Win32,code,"journal_reader.identity");
             return io_failure<bool>(code,"journal_reader.identity");
         }
@@ -450,7 +451,7 @@ private:
             return rejected<bool>(AdapterError::MetadataChanged,"journal_reader.identity_or_version_changed",ObservationState::Changed);
         }
         alignas(8) std::array<std::byte,65536> buffer{};
-        if(!GetFileInformationByHandleEx(file_.get(),FileNameInfo,buffer.data(),static_cast<DWORD>(buffer.size()))) {
+        if(!::ck::files::detail::legacy_query(file_.get(),FileNameInfo,buffer.data(),static_cast<DWORD>(buffer.size()),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.453")) {
             const auto code=GetLastError();remember_finish(state(code),ErrorDomain::Win32,code,"journal_reader.exact_name");
             return io_failure<bool>(code,"journal_reader.exact_name");
         }
@@ -474,8 +475,8 @@ private:
         const auto security=verify_security(file_.get(),user_.data());if(!security.value())return security;
         if(!*security.value())return rejected<bool>(AdapterError::InvalidNativeResult,"journal_file.file_security");
         FILE_ATTRIBUTE_TAG_INFO tag{};FILE_STANDARD_INFO info{};
-        if(!GetFileInformationByHandleEx(file_.get(),FileAttributeTagInfo,&tag,sizeof(tag)) ||
-            !GetFileInformationByHandleEx(file_.get(),FileStandardInfo,&info,sizeof(info)))
+        if(!::ck::files::detail::legacy_query(file_.get(),FileAttributeTagInfo,&tag,sizeof(tag),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.477") ||
+            !::ck::files::detail::legacy_query(file_.get(),FileStandardInfo,&info,sizeof(info),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.478"))
             return io_failure<bool>(GetLastError(),"journal_file.revalidate_info");
         if((tag.FileAttributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DIRECTORY)) || info.NumberOfLinks!=1)
             return rejected<bool>(AdapterError::InvalidAccess,"journal_file.revalidate_kind",ObservationState::Denied);
@@ -545,11 +546,11 @@ Observation<std::unique_ptr<OperationJournalFile>> open_windows_journal_at(Handl
     object.SecurityDescriptor = create_new ? relative_descriptor.data() : nullptr;
     IO_STATUS_BLOCK io{};
     HANDLE raw_file{};
-    const auto status = NtCreateFile(&raw_file, read_only ? (FILE_GENERIC_READ | READ_CONTROL) : (FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_OWNER),
+    const auto status = ::ck::files::detail::legacy_nt_create(&raw_file, read_only ? (FILE_GENERIC_READ | READ_CONTROL) : (FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_OWNER),
         &object, &io, nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
         create_new ? FILE_CREATE : FILE_OPEN,
         FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | (read_only ? FILE_OPEN_NO_RECALL : FILE_WRITE_THROUGH),
-        nullptr, 0);
+        nullptr, 0,"legacy.operation_journal_file_windows.NtCreateFile.548");
     Handle file(raw_file);
     // This is a synchronous, nonalertable file object with SYNCHRONIZE access.
     // The I/O manager completes the open before returning; no asynchronous
@@ -563,8 +564,8 @@ Observation<std::unique_ptr<OperationJournalFile>> open_windows_journal_at(Handl
         return rejected<Pointer>(AdapterError::InvalidNativeResult, "journal_file.open_result");
     FILE_ATTRIBUTE_TAG_INFO tag{};
     FILE_STANDARD_INFO info{};
-    if (!GetFileInformationByHandleEx(file.get(), FileAttributeTagInfo, &tag, sizeof(tag)) ||
-        !GetFileInformationByHandleEx(file.get(), FileStandardInfo, &info, sizeof(info)))
+    if (!::ck::files::detail::legacy_query(file.get(), FileAttributeTagInfo, &tag, sizeof(tag),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.566") ||
+        !::ck::files::detail::legacy_query(file.get(), FileStandardInfo, &info, sizeof(info),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.567"))
         return failure<Pointer>(GetLastError(), "journal_file.file_info");
     if ((tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) || info.NumberOfLinks != 1 ||
         (create_new && info.EndOfFile.QuadPart != 0))
@@ -605,9 +606,9 @@ Observation<bool> prepare_native_operation_journal_root(const NativeAbsolutePath
     auto user_data = std::move(user).take_value();
     const auto native_path = windows_extended_path(host.value()->native());
     if (!native_path) return rejected<bool>(AdapterError::InvalidPath, "journal_file.prepare_root.path");
-    Handle directory(CreateFileW(native_path->c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL |
+    Handle directory(::ck::files::detail::legacy_create(native_path->c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL |
             WRITE_DAC | WRITE_OWNER, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr,"legacy.operation_journal_file_windows.CreateFileW.608"));
     if (directory.get() == INVALID_HANDLE_VALUE)
         return failure<bool>(GetLastError(), "journal_file.prepare_root.open");
     std::vector<std::byte> system, acl_data;
@@ -636,8 +637,8 @@ Observation<bool> detail::qualify_operation_journal_directory(const DirectoryCur
         if(!proof.qualified)return Observation<bool>::unavailable(proof.state,{proof.domain,proof.code,proof.operation});
         auto user=effective_user();if(!user.value())return Observation<bool>::unavailable(user.state(),user.unavailable_detail()->error);
         FILE_ID_INFO native{};FILE_STANDARD_INFO standard{};
-        if(!GetFileInformationByHandleEx(directory.get(),FileIdInfo,&native,sizeof(native)) ||
-           !GetFileInformationByHandleEx(directory.get(),FileStandardInfo,&standard,sizeof(standard)))return failure<bool>(GetLastError(),"journal_reader.root_identity");
+        if(!::ck::files::detail::legacy_query(directory.get(),FileIdInfo,&native,sizeof(native),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.639") ||
+           !::ck::files::detail::legacy_query(directory.get(),FileStandardInfo,&standard,sizeof(standard),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.640"))return failure<bool>(GetLastError(),"journal_reader.root_identity");
         if(!standard.Directory || standard.DeletePending || !standard.NumberOfLinks)return rejected<bool>(AdapterError::MetadataChanged,"journal_reader.root_unlinked",ObservationState::Changed);
         NativeIdentifier object;std::memcpy(object.bytes.data(),native.FileId.Identifier,16);
         const auto* old=cursor.identity().value();
@@ -646,9 +647,9 @@ Observation<bool> detail::qualify_operation_journal_directory(const DirectoryCur
         return verify_root(directory.get(),const_cast<std::byte*>(user.value()->data()));
     }();
     const auto raw=directory.release();
-    detail::observe_native_close(raw,"journal_reader.validation_duplicate_close");
-    const BOOL native_ok=CloseHandle(raw);const DWORD native_error=native_ok?ERROR_SUCCESS:GetLastError();
-    const auto injected=detail::inject_native_close_failure(raw,"journal_reader.validation_duplicate_close",native_ok!=FALSE,native_error);
+    ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_close(raw,"journal_reader.validation_duplicate_close");});
+    const BOOL native_ok=::ck::files::detail::legacy_close_native_call(raw,"legacy.operation_journal_file_windows.CloseHandle.650");const DWORD native_error=native_ok?ERROR_SUCCESS:GetLastError();
+    const auto injected=::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::inject_native_close_failure(raw,"journal_reader.validation_duplicate_close",native_ok!=FALSE,native_error);});
     const auto error=native_ok?injected:native_error;
     if(error) {
         detail::record_metadata_capture_close({state(error),ErrorDomain::Win32,error,"journal_reader.validation_duplicate_close"});
@@ -692,9 +693,9 @@ Observation<std::unique_ptr<OperationJournalFile>> open_native_operation_journal
     auto user_data = std::move(user).take_value();
     const auto native_path = windows_extended_path(root.native());
     if (!native_path) return rejected<Pointer>(AdapterError::InvalidPath, "journal_file.root_address");
-    Handle directory(CreateFileW(native_path->c_str(), FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
+    Handle directory(::ck::files::detail::legacy_create(native_path->c_str(), FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr,"legacy.operation_journal_file_windows.CreateFileW.695"));
     if (directory.get() == INVALID_HANDLE_VALUE) return failure<Pointer>(GetLastError(), "journal_file.open_root");
     auto root_valid = verify_root(directory.get(), user_data.data());
     if (!root_valid.value()) {
@@ -725,9 +726,9 @@ Observation<WindowsJournalDirectory> query_journal_directory(HANDLE handle) {
     auto local=journal_local_volume(handle);
     if(!local.value())return Observation<WindowsJournalDirectory>::unavailable(local.state(),local.unavailable_detail()->error);
     FILE_ID_INFO id{};FILE_ATTRIBUTE_TAG_INFO tag{};FILE_STANDARD_INFO standard{};
-    if(!GetFileInformationByHandleEx(handle,FileIdInfo,&id,sizeof(id))||
-        !GetFileInformationByHandleEx(handle,FileAttributeTagInfo,&tag,sizeof(tag))||
-        !GetFileInformationByHandleEx(handle,FileStandardInfo,&standard,sizeof(standard)))
+    if(!::ck::files::detail::legacy_query(handle,FileIdInfo,&id,sizeof(id),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.728")||
+        !::ck::files::detail::legacy_query(handle,FileAttributeTagInfo,&tag,sizeof(tag),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.729")||
+        !::ck::files::detail::legacy_query(handle,FileStandardInfo,&standard,sizeof(standard),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.730"))
         return failure<WindowsJournalDirectory>(GetLastError(),"journal_root.directory_identity");
     if(!(tag.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)||(tag.FileAttributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_OFFLINE))||standard.DeletePending)
         return rejected<WindowsJournalDirectory>(AdapterError::FinalLinkRejected,"journal_root.directory_kind",ObservationState::Unsupported);
@@ -764,11 +765,11 @@ Observation<Handle> guarded_journal_directory_by_id(HANDLE hint,const FILE_ID_IN
     FILE_ID_DESCRIPTOR descriptor{};descriptor.dwSize=sizeof(descriptor);descriptor.Type=ExtendedFileIdType;descriptor.ExtendedFileId=id.FileId;
     // No FILE_SHARE_DELETE: this same owning open excludes prior/new DELETE
     // holders, so acquired directory memberships cannot subsequently be moved.
-    Handle handle(OpenFileById(hint,&descriptor,FILE_GENERIC_READ|FILE_GENERIC_WRITE|READ_CONTROL|SYNCHRONIZE,
-        FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL));
+    Handle handle(::ck::files::detail::legacy_open_by_id(hint,&descriptor,FILE_GENERIC_READ|FILE_GENERIC_WRITE|READ_CONTROL|SYNCHRONIZE,
+        FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_OPEN_NO_RECALL,"legacy.operation_journal_file_windows.OpenFileById.767"));
     if(!handle || handle.get()==INVALID_HANDLE_VALUE)return failure<Handle>(GetLastError(),"journal_root.OpenFileById");
     FILE_ID_INFO current{};
-    if(!GetFileInformationByHandleEx(handle.get(),FileIdInfo,&current,sizeof(current)))return failure<Handle>(GetLastError(),"journal_root.by_id_identity");
+    if(!::ck::files::detail::legacy_query(handle.get(),FileIdInfo,&current,sizeof(current),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.771"))return failure<Handle>(GetLastError(),"journal_root.by_id_identity");
     if(current.VolumeSerialNumber!=id.VolumeSerialNumber||journal_object(current)!=journal_object(id))
         return rejected<Handle>(AdapterError::MetadataChanged,"journal_root.by_id_changed",ObservationState::Changed);
     return Observation<Handle>::available(std::move(handle));
@@ -787,16 +788,16 @@ Observation<Handle> open_journal_root_child(HANDLE parent,const NativeName& chil
     OBJECT_ATTRIBUTES object{};object.Length=sizeof(object);object.RootDirectory=parent;object.ObjectName=&n;
     object.SecurityDescriptor=provision?self_relative.data():nullptr;
     IO_STATUS_BLOCK io{};HANDLE raw{};
-    const auto status=NtCreateFile(&raw,FILE_GENERIC_READ|FILE_GENERIC_WRITE|READ_CONTROL|SYNCHRONIZE,&object,&io,nullptr,
+    const auto status=::ck::files::detail::legacy_nt_create(&raw,FILE_GENERIC_READ|FILE_GENERIC_WRITE|READ_CONTROL|SYNCHRONIZE,&object,&io,nullptr,
         FILE_ATTRIBUTE_DIRECTORY,FILE_SHARE_READ|FILE_SHARE_WRITE,provision?FILE_OPEN_IF:FILE_OPEN,
-        FILE_DIRECTORY_FILE|FILE_OPEN_REPARSE_POINT|FILE_SYNCHRONOUS_IO_NONALERT,nullptr,0);
+        FILE_DIRECTORY_FILE|FILE_OPEN_REPARSE_POINT|FILE_SYNCHRONOUS_IO_NONALERT,nullptr,0,"legacy.operation_journal_file_windows.NtCreateFile.790");
     Handle result(raw);if(status<0)return nt_failure<Handle>(status,"journal_root.NtCreateFile");
     if(io.Information!=FILE_CREATED&&io.Information!=FILE_OPENED)return rejected<Handle>(AdapterError::InvalidNativeResult,"journal_root.open_result");
     created=io.Information==FILE_CREATED;return Observation<Handle>::available(std::move(result));
 }
 bool flush_journal_directory(HANDLE handle,detail::PreparedJournalFailureLatch& failure) noexcept {
-    detail::observe_native_test_io(detail::NativeTestIo::Flush);
-    if(!FlushFileBuffers(handle)) {const auto code=GetLastError();failure.record(state(code),ErrorDomain::Win32,code,"journal_root.directory_FlushFileBuffers");return false;}
+    ::ck::files::detail::legacy_preserve_windows_error([&]()noexcept{return detail::observe_native_test_io(detail::NativeTestIo::Flush);});
+    if(!::ck::files::detail::legacy_flush(handle,"legacy.operation_journal_file_windows.FlushFileBuffers.799")) {const auto code=GetLastError();failure.record(state(code),ErrorDomain::Win32,code,"journal_root.directory_FlushFileBuffers");return false;}
     try {
         if(const auto fault=detail::journal_root_fault(detail::JournalRootFaultPoint::DirectoryFlush)) {
             failure.record(state(static_cast<DWORD>(*fault)),ErrorDomain::Win32,*fault,"journal_root.directory_FlushFileBuffers");return false;
@@ -826,7 +827,7 @@ public:
         std::vector<ObjectIdentity> ids;ids.reserve(chain_.size());
         for(const auto& node:chain_) {
             FILE_ID_INFO value{};
-            if(!GetFileInformationByHandleEx(node.handle.get(),FileIdInfo,&value,sizeof(value)))
+            if(!::ck::files::detail::legacy_query(node.handle.get(),FileIdInfo,&value,sizeof(value),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.829"))
                 return failure<std::vector<ObjectIdentity>>(GetLastError(),"journal_root.ancestry_identity");
             ids.push_back({identity_.scope,IdentityScheme::WindowsFileId128,
                 NativeIdentifier::from_u64(value.VolumeSerialNumber),journal_object(value),{}});
@@ -839,7 +840,7 @@ public:
         std::lock_guard lock(mutex_);auto checked=check();
         if(!checked.value())return Observation<void*>::unavailable(checked.state(),checked.unavailable_detail()->error);
         HANDLE raw{};
-        if(!DuplicateHandle(GetCurrentProcess(),chain_.front().handle.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+        if(!::ck::files::detail::legacy_duplicate(GetCurrentProcess(),chain_.front().handle.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS,"legacy.operation_journal_file_windows.DuplicateHandle.842"))
             return failure<void*>(GetLastError(),"journal_root.duplicate_directory");
         return Observation<void*>::available(raw);
     }
@@ -849,7 +850,7 @@ public:
         if(!name.is_valid()||!name.windows_units())return rejected<std::unique_ptr<OperationJournalFile>>(AdapterError::InvalidIdentifier,"journal_root.basename");
         std::lock_guard lock(mutex_);auto checked=check();if(!checked.value())return R::unavailable(checked.state(),checked.unavailable_detail()->error);
         HANDLE raw{};
-        if(!DuplicateHandle(GetCurrentProcess(),chain_.front().handle.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS))
+        if(!::ck::files::detail::legacy_duplicate(GetCurrentProcess(),chain_.front().handle.get(),GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS,"legacy.operation_journal_file_windows.DuplicateHandle.852"))
             return failure<std::unique_ptr<OperationJournalFile>>(GetLastError(),"journal_root.duplicate_root");
         Handle directory(raw); // own before the following user-vector copy can allocate
         return open_windows_journal_at(std::move(directory),user_,name,create,shared_from_this());
@@ -881,7 +882,7 @@ public:
         if(qualified)for(const auto& node:chain_)(void)flush_journal_directory(node.handle.get(),consumer_failure_);
         for(auto& node:chain_) {
             const auto handle=node.handle.release();if(!handle||handle==INVALID_HANDLE_VALUE)continue;
-            if(!CloseHandle(handle)) {const auto code=GetLastError();consumer_failure_.record(state(code),ErrorDomain::Win32,code,"journal_root.directory_CloseHandle");}
+            if(!::ck::files::detail::legacy_close_native_call(handle,"legacy.operation_journal_file_windows.CloseHandle.884")) {const auto code=GetLastError();consumer_failure_.record(state(code),ErrorDomain::Win32,code,"journal_root.directory_CloseHandle");}
             try {
                 if(const auto fault=detail::journal_root_fault(detail::JournalRootFaultPoint::DirectoryClose))
                     consumer_failure_.record(state(static_cast<DWORD>(*fault)),ErrorDomain::Win32,*fault,"journal_root.directory_CloseHandle");
@@ -924,7 +925,7 @@ public:
     }
     Observation<bool> finish_io() override {
         if(directory_) {
-            const auto raw=directory_.release();if(!CloseHandle(raw))close_error_=GetLastError();
+            const auto raw=directory_.release();if(!::ck::files::detail::legacy_close_native_call(raw,"legacy.operation_journal_file_windows.CloseHandle.927"))close_error_=GetLastError();
             if(close_error_)detail::record_prepared_journal_consumer_failure(*root_,
                 state(close_error_),ErrorDomain::Win32,close_error_,"journal_root.enumeration_close");
             try {
@@ -951,7 +952,7 @@ private:
         if(!offset_) {
             buffer_.fill(0);
             const auto info=started_?FileIdBothDirectoryInfo:FileIdBothDirectoryRestartInfo;
-            const bool success=GetFileInformationByHandleEx(directory_.get(),info,buffer_.data(),static_cast<DWORD>(sizeof(buffer_)))!=0;
+            const bool success=::ck::files::detail::legacy_query(directory_.get(),info,buffer_.data(),static_cast<DWORD>(sizeof(buffer_)),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.954")!=0;
             const DWORD code=GetLastError();checked=root_->revalidate();
             if(!checked.value())return R::unavailable(checked.state(),checked.unavailable_detail()->error);
             if(!success)return code==ERROR_NO_MORE_FILES?R::available(DirectoryEnd{}):failure<DirectoryStep>(code,"journal_root.enumerate");
@@ -1002,12 +1003,12 @@ Observation<std::unique_ptr<PreparedJournalDirectory>> open_prepared_journal_dir
     auto duplicate=detail::duplicate_prepared_journal_directory(*root);
     if(!duplicate.value())return R::unavailable(duplicate.state(),duplicate.unavailable_detail()->error);
     Handle original(std::move(duplicate).take_value());FILE_ID_INFO id{};
-    if(!GetFileInformationByHandleEx(original.get(),FileIdInfo,&id,sizeof(id)))return failure<std::unique_ptr<PreparedJournalDirectory>>(GetLastError(),"journal_root.enumeration_identity");
+    if(!::ck::files::detail::legacy_query(original.get(),FileIdInfo,&id,sizeof(id),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.1005"))return failure<std::unique_ptr<PreparedJournalDirectory>>(GetLastError(),"journal_root.enumeration_identity");
     // A fresh object-bound open gives an independent enumeration position.
     // DuplicateHandle alone shares the directory FILE_OBJECT state.
     auto directory=guarded_journal_directory_by_id(original.get(),id);
     if(!directory.value())return R::unavailable(directory.state(),directory.unavailable_detail()->error);
-    const auto raw=original.release();if(!CloseHandle(raw))return failure<std::unique_ptr<PreparedJournalDirectory>>(GetLastError(),"journal_root.enumeration_duplicate_close");
+    const auto raw=original.release();if(!::ck::files::detail::legacy_close_native_call(raw,"legacy.operation_journal_file_windows.CloseHandle.1010"))return failure<std::unique_ptr<PreparedJournalDirectory>>(GetLastError(),"journal_root.enumeration_duplicate_close");
     auto checked=root->revalidate();if(!checked.value())return R::unavailable(checked.state(),checked.unavailable_detail()->error);
     return R::available(std::make_unique<WindowsPreparedJournalDirectory>(std::move(directory).take_value(),std::move(root)));
 }
@@ -1027,7 +1028,7 @@ Observation<PreparedJournalRoot::Pointer> prepare_native_journal_root(PreparedJo
     auto duplicate=detail::duplicate_windows_journal_directory(*request.parent);
     if(!duplicate.value())return R::unavailable(duplicate.state(),duplicate.unavailable_detail()->error);
     Handle parent(std::move(duplicate).take_value());FILE_ID_INFO parent_id{};
-    if(!GetFileInformationByHandleEx(parent.get(),FileIdInfo,&parent_id,sizeof(parent_id)))return failure<PreparedJournalRoot::Pointer>(GetLastError(),"journal_root.parent_identity");
+    if(!::ck::files::detail::legacy_query(parent.get(),FileIdInfo,&parent_id,sizeof(parent_id),"legacy.operation_journal_file_windows.GetFileInformationByHandleEx.1030"))return failure<PreparedJournalRoot::Pointer>(GetLastError(),"journal_root.parent_identity");
     const auto* original=request.parent->identity().value();
     if(!original||original->scheme!=IdentityScheme::WindowsFileId128||original->volume!=NativeIdentifier::from_u64(parent_id.VolumeSerialNumber)||original->object!=journal_object(parent_id))
         return rejected<PreparedJournalRoot::Pointer>(AdapterError::MetadataChanged,"journal_root.parent_changed",ObservationState::Changed);
@@ -1059,7 +1060,7 @@ Observation<PreparedJournalRoot::Pointer> prepare_native_journal_root(PreparedJo
         chain.push_back(std::move(ancestor).take_value());++progress.acquired_directories;notify(JournalRootPreparationPhase::Ancestry);
     }
     const auto parent_handle=parent.release();
-    if(!CloseHandle(parent_handle))return failure<PreparedJournalRoot::Pointer>(GetLastError(),"journal_root.input_duplicate_close");
+    if(!::ck::files::detail::legacy_close_native_call(parent_handle,"legacy.operation_journal_file_windows.CloseHandle.1062"))return failure<PreparedJournalRoot::Pointer>(GetLastError(),"journal_root.input_duplicate_close");
     ObjectIdentity id{original->scope,IdentityScheme::WindowsFileId128,NativeIdentifier::from_u64(chain.front().id.VolumeSerialNumber),journal_object(chain.front().id),{}};
     auto navigation=std::move(request.navigation_hint);
     std::vector<wchar_t> path(32768);const auto length=GetFinalPathNameByHandleW(chain.front().handle.get(),path.data(),static_cast<DWORD>(path.size()),FILE_NAME_OPENED|VOLUME_NAME_DOS);
@@ -1073,3 +1074,20 @@ Observation<PreparedJournalRoot::Pointer> prepare_native_journal_root(PreparedJo
 }
 
 } // namespace ck::files
+
+#ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
+namespace ck::files::detail {
+// Test instrumentation closure only, not native authority/async completion.
+std::uint64_t legacy_native_journal_coverage()noexcept {
+    return legacy_operation_bit(LegacyNativeOperation::Read)|
+        legacy_operation_bit(LegacyNativeOperation::Write)|
+        legacy_operation_bit(LegacyNativeOperation::Close)|
+        legacy_operation_bit(LegacyNativeOperation::Duplicate)|
+        legacy_operation_bit(LegacyNativeOperation::NativeCreate)|
+        legacy_operation_bit(LegacyNativeOperation::Create)|
+        legacy_operation_bit(LegacyNativeOperation::OpenById)|
+        legacy_operation_bit(LegacyNativeOperation::Query)|
+        legacy_operation_bit(LegacyNativeOperation::Flush);
+}
+}
+#endif

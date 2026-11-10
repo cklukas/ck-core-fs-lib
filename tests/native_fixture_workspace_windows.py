@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: LGPL-2.0-or-later
 """Private shared held-native Windows fixture workspace.
 
-Extracted from the qualified V3 reader wrapper. Native creation, provider/ACL
-checks, ownership, disposal layout, cleanup and failure behavior are unchanged.
-This refactor/seed profile is SOURCE ONLY until native controls requalify it.
+Derivative of the qualified V3 reader wrapper: first failure survives every
+independent drain. Native provider/ACL checks and 45/285 +3 +5 bounds remain.
+SOURCE ONLY until the paired native controls and original twelve requalify it.
 """
 import ctypes as c
 from ctypes import wintypes as w
@@ -16,7 +16,63 @@ import time
 import uuid
 
 
-def run_fixture(binary, parent, provider, args, *, seed=False):
+class _StopFixture(Exception):
+    """Private unwinding marker; native diagnostic formatting follows all drains."""
+
+
+class _FirstFailure:
+    def __init__(self):
+        self.kind = None
+        self.code = 0
+        self.operation = None
+        self.exception = None
+
+    def native(self, code, operation, *, ntstatus=False):
+        if self.kind is None:
+            self.kind = "ntstatus" if ntstatus else "win32"
+            self.code = code
+            self.operation = operation
+
+    def caught(self, error):
+        if self.kind is None:
+            self.kind = "exception"
+            self.exception = error
+
+    def raise_after_drain(self):
+        if self.kind == "exception":
+            raise self.exception
+        if self.kind == "ntstatus":
+            raise RuntimeError("%s status=%08x" % (self.operation, self.code & 0xffffffff))
+        if self.kind == "win32":
+            raise c.WinError(self.code)
+
+
+class _NativeReleases:
+    """Same native release path used by wrapper and private real-kernel controls."""
+    def __init__(self, kernel, first, stop, observe):
+        self.kernel = kernel
+        self.first = first
+        self.stop = stop
+        self.observe = observe
+
+    def close(self, handle, role):
+        ok = self.kernel.CloseHandle(handle)  # Genuine native call always precedes observer.
+        error = 0 if ok else c.get_last_error()
+        if not ok:
+            self.first.native(error, "CloseHandle")
+        self.observe("close-" + role, handle, ok, error)
+        if not ok:
+            raise self.stop
+    def free(self, address, role):
+        remaining = self.kernel.LocalFree(address)
+        error = c.get_last_error() if remaining else 0
+        if remaining:
+            self.first.native(error, "LocalFree")
+        self.observe("free-" + role, address, not remaining, error)
+        if remaining:
+            raise self.stop
+
+def run_fixture(binary, parent, provider, args, *, seed=False, _native_observer=None):
     if os.name != "nt":
         raise RuntimeError("Windows only: binary explicit-parent NTFS|ReFS [args]")
     if provider not in ("NTFS", "ReFS"):
@@ -38,6 +94,16 @@ def run_fixture(binary, parent, provider, args, *, seed=False):
         raise ValueError("relative/stream components forbidden")
     if os.environ.get("CK_FS_REQUIRE_V_DEV_DRIVE") == "1" and not parent.upper().startswith("\\\\?\\V:\\TMP\\"):
         raise ValueError("fixture must be beneath explicit V:\\tmp")
+
+    # Private Python-controller argument only; neither CLI nor environment can
+    # enable it. Observations follow genuine native calls. Return values are
+    # ignored; observer exceptions can only add failure, never native success.
+    first = _FirstFailure()
+    stop = _StopFixture()
+
+    def observe(event, owner, ok=True, error=0):
+        if _native_observer is not None:
+            _native_observer(event, owner, bool(ok), error)
 
     k = c.WinDLL("kernel32", use_last_error=True)
     n = c.WinDLL("ntdll")
@@ -89,9 +155,10 @@ def run_fixture(binary, parent, provider, args, *, seed=False):
 
     def require(ok):
         if not ok:
-            raise c.WinError(c.get_last_error())
-    def close(handle):
-        require(k.CloseHandle(handle))  # Once only; failed close is never retried.
+            first.native(c.get_last_error(), "native fixture operation")
+            raise stop
+    releases = _NativeReleases(k, first, stop, observe)
+    close, free = releases.close, releases.free
     def relative(owner, text, create=False, security=None):
         raw = text.encode("utf-16-le", "surrogatepass")
         storage = c.create_string_buffer(raw + b"\0\0")
@@ -105,19 +172,33 @@ def run_fixture(binary, parent, provider, args, *, seed=False):
             None, 0, 3, 2 if create else 1,
             0x20 | 0x200000 | 0x4000 | (1 if create else 0), None, 0)
         if status:
-            raise RuntimeError("NtCreateFile status=%08x" % (status & 0xffffffff))
+            first.native(status, "NtCreateFile", ntstatus=True)
+            raise stop
         if create and io.information != 2:  # FILE_CREATED, never adopt an existing root.
-            close(result); raise RuntimeError("exclusive root creation not proven")
+            first.caught(RuntimeError("exclusive root creation not proven"))
+            consumed, result = result, None
+            close(consumed, "unexpected-root")
+            raise stop
         return result
 
-    parent_handle = k.CreateFileW(parent, 0x80 | 4 | 0x100000, 3, None, 3, 0x02200000, None)
-    require(parent_handle != H(-1).value)
+    # Allocate owner cells before acquiring the first native owner. Release
+    # detachment uses None, not a new ctypes object, including exceptional paths.
+    parent_handle = None
     root = None
     work = None
     child = None
     token = H()
     sd = P()
+    sid = w.LPWSTR()
+    exited = True
+    preserved = False
+    invalid_handle = H(-1).value
     try:
+        parent_handle = k.CreateFileW(parent, 0x80 | 4 | 0x100000, 3, None, 3, 0x02200000, None)
+        if parent_handle == invalid_handle:
+            parent_handle = None
+            require(False)
+        observe("open-parent", parent_handle)
         actual = c.create_unicode_buffer(32)
         require(k.GetVolumeInformationByHandleW(parent_handle, None, 0, None, None, None, actual, 32))
         parent_tag = (w.DWORD * 2)()
@@ -127,29 +208,34 @@ def run_fixture(binary, parent, provider, args, *, seed=False):
         if actual.value != provider:
             raise RuntimeError("actual native provider does not match explicit selection")
         require(a.OpenProcessToken(k.GetCurrentProcess(), 8, c.byref(token)))
+        observe("open-token", token)
         needed = w.DWORD()
         a.GetTokenInformation(token, 1, None, 0, c.byref(needed))
         if not 0 < needed.value <= 65536:
             raise RuntimeError("invalid TokenUser extent")
         user = c.create_string_buffer(needed.value)
         require(a.GetTokenInformation(token, 1, user, needed, c.byref(needed)))
-        sid = w.LPWSTR()
         require(a.ConvertSidToStringSidW(c.cast(user, c.POINTER(P))[0], c.byref(sid)))
-        try:
-            sddl = "O:%sD:P(A;;FA;;;%s)(A;;FA;;;SY)" % (sid.value, sid.value)
-        finally:
-            k.LocalFree(c.cast(sid, P))
+        observe("open-sid", c.cast(sid, P))
+        sddl = "O:%sD:P(A;;FA;;;%s)(A;;FA;;;SY)" % (sid.value, sid.value)
+        consumed, sid = sid, None
+        free(consumed, "sid")
         require(a.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, c.byref(sd), None))
+        observe("open-sd", sd)
         name = ("seed-close-" if seed else "reader-close-") + uuid.uuid4().hex
         root = relative(parent_handle, name, create=True, security=sd)
         work = parent.rstrip("\\") + "\\" + name
+        observe("open-root", root)
         # Before launch: close non-owning setup resources, retain native root+parent.
-        k.LocalFree(sd); sd = P()
-        close(token); token = H()
+        consumed, sd = sd, None
+        free(consumed, "sd")
+        consumed, token = token, None
+        close(consumed, "token")
         env = dict(os.environ, TEMP=work, TMP=work, TMPDIR=work)
         # Provider is checked natively above; seed wmain takes ROOT only.
         command = [binary, work, *args] if seed else [binary, work, provider, *args]
         child = subprocess.Popen(command, env=env, shell=False)
+        observe("child-started", child.pid)
         try:
             result = child.wait(timeout=285 if seed else 45)
         except subprocess.TimeoutExpired:
@@ -158,16 +244,36 @@ def run_fixture(binary, parent, provider, args, *, seed=False):
             result = 124
         if result:
             raise subprocess.CalledProcessError(result, command)
+    except BaseException as error:
+        first.caught(error)
     finally:
-        # Also kill+wait on exceptional paths; do not clean a live child's files.
-        exited = child is None or child.poll() is not None
+        # No allocation/formatting of a native diagnostic precedes these drains.
+        # Child termination must be positively established before disposal.
+        exited = child is None
+        if child is not None:
+            try:
+                exited = child.poll() is not None
+            except BaseException as error:
+                first.caught(error)
         if not exited:
             try:
                 child.kill(); child.wait(timeout=3); exited = True
-            except BaseException:
-                print("PRESERVED live child/root", child.pid, ascii(work), file=sys.stderr)
-        if sd: k.LocalFree(sd)
-        if token: close(token)
+            except BaseException as error:
+                first.caught(error)
+        # Each variable is detached BEFORE its one native release attempt.
+        # Failure of one drain cannot bypass any following owner.
+        consumed, sid = sid, None
+        if consumed:
+            try: free(consumed, "sid")
+            except BaseException as error: first.caught(error)
+        consumed, sd = sd, None
+        if consumed:
+            try: free(consumed, "sd")
+            except BaseException as error: first.caught(error)
+        consumed, token = token, None
+        if consumed:
+            try: close(consumed, "token")
+            except BaseException as error: first.caught(error)
         try:
             if root is not None and exited:
                 deadline = time.monotonic() + 5
@@ -177,6 +283,10 @@ def run_fixture(binary, parent, provider, args, *, seed=False):
                         raise RuntimeError("native cleanup bound; root preserved")
                     tag = (w.DWORD * 2)()
                     require(k.GetFileInformationByHandleEx(handle, 9, c.byref(tag), c.sizeof(tag)))
+                    # Observation follows the genuine tag query and precedes
+                    # all disposition calls in this subtree. A failed witness
+                    # adds cleanup failure; it never fabricates native success.
+                    observe("dispose-ready", handle)
                     if tag[0] & 0x10 and not tag[0] & 0x400:
                         while True:
                             buffer, io = c.create_string_buffer(65536), Io()
@@ -210,16 +320,37 @@ def run_fixture(binary, parent, provider, args, *, seed=False):
                             if remaining[0] < 0 or time.monotonic() > deadline:
                                 raise RuntimeError("native cleanup bound; root preserved")
                             owned = relative(handle, found)
-                            try: dispose(owned, depth + 1)
-                            finally: close(owned)
+                            try:
+                                observe("open-owned", owned)
+                                dispose(owned, depth + 1)
+                            except BaseException as error:
+                                first.caught(error)
+                                raise
+                            finally:
+                                consumed, owned = owned, None
+                                close(consumed, "owned")
                     delete = FileDispositionInfo(True)
                     require(k.SetFileInformationByHandle(handle, 4, c.byref(delete), c.sizeof(FileDispositionInfo)))
+                    observe("dispose", handle)
                 dispose(root)
-        except BaseException:
-            print("PRESERVED native fixture root", json.dumps(work, ensure_ascii=True), file=sys.stderr)
-            raise
+        except BaseException as error:
+            preserved = True
+            first.caught(error)
         finally:
+            consumed, root = root, None
+            if consumed is not None:
+                try: close(consumed, "root")
+                except BaseException as error: first.caught(error)
+            consumed, parent_handle = parent_handle, None
+            if consumed is not None:
+                try: close(consumed, "parent")
+                except BaseException as error: first.caught(error)
+        if not exited or preserved:
             try:
-                if root is not None: close(root)
-            finally:
-                close(parent_handle)
+                if not exited:
+                    print("PRESERVED live child/root", child.pid, ascii(work), file=sys.stderr)
+                else:
+                    print("PRESERVED native fixture root", json.dumps(work, ensure_ascii=True), file=sys.stderr)
+            except BaseException:
+                pass  # A diagnostic must never replace the first failure.
+    first.raise_after_drain()

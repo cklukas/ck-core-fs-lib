@@ -1,48 +1,34 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
-// Reuse the native fixture, not a fake provider. This TU has its own entry point.
-#define main reviewed_tree_existing_tests_main
-#include "reviewed_tree_plan_tests.cpp"
-#undef main
-#include "platform/prepared_journal_root_bridge.hpp"
-#ifndef _WIN32
-#include <dlfcn.h>
+// Genuine native fixture only; no other executable's override/allocator body.
+#include "reviewed_tree_root_cancel_fixture.hpp"
+#include "platform/journal_root_test_faults.hpp"
+#include "platform/legacy_native_fixture_observation.hpp"
+#ifndef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
+#error Rebuild the entire matching SDK and client cohort with compiled native observation
 #endif
 namespace root_cancel_hook {
 thread_local std::stop_source* armed=nullptr;
 thread_local unsigned hits=0;
 thread_local bool closed_error=false;
-std::optional<std::int64_t> close_fault(ck::files::detail::JournalRootFaultPoint point){
+std::optional<std::int64_t> close_fault(ck::files::detail::JournalRootFaultPoint point)noexcept{
     if(point==ck::files::detail::JournalRootFaultPoint::JournalClose)return 5;
     return std::nullopt;
 }
-void after_query()noexcept {
+void after_query(const ck::files::detail::LegacyNativeEvent& event)noexcept {
+    using namespace ck::files::detail;
+    if(event.operation!=LegacyNativeOperation::Query||event.phase!=LegacyNativePhase::After)return;
     if(!armed)return;
     auto* stop=armed;armed=nullptr;++hits;stop->request_stop();
 }
-#ifdef _WIN32
-BOOL WINAPI query(HANDLE h,FILE_INFO_BY_HANDLE_CLASS kind,LPVOID out,DWORD n){
-    using F=BOOL(WINAPI*)(HANDLE,FILE_INFO_BY_HANDLE_CLASS,LPVOID,DWORD);
-    static const auto real=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"GetFileInformationByHandleEx"));
-    const auto result=real(h,kind,out,n);const auto error=GetLastError();after_query();SetLastError(error);return result;
 }
-#else
-int query(int fd,struct stat* out)noexcept {
-    using F=int(*)(int,struct stat*);static const auto real=reinterpret_cast<F>(dlsym(RTLD_NEXT,"fstat"));
-    const auto result=real(fd,out);const auto error=errno;after_query();errno=error;return result;
-}
-#endif
-}
-#ifdef _WIN32
-extern "C" {decltype(&GetFileInformationByHandleEx) __imp_GetFileInformationByHandleEx=&root_cancel_hook::query;}
-#else
-extern "C" int fstat(int fd,struct stat* out)
-#ifdef __linux__
-noexcept
-#endif
-{return root_cancel_hook::query(fd,out);}
-#endif
 int main(){try{
+    constexpr auto query=detail::legacy_operation_bit(detail::LegacyNativeOperation::Query);
+    CHECK((detail::legacy_native_metadata_coverage()&query)==query);
+    CHECK((detail::legacy_native_journal_coverage()&query)==query);
+    CHECK((detail::legacy_native_scope_coverage()&query)==query);
+    const auto previous_query=detail::legacy_native_test_observer.exchange(root_cancel_hook::after_query);
+    struct RestoreQuery {detail::LegacyNativeObserver previous;~RestoreQuery(){root_cancel_hook::armed=nullptr;detail::legacy_native_test_observer.store(previous);}} restore_query{previous_query};
     for(bool during_scope:{false,true})for(bool native_close_error:{false,true}){
         if(!during_scope&&native_close_error)continue;
         Fixture fixture;auto request=fixture.request();PreparedJournalRoot::Pointer root;

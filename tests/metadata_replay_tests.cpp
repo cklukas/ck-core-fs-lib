@@ -10,6 +10,7 @@
 #include <iostream>
 #include <bit>
 #include <cstring>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,6 +22,11 @@
 #include <sddl.h>
 #include <atomic>
 #include <thread>
+#include "platform/native_close_test_faults.hpp"
+#include "windows_test_runtime_self_report.hpp"
+#ifndef CK_FS_NATIVE_CLOSE_TEST_HOOKS
+#error This native Windows fixture requires the coherent compiled native test seam
+#endif
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -33,55 +39,49 @@
 #endif
 #endif
 #ifdef _WIN32
-// Test-only import interception requests cancellation after a real native
-// target-stream write; the snapshot retains its genuine bound native readers.
+// Compiled observation of an actual provider write. The real native call
+// and its byte count/error remain authoritative; cancellation cannot replace it.
 namespace {
 std::atomic<std::stop_source*> ads_cancel_on_write{nullptr};
 FILE_ID_INFO ads_cancel_target{};
-BOOL WINAPI metadata_test_write_file(HANDLE h,LPCVOID bytes,DWORD size,LPDWORD written,LPOVERLAPPED io) {
-    using NativeWrite=BOOL(WINAPI*)(HANDLE,LPCVOID,DWORD,LPDWORD,LPOVERLAPPED);
-    static const auto native=std::bit_cast<NativeWrite>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"WriteFile"));
-    const BOOL result=native(h,bytes,size,written,io);const DWORD saved=GetLastError();
-    if(result&&ads_cancel_on_write.load(std::memory_order_acquire)) {
-        FILE_ID_INFO current{};
-        if(GetFileInformationByHandleEx(h,FileIdInfo,&current,sizeof(current))&&
-           current.VolumeSerialNumber==ads_cancel_target.VolumeSerialNumber&&
-           std::memcmp(current.FileId.Identifier,ads_cancel_target.FileId.Identifier,16)==0) {
-            if(auto* stop=ads_cancel_on_write.exchange(nullptr,std::memory_order_acq_rel))stop->request_stop();
-        }
+void metadata_test_after_write(void* raw,ck::files::detail::NativeTestIo op,bool succeeded,
+        std::uint32_t,const char* operation) noexcept {
+    if(op!=ck::files::detail::NativeTestIo::Write||!succeeded||
+       std::strcmp(operation,"metadata_channels.WriteFile")!=0||
+       !ads_cancel_on_write.load(std::memory_order_acquire))return;
+    FILE_ID_INFO current{};
+    if(GetFileInformationByHandleEx(raw,FileIdInfo,&current,sizeof(current))&&
+       current.VolumeSerialNumber==ads_cancel_target.VolumeSerialNumber&&
+       std::memcmp(current.FileId.Identifier,ads_cancel_target.FileId.Identifier,16)==0) {
+        if(auto* stop=ads_cancel_on_write.exchange(nullptr,std::memory_order_acq_rel))stop->request_stop();
     }
-    SetLastError(saved);return result;
 }
-}
-extern "C" { decltype(&WriteFile) __imp_WriteFile=&metadata_test_write_file; }
-#ifdef CK_FS_METADATA_TEST_CLOSE_FAULT
-// Test executable import replacement only. Production adapters still call the
-// native API. Consume the real handle before reporting a deterministic delayed
-// close error, then ensure cached finalization never retries that consumed ID.
-namespace {
+#if defined(CK_FS_METADATA_TEST_CLOSE_FAULT) || defined(CK_FS_NATIVE_CLOSE_TEST_HOOKS)
 std::atomic<bool> close_fault_armed{false};
 std::atomic<unsigned> close_fault_hits{0};
 FILE_ID_INFO close_fault_target{};
-BOOL WINAPI metadata_test_close_handle(HANDLE handle) {
-    using NativeClose=BOOL(WINAPI*)(HANDLE);
-    static const auto native=std::bit_cast<NativeClose>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"CloseHandle"));
-    const DWORD saved=GetLastError();bool selected=false;
+thread_local HANDLE close_fault_selected=nullptr;
+void metadata_test_before_close(void* handle,const char*,const char*) noexcept {
+    close_fault_selected=nullptr;
     if(close_fault_armed.load(std::memory_order_acquire)) {
         FILE_ID_INFO current{};
-        selected=GetFileInformationByHandleEx(handle,FileIdInfo,&current,sizeof(current))!=0&&
-            current.VolumeSerialNumber==close_fault_target.VolumeSerialNumber&&
-            std::memcmp(current.FileId.Identifier,close_fault_target.FileId.Identifier,16)==0;
+        if(GetFileInformationByHandleEx(handle,FileIdInfo,&current,sizeof(current))&&
+           current.VolumeSerialNumber==close_fault_target.VolumeSerialNumber&&
+           std::memcmp(current.FileId.Identifier,close_fault_target.FileId.Identifier,16)==0)
+            close_fault_selected=handle;
     }
-    SetLastError(saved);const auto result=native(handle);
-    if(selected&&result&&close_fault_armed.exchange(false,std::memory_order_acq_rel)) {
-        close_fault_hits.fetch_add(1,std::memory_order_relaxed);SetLastError(ERROR_WRITE_FAULT);return FALSE;
+}
+std::uint32_t metadata_test_after_close(void* handle,const char*,bool succeeded,std::uint32_t) noexcept {
+    const bool selected=std::exchange(close_fault_selected,nullptr)==handle;
+    if(selected&&succeeded&&close_fault_armed.exchange(false,std::memory_order_acq_rel)) {
+        close_fault_hits.fetch_add(1,std::memory_order_relaxed);return ERROR_WRITE_FAULT;
     }
-    return result;
+    return ERROR_SUCCESS;
 }
+#endif
 }
-extern "C" { decltype(&CloseHandle) __imp_CloseHandle=&metadata_test_close_handle; }
 #endif
-#endif
+
 using namespace ck::files;
 namespace {
 void require(bool value,const char* message) {if(!value) throw std::runtime_error(message);}
@@ -388,7 +388,7 @@ void windows_ads_source_change_and_unknown_tests() {
     require(capture_metadata_replay(opaque,policy).state()==ObservationState::Unsupported,"unknown native stream kind silently dropped");
     std::cout<<"ADS source manifest mutation with restored timestamps and unknown stream-type refusal passed\n";
 }
-#ifdef CK_FS_METADATA_TEST_CLOSE_FAULT
+#if defined(CK_FS_METADATA_TEST_CLOSE_FAULT) || defined(CK_FS_NATIVE_CLOSE_TEST_HOOKS)
 void windows_ads_close_failure_test() {
     Fixture f;auto policy=f.policy();
     const auto path=f.root+L"\\source:fault:$DATA";
@@ -1190,9 +1190,18 @@ void native_tests() {
     std::cout<<"native capture/apply/verify, ACL/xattr, identity, limits and mutation regressions passed\n";
 }
 }
-int main() {try {policy_tests();writer_finalization_tests();directory_metadata_tests();
+int main() {
 #ifdef _WIN32
-#ifdef CK_FS_METADATA_TEST_CLOSE_FAULT
+    if(!ckfs_test::report_runtime_self("metadata_replay"))return 2;
+    ck::files::detail::native_file_test_after.store(metadata_test_after_write,std::memory_order_release);
+#if defined(CK_FS_METADATA_TEST_CLOSE_FAULT) || defined(CK_FS_NATIVE_CLOSE_TEST_HOOKS)
+    ck::files::detail::native_close_test_before.store(metadata_test_before_close,std::memory_order_release);
+    ck::files::detail::native_close_test_after.store(metadata_test_after_close,std::memory_order_release);
+#endif
+#endif
+try {policy_tests();writer_finalization_tests();directory_metadata_tests();
+#ifdef _WIN32
+#if defined(CK_FS_METADATA_TEST_CLOSE_FAULT) || defined(CK_FS_NATIVE_CLOSE_TEST_HOOKS)
     windows_ads_close_failure_test();
 #endif
     windows_ads_tests();windows_ads_proof_tests();windows_ads_change_cancel_tests();windows_ads_source_change_and_unknown_tests();windows_complete_coverage_tests();strong_staging_tests();windows_acl_control_tests();rh_content_guard_tests();rh_native_retention_test();rh_retention_review_break_test();

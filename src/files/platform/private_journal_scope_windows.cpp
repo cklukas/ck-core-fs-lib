@@ -7,6 +7,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
+#include "legacy_native_fixture_windows.hpp"
 #include "native_windows_journal_volume.hpp"
 namespace ck::files::detail {
 Observation<bool> certify_journal_scope_cursor(PreparedJournalRoot& root,const DirectoryCursor& cursor) {
@@ -20,7 +21,7 @@ Observation<bool> certify_journal_scope_cursor(PreparedJournalRoot& root,const D
     const auto proof=prove_windows_journal_volume(handle);
     // Consume exactly once on every result path. Latch a close failure before
     // constructing any potentially allocating Observation/error string.
-    if(!CloseHandle(handle)) {
+    if(!::ck::files::detail::legacy_close_native_call(handle,"legacy.private_journal_scope_windows.CloseHandle.23")) {
         const auto close_code=GetLastError();
         record_prepared_journal_consumer_failure(root,ObservationState::Unknown,
             ErrorDomain::Win32,close_code,"journal_scope.cursor_close");
@@ -71,3 +72,13 @@ Observation<ScopeDirectoryCursor::Pointer> open_scope_directory_cursor(PreparedJ
     return Observation<P>::available(std::make_unique<WindowsScopeCursor>(std::move(cursor)));
 }
 }
+
+#ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS
+namespace ck::files::detail {
+// Test instrumentation closure only, not native authority/async completion.
+std::uint64_t legacy_native_scope_coverage()noexcept {
+    return legacy_operation_bit(LegacyNativeOperation::Close)|
+        legacy_operation_bit(LegacyNativeOperation::Query);
+}
+}
+#endif

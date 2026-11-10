@@ -17,7 +17,7 @@ public:
         std::string_view operation) noexcept {
         unsigned empty=0;
         if(!state_.compare_exchange_strong(empty,1,std::memory_order_acq_rel))return;
-        if(const auto pause=journal_root_test_publication_pause.load(std::memory_order_acquire))pause();
+        journal_root_failure_publication_checkpoint();
         if(state==ObservationState::Available||static_cast<unsigned>(state)>static_cast<unsigned>(ObservationState::Failed)||
             domain==ErrorDomain::None||static_cast<unsigned>(domain)>static_cast<unsigned>(ErrorDomain::NtStatus)) {
             state=ObservationState::Failed;domain=ErrorDomain::Adapter;

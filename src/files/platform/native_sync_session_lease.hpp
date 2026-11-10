@@ -7,7 +7,14 @@ namespace ck::files {class NativeHierarchyContext;namespace detail {struct Hiera
 // identity DTOs and a caller's SyncSessionBackend subclass cannot mint this brand.
 bool certify_native_sync_backend(const SyncSessionBackend&)noexcept;
 // Failure-only test boundary after genuine native validation; grants no facts.
+#if defined(CK_FS_INTERNAL_TEST_HOOKS) && CK_FS_INTERNAL_TEST_HOOKS
 inline thread_local void(*session_epoch_before_construct_test)()noexcept=nullptr;
+inline void session_epoch_before_construct_checkpoint() noexcept {
+    if(session_epoch_before_construct_test)session_epoch_before_construct_test();
+}
+#else
+inline void session_epoch_before_construct_checkpoint() noexcept {}
+#endif
 class NativeSessionLease;
 Observation<std::unique_ptr<DirectoryCursor>> open_native_session_root(const NativeSessionLease&,bool);
 class NativeSessionLease final {

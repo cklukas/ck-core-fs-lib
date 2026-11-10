@@ -4,6 +4,7 @@
 #include "held_child.hpp"
 #ifdef _WIN32
 #include "platform/native_journal_directory_bridge.hpp"
+#include "native_read_close_capture_fixture.hpp"
 #endif
 #include "metadata_semantic_digest.hpp"
 #include "native_sync_observation.hpp"
@@ -16,8 +17,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 #ifdef _WIN32
 #include <windows.h>
+#include "windows_test_runtime_self_report.hpp"
 #include <sddl.h>
 #else
 #include <fcntl.h>
@@ -37,13 +40,28 @@ std::atomic<unsigned> native_reads{0},advance_reads{0};std::atomic<bool> frame{f
 #ifdef _WIN32
 std::stop_source* cancel_read=nullptr;
 FILE_ID_INFO close_target{};std::atomic<bool> close_armed{false},close_watch{false};std::atomic<unsigned> close_hits{0},selected_closes{0};
-BOOL WINAPI watched_close(HANDLE h){using F=BOOL(WINAPI*)(HANDLE);static const auto fn=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"CloseHandle"));bool selected=false;
- if(close_watch){FILE_ID_INFO id{};selected=GetFileInformationByHandleEx(h,FileIdInfo,&id,sizeof(id))&&id.VolumeSerialNumber==close_target.VolumeSerialNumber&&!std::memcmp(id.FileId.Identifier,close_target.FileId.Identifier,16);}
- const auto result=fn(h);const auto error=GetLastError();if(selected&&result){++selected_closes;if(close_armed.exchange(false)){++close_hits;SetLastError(ERROR_READ_FAULT);return FALSE;}}SetLastError(error);return result;
+thread_local bool selected_close_pending=false;
+void capture_close_before(void* raw,const char*,const char*) noexcept {
+ selected_close_pending=false;
+ if(close_watch){FILE_ID_INFO id{};selected_close_pending=GetFileInformationByHandleEx(static_cast<HANDLE>(raw),FileIdInfo,&id,sizeof(id))&&id.VolumeSerialNumber==close_target.VolumeSerialNumber&&!std::memcmp(id.FileId.Identifier,close_target.FileId.Identifier,16);}
 }
+std::uint32_t capture_close_after(void*,const char*,bool succeeded,std::uint32_t) noexcept {
+ const bool selected=std::exchange(selected_close_pending,false);
+ if(selected&&succeeded){++selected_closes;if(close_armed.exchange(false)){++close_hits;return ERROR_READ_FAULT;}}
+ return 0; // A native failure is never replaced; the adapter retains its exact error.
+}
+
 #endif
 #ifdef _WIN32
-BOOL WINAPI watched_read(HANDLE h,LPVOID bytes,DWORD n,LPDWORD copied,LPOVERLAPPED io){using F=BOOL(WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED);static const auto fn=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"ReadFile"));++native_reads;if(frame){++advance_reads;check(n<=frame_limit,"native read exceeded configured chunk");}const auto result=fn(h,bytes,n,copied,io);const auto error=GetLastError();if(cancel_read&&frame){auto* s=cancel_read;cancel_read=nullptr;s->request_stop();}SetLastError(error);return result;}
+std::atomic<bool> native_read_violation{false};
+void capture_read_after(void*,detail::NativeReadPhase phase,std::uint32_t requested,std::uint32_t,bool,std::uint32_t,const char*) noexcept {
+ if(phase!=detail::NativeReadPhase::Request)return;
+ ++native_reads;
+ if(frame){++advance_reads;if(requested>frame_limit)native_read_violation=true;}
+
+ if(cancel_read&&frame){auto* source=cancel_read;cancel_read=nullptr;source->request_stop();}
+}
+
 #endif
 #ifndef _WIN32
 std::atomic<bool> close_armed{false},close_watch{false};std::atomic<unsigned> close_hits{0},selected_closes{0};dev_t close_device{};ino_t close_inode{};
@@ -83,7 +101,11 @@ struct Fixture{
 #endif
 MetadataReplayPolicy policy(bool full=false){MetadataReplayPolicy p;p.scope=full?RegularMetadataScope::CompleteMetadataV1:RegularMetadataScope::OrdinaryCallerVisibleV1;p.ownership=MetadataOwnership::Original;p.allow_privilege_metadata=full;return p;}
 MetadataCaptureLimits limits(){MetadataCaptureLimits p;p.read.max_bytes=1024;return p;}
-Observation<MetadataCaptureAdvance> advance(MetadataCaptureJob&j,std::stop_token stop={}){advance_reads=0;frame_limit=1024;frame=true;auto r=j.advance(stop);frame=false;check(advance_reads<=1,"more than one actual native read/advance");if(r.value()){check(r.value()->content_reads<=1&&r.value()->content_bytes<=1024,"advance reported unbounded I/O");
+Observation<MetadataCaptureAdvance> advance(MetadataCaptureJob&j,std::stop_token stop={}){advance_reads=0;frame_limit=1024;frame=true;auto r=j.advance(stop);frame=false;
+#ifdef _WIN32
+check(!native_read_violation,"native read exceeded configured chunk");
+#endif
+check(advance_reads<=1,"more than one actual native read/advance");if(r.value()){check(r.value()->content_reads<=1&&r.value()->content_bytes<=1024,"advance reported unbounded I/O");
  check(r.value()->content_reads>=advance_reads,"hidden native bulk read in metadata/finalization phase");
  }return r;}
 std::shared_ptr<const NativeMetadataProof> drain(MetadataCaptureJob&job){for(unsigned i=0;i<100000;++i){take(advance(job));if(job.progress().phase==MetadataCapturePhase::Complete)return take(job.result());}throw std::runtime_error("progressive producer did not finish");}
@@ -173,12 +195,17 @@ struct Privilege{HANDLE token=nullptr;TOKEN_PRIVILEGES old{};bool enabled=false;
 #endif
 }
 #ifdef _WIN32
-extern "C" {decltype(&ReadFile) __imp_ReadFile=&watched_read;decltype(&CloseHandle) __imp_CloseHandle=&watched_close;}
+// Native callbacks are installed by main; no Windows import replacement.
 #else
 extern "C" ssize_t pread(int fd,void* data,size_t n,off_t offset){return watched_pread(fd,data,n,offset);}
 extern "C" int close(int fd){return watched_close(fd);}
 #endif
-int main(){try{
+int main(){
+#ifdef _WIN32
+ if(!ckfs_test::report_runtime_self("metadata-capture"))return 1;
+ NativeCaptureFixtureScope native_capture_scope(capture_read_after,capture_close_before,capture_close_after);
+#endif
+try {
 #ifdef __APPLE__
  if(std::getenv("CK_METADATA_CAPTURE_NOOWNERS")){noowners_negative();return 0;}
 #endif

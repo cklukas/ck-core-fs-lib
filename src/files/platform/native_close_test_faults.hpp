@@ -24,6 +24,29 @@ inline void observe_native_file_before(void* handle,NativeTestIo op,std::uint32_
 inline void observe_native_file_after(void* handle,NativeTestIo op,bool succeeded,std::uint32_t error,const char* operation)noexcept {
  if(const auto f=native_file_test_after.load(std::memory_order_acquire))f(handle,op,succeeded,error,operation);
 }
+// One Request per real ReadFile; Completion only when that I/O completes (or
+// its immediate native failure). FALSE/ERROR_IO_PENDING is Request only. Drain
+// describes the real cancellation/wait result; it is not a successful proof.
+// Pending is a real GetOverlappedResult FALSE/ERROR_IO_INCOMPLETE, not completion.
+enum class NativeReadPhase {Request,Pending,Completion,Drain};
+// copied is meaningful only for succeeded; zero otherwise, never pending data.
+// Read-only post-native detail. Counts are values, not writable buffers or
+// result pointers. Observers may arm a later allocator failure or cancellation;
+// they cannot skip I/O, supply bytes, replace success, or throw across this ABI.
+using NativeReadAfter=void(*)(void*,NativeReadPhase,std::uint32_t,std::uint32_t,bool,std::uint32_t,const char*) noexcept;
+inline std::atomic<NativeReadAfter> native_read_test_after{nullptr};
+inline void observe_native_read_after(void* handle,NativeReadPhase phase,std::uint32_t requested,std::uint32_t copied,
+                                     bool succeeded,std::uint32_t error,const char* operation)noexcept {
+ if(const auto f=native_read_test_after.load(std::memory_order_acquire))f(handle,phase,requested,copied,succeeded,error,operation);
+}
+#ifdef _WIN32
+// Private hooks-only regression access to the EXACT adapter helpers. These
+// functions do not mint filesystem authority, substitute results, or reopen
+// addresses; fixtures supply their own genuine native handles. No C ABI/export.
+bool probe_native_capture_read(void*,void*,std::uint32_t,std::uint32_t*,void* overlapped=nullptr) noexcept;
+bool probe_native_capture_read_completion(void*,void*,std::uint32_t,std::uint32_t*,bool,NativeReadPhase) noexcept;
+bool probe_native_capture_close(void*) noexcept;
+#endif
 using NativeCloseBefore=void(*)(void*,const char*,const char*) noexcept;
 using NativeCloseAfter=std::uint32_t(*)(void*,const char*,bool,std::uint32_t) noexcept;
 inline std::atomic<NativeCloseBefore> native_close_test_before{nullptr};
@@ -45,6 +68,8 @@ inline std::uint32_t inject_native_close_failure(void* handle,const char* operat
 inline void observe_native_test_io(NativeTestIo)noexcept{}
 inline void observe_native_file_before(void*,NativeTestIo,std::uint32_t,const char*)noexcept{}
 inline void observe_native_file_after(void*,NativeTestIo,bool,std::uint32_t,const char*)noexcept{}
+enum class NativeReadPhase {Request,Pending,Completion,Drain};
+inline void observe_native_read_after(void*,NativeReadPhase,std::uint32_t,std::uint32_t,bool,std::uint32_t,const char*)noexcept{}
 struct NativeCloseRoleScope final {explicit NativeCloseRoleScope(const char*)noexcept{}};
 inline void observe_native_close(void*,const char*)noexcept{}
 inline std::uint32_t inject_native_close_failure(void*,const char*,bool,std::uint32_t)noexcept{return 0;}

@@ -2,6 +2,13 @@
 
 ## Unreleased 0.5 development checkpoint
 
+- Replace the remaining unsafe Windows fixture interception with compiled,
+  read-only native observations; retain all fourteen legacy entrypoints and
+  real read/completion/drain error channels. Guard private fault storage with
+  BUILD_TESTING and match installed test-client profiles explicitly. The
+  combined source passes 67 normal macOS SDK tests and five installed consumers;
+  full Windows, sanitizer and production-OFF qualification remains open.
+
 - Replace the Copy, target-read Seed, Sync and held-journal-reader Windows
   close fault imports with compiled observers after genuine native operations.
   Qualify 80 focused cases on NTFS/ReFS in each normal and matching ASan mode,

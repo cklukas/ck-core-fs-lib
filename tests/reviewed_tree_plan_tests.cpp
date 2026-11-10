@@ -21,6 +21,8 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include "windows_test_runtime_self_report.hpp"
+#include "native_read_close_capture_fixture.hpp"
 #include <winternl.h>
 #include <sddl.h>
 #include <bit>
@@ -51,28 +53,55 @@ extern "C" int fsync(int fd) {
 }
 #endif
 namespace tree_capture_test {
-thread_local bool step=false,violation=false,arm_close=false,watch_close=false,oom_on_read=false,fail_alloc=false,oom_on_close=false,defer_debug_proxy=false;
-thread_local std::size_t reads=0,total_reads=0,chunk=0,close_faults=0,closed_views=0,skip_closes=0;
+thread_local bool step=false,violation=false,arm_close=false,watch_close=false,oom_on_read=false,fail_alloc=false,oom_on_close=false;
+thread_local std::size_t ordinary_new_denials=0,reads=0,total_reads=0,chunk=0,close_faults=0,closed_views=0,skip_closes=0;
+thread_local bool inside_job_advance=false,deferred_bound_violation=false;
+thread_local std::size_t ordinary_new_in_job=0,ordinary_new_outside_job=0;
+// Only this no-allocation scope marks actual SDK execution. It restores both
+// flags during unwinding, BEFORE fixture CHECK/take/diagnostic code can run.
+struct JobAdvanceScope final {
+    bool previous_step=step,previous_inside=inside_job_advance;
+    JobAdvanceScope()noexcept {step=true;inside_job_advance=true;}
+    ~JobAdvanceScope()noexcept {
+        deferred_bound_violation=deferred_bound_violation||reads>1||violation;
+        inside_job_advance=previous_inside;step=previous_step;
+    }
+    JobAdvanceScope(const JobAdvanceScope&)=delete;
+    JobAdvanceScope& operator=(const JobAdvanceScope&)=delete;
+};
+// A fixture diagnostic is not SDK allocation even if a test callback happens
+// to call CHECK/take from inside an SDK frame. Never clear the denial itself.
+struct FixtureDiagnosticScope final {
+    bool previous_inside=inside_job_advance;
+    FixtureDiagnosticScope()noexcept {inside_job_advance=false;}
+    ~FixtureDiagnosticScope()noexcept {inside_job_advance=previous_inside;}
+};
 thread_local std::stop_source* cancel=nullptr;
 #ifdef _WIN32
 FILE_ID_INFO target{};
-BOOL WINAPI read(HANDLE h,LPVOID data,DWORD n,LPDWORD copied,LPOVERLAPPED io){
-    using F=BOOL(WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED);
-    static const auto real=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"ReadFile"));
-    if(step){++reads;++total_reads;violation=violation||n>chunk;}
-    const auto result=real(h,data,n,copied,io);const auto e=GetLastError();
-    if(step&&oom_on_read){oom_on_read=false;fail_alloc=true;defer_debug_proxy=true;}
-    if(step&&cancel){auto* saved=cancel;cancel=nullptr;saved->request_stop();}SetLastError(e);return result;
+void capture_read_after(void*,ck::files::detail::NativeReadPhase phase,std::uint32_t requested,std::uint32_t,bool succeeded,std::uint32_t,const char*) noexcept {
+    if(phase==ck::files::detail::NativeReadPhase::Request){
+        if(step){++reads;++total_reads;violation=violation||requested>chunk;}
+        if(step&&cancel){auto* saved=cancel;cancel=nullptr;saved->request_stop();}
+    }
+    if(phase==ck::files::detail::NativeReadPhase::Completion&&succeeded&&step&&oom_on_read){oom_on_read=false;fail_alloc=true;}
 }
-BOOL WINAPI close(HANDLE h){using F=BOOL(WINAPI*)(HANDLE);static const auto real=std::bit_cast<F>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"CloseHandle"));
-    bool selected=false;if(step&&(arm_close||watch_close)&&total_reads){FILE_ID_INFO id{};selected=GetFileInformationByHandleEx(h,FileIdInfo,&id,sizeof(id))&&id.VolumeSerialNumber==target.VolumeSerialNumber&&!std::memcmp(&id.FileId,&target.FileId,sizeof(id.FileId));}
-    const auto result=real(h);const auto e=GetLastError();if(selected&&result){++closed_views;if(arm_close){if(skip_closes)--skip_closes;else{arm_close=false;++close_faults;if(oom_on_close)fail_alloc=true;SetLastError(ERROR_READ_FAULT);return FALSE;}}}SetLastError(e);return result;
+thread_local bool selected_close_pending=false;
+void capture_close_before(void* raw,const char*,const char*) noexcept {
+    selected_close_pending=false;
+    if(step&&(arm_close||watch_close)&&total_reads){FILE_ID_INFO id{};selected_close_pending=GetFileInformationByHandleEx(static_cast<HANDLE>(raw),FileIdInfo,&id,sizeof(id))&&id.VolumeSerialNumber==target.VolumeSerialNumber&&!std::memcmp(&id.FileId,&target.FileId,sizeof(id.FileId));}
 }
+std::uint32_t capture_close_after(void*,const char*,bool succeeded,std::uint32_t) noexcept {
+    const bool selected=selected_close_pending;selected_close_pending=false;
+    if(selected&&succeeded){++closed_views;if(arm_close){if(skip_closes)--skip_closes;else{arm_close=false;++close_faults;if(oom_on_close)fail_alloc=true;return ERROR_READ_FAULT;}}}
+    return 0;
+}
+
 #else
 dev_t device{};ino_t inode{};
 ssize_t read(int fd,void* data,size_t n,off_t off){using F=ssize_t(*)(int,void*,size_t,off_t);static const auto real=reinterpret_cast<F>(dlsym(RTLD_NEXT,"pread"));
     if(step){++reads;++total_reads;violation=violation||n>chunk;}const auto result=real(fd,data,n,off);
-    if(step&&oom_on_read){oom_on_read=false;fail_alloc=true;defer_debug_proxy=true;}
+    if(step&&oom_on_read){oom_on_read=false;fail_alloc=true;}
     if(step&&cancel){auto* saved=cancel;cancel=nullptr;saved->request_stop();}return result;
 }
 int close(int fd){using F=int(*)(int);static const auto real=reinterpret_cast<F>(dlsym(RTLD_NEXT,"close"));bool selected=false;
@@ -82,14 +111,14 @@ int close(int fd){using F=int(*)(int);static const auto real=reinterpret_cast<F>
 #endif
 }
 void* operator new(std::size_t n){
-    bool inject=tree_capture_test::fail_alloc;
-#if defined(_MSC_VER) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL>0
-    // MSVC Debug string's noexcept default constructor allocates a proxy;
-    // failing that vendor allocation terminates rather than throwing to us.
-    // This fixture targets the next throwing APPLICATION allocation instead.
-    if(tree_capture_test::defer_debug_proxy&&n==sizeof(std::_Container_proxy))inject=false;
-#endif
-    if(inject){tree_capture_test::fail_alloc=false;tree_capture_test::defer_debug_proxy=false;throw std::bad_alloc();}
+    // Persistent ordinary new/new[] failure: reset only in the owning test
+    // after the SDK catch/drain has completed. No type/size/profile exemption.
+    if(tree_capture_test::fail_alloc){
+        ++tree_capture_test::ordinary_new_denials;
+        if(tree_capture_test::inside_job_advance)++tree_capture_test::ordinary_new_in_job;
+        else ++tree_capture_test::ordinary_new_outside_job;
+        throw std::bad_alloc();
+    }
     if(auto* p=std::malloc(n?n:1))return p;throw std::bad_alloc();
 }
 void operator delete(void* p)noexcept{std::free(p);}
@@ -100,7 +129,7 @@ void operator delete(void* p,std::size_t)noexcept{std::free(p);}
 void operator delete[](void* p,std::size_t)noexcept{std::free(p);}
 #endif
 #ifdef _WIN32
-extern "C" {decltype(&ReadFile) __imp_ReadFile=&tree_capture_test::read;decltype(&CloseHandle) __imp_CloseHandle=&tree_capture_test::close;}
+// Main installs private native observers; no Windows import replacement.
 #else
 extern "C" ssize_t pread(int fd,void* data,size_t n,off_t off){return tree_capture_test::read(fd,data,n,off);}
 extern "C" int close(int fd){return tree_capture_test::close(fd);}
@@ -145,11 +174,17 @@ namespace {
 unsigned checks = 0;
 void check(bool ok, const char* message, int line) {
     ++checks;
-    if (!ok) throw std::runtime_error(std::string("line ") + std::to_string(line) + ": " + message);
+    if (!ok) {
+        tree_capture_test::FixtureDiagnosticScope outside_sdk;
+        throw std::runtime_error(std::string("line ") + std::to_string(line) + ": " + message);
+    }
 }
 #define CHECK(x) check(bool(x), #x, __LINE__)
 template<class T> T take(Observation<T> o) {
-    if (!o.value()) throw std::runtime_error(o.unavailable_detail()->error.operation + " state=" + std::to_string(int(o.state())));
+    if (!o.value()) {
+        tree_capture_test::FixtureDiagnosticScope outside_sdk;
+        throw std::runtime_error(o.unavailable_detail()->error.operation + " state=" + std::to_string(int(o.state())));
+    }
     return std::move(o).take_value();
 }
 NativeName name(std::string s) {
@@ -1087,10 +1122,27 @@ void test_exact_names_links_and_fifo() {
 #endif
 }
 namespace {
+void check_advance_bounds() {
+    // Diagnostics are NEVER allowed while the persistent allocator is armed.
+    // The frame destructor records any violation before returning/unwinding;
+    // the owning OOM tests call this only after their explicit allocator reset.
+    if(tree_capture_test::fail_alloc){
+        tree_capture_test::deferred_bound_violation=tree_capture_test::deferred_bound_violation||tree_capture_test::reads>1||tree_capture_test::violation;
+        return; // Only POD while armed, including an accidental direct call.
+    }
+    CHECK(tree_capture_test::reads<=1);CHECK(!tree_capture_test::violation);
+    CHECK(!tree_capture_test::deferred_bound_violation);
+    tree_capture_test::deferred_bound_violation=false;
+}
 ReviewedTreeState bounded_advance(ReviewedTreePlanJob& job,std::size_t chunk,std::stop_token stop={}) {
-    tree_capture_test::reads=0;tree_capture_test::chunk=chunk;tree_capture_test::step=true;
-    ReviewedTreeState state;try{state=job.advance(stop);}catch(...){tree_capture_test::step=false;throw;}tree_capture_test::step=false;
-    CHECK(tree_capture_test::reads<=1);CHECK(!tree_capture_test::violation);return state;
+    tree_capture_test::reads=0;tree_capture_test::chunk=chunk;
+    ReviewedTreeState state;
+    {
+        tree_capture_test::JobAdvanceScope in_job;
+        state=job.advance(stop);
+    }
+    if(!tree_capture_test::fail_alloc)check_advance_bounds();
+    return state;
 }
 void bounded_preview(ReviewedTreePlanJob& job,std::size_t chunk) {
     for(unsigned i=0;i<500000&&job.state()==ReviewedTreeState::Inventory;++i)bounded_advance(job,chunk);
@@ -1225,10 +1277,14 @@ void test_progressive_exception(){
     auto root=take(acquire_native_journal_root(*request.journal_root));request.prepared_journal_root=root;
     std::weak_ptr<const HeldChild> source_root=request.source_root,destination_root=request.destination_root;
     auto job=take(ReviewedTreePlanJob::create(std::move(request)));select_close_target(f.path("s/a"));
-    tree_capture_test::closed_views=0;tree_capture_test::total_reads=0;tree_capture_test::watch_close=true;tree_capture_test::oom_on_read=true;bool threw=false;
+    tree_capture_test::closed_views=0;tree_capture_test::total_reads=0;tree_capture_test::watch_close=true;tree_capture_test::ordinary_new_denials=0;
+    tree_capture_test::ordinary_new_in_job=0;tree_capture_test::ordinary_new_outside_job=0;tree_capture_test::oom_on_read=true;bool threw=false;
     try{for(unsigned i=0;i<10000&&job->state()<ReviewedTreeState::Complete;++i)bounded_advance(*job,31);}catch(const std::bad_alloc&){threw=true;}
-    tree_capture_test::watch_close=false;tree_capture_test::fail_alloc=false;tree_capture_test::defer_debug_proxy=false;tree_capture_test::oom_on_read=false;
-    CHECK(threw);CHECK(tree_capture_test::closed_views>0);CHECK(source_root.expired()&&destination_root.expired());
+    tree_capture_test::watch_close=false;tree_capture_test::fail_alloc=false;tree_capture_test::oom_on_read=false;
+    check_advance_bounds();CHECK(!tree_capture_test::inside_job_advance);
+    CHECK(tree_capture_test::ordinary_new_outside_job==0);CHECK(tree_capture_test::ordinary_new_in_job>0);
+    CHECK(tree_capture_test::ordinary_new_denials==tree_capture_test::ordinary_new_in_job+tree_capture_test::ordinary_new_outside_job);
+    CHECK(threw);CHECK(tree_capture_test::ordinary_new_denials>0);CHECK(tree_capture_test::closed_views>0);CHECK(source_root.expired()&&destination_root.expired());
     CHECK(job->state()==ReviewedTreeState::Failed);CHECK(take(root->finish_io()));
     std::printf("progressive Scanner allocation exception after actual native read explicitly drains source owners PASS\n");
 }
@@ -1241,9 +1297,14 @@ void test_original_scan_close(bool oom=false){
     for(unsigned i=0;i<10000&&!tree_capture_test::total_reads&&job->state()==ReviewedTreeState::Inventory;++i)bounded_advance(*job,31);
     CHECK(tree_capture_test::total_reads>0&&job->state()==ReviewedTreeState::Inventory);
     tree_capture_test::closed_views=0;tree_capture_test::close_faults=0;tree_capture_test::skip_closes=1;tree_capture_test::arm_close=true;
-    std::stop_source stop;stop.request_stop();tree_capture_test::oom_on_close=oom;bool threw=false;
+    std::stop_source stop;stop.request_stop();tree_capture_test::ordinary_new_denials=0;
+    tree_capture_test::ordinary_new_in_job=0;tree_capture_test::ordinary_new_outside_job=0;tree_capture_test::oom_on_close=oom;bool threw=false;
     try{bounded_advance(*job,31,stop.get_token());}catch(const std::bad_alloc&){threw=true;}
-    tree_capture_test::arm_close=false;tree_capture_test::oom_on_close=false;tree_capture_test::fail_alloc=false;CHECK(threw==oom);
+    tree_capture_test::arm_close=false;tree_capture_test::oom_on_close=false;tree_capture_test::fail_alloc=false;
+    check_advance_bounds();CHECK(!tree_capture_test::inside_job_advance);
+    CHECK(tree_capture_test::ordinary_new_outside_job==0);CHECK(!oom||tree_capture_test::ordinary_new_in_job>0);
+    CHECK(tree_capture_test::ordinary_new_denials==tree_capture_test::ordinary_new_in_job+tree_capture_test::ordinary_new_outside_job);
+    CHECK(threw==oom);CHECK(!oom||tree_capture_test::ordinary_new_denials>0);
     CHECK(tree_capture_test::close_faults==1&&tree_capture_test::closed_views>=2);CHECK(job->state()==ReviewedTreeState::NeedsReconciliation);
     CHECK(source_root.expired()&&destination_root.expired());detail::PreparedJournalConsumerFailure failure;
     CHECK(detail::read_prepared_journal_consumer_failure(*root,failure));
@@ -1394,6 +1455,11 @@ void test_mac_plan_validation(){
 #endif
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+ if(!ckfs_test::report_runtime_self("reviewed-tree"))return 1;
+    NativeCaptureFixtureScope native_capture_scope(tree_capture_test::capture_read_after,
+        tree_capture_test::capture_close_before,tree_capture_test::capture_close_after);
+#endif
     try {
         if(argc==2&&std::string_view(argv[1])=="--loss-main") {test_explicit_loss_main();test_loss_root_close();std::printf("explicit loss Scanner: %u checks passed\n",checks);return 0;}
         if(argc==2&&std::string_view(argv[1])=="--progressive-metadata") {
