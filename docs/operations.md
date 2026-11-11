@@ -26,6 +26,15 @@ planning suite do not establish a platform's mutation capabilities. Consult the
 [revision-specific evidence](validation-2026-11-02.md): the macOS strong
 publication gate remains open, so its positive copy qualification is failing.
 
+## Coordinator ledger inventory
+
+Linux checks for ledger directory changes with inotify on the held private
+root. The watch requires inotify, openat2, and a verified procfs view of the
+worker's descriptor table. macOS checks the held directory with kqueue.
+These platforms refuse the inventory if the watch cannot be established,
+reports a change, or loses coverage. The existing root identity and directory
+version checks also apply through the end of the scan.
+
 ## Available in the first C ABI revision
 
 - Engine creation and deterministic API/state names.
