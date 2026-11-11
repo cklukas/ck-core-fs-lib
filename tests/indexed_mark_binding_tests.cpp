@@ -76,6 +76,10 @@ void create_file(const DirectoryCursor &directory, const NativeName &entry) {
     (void)take(file->finish_content_writes());
 }
 
+std::unique_ptr<DirectoryCursor> rescan(const IndexedPane &pane) {
+    return take(DirectoryCursor::open_read_only_scan(take(pane.hold_directory(pane.state_stamp()))));
+}
+
 void run(const std::filesystem::path &fixture) {
     NativeFileSystem fs;
     auto parent = take(fs.open_native_directory(address(fixture)));
@@ -134,7 +138,7 @@ void run(const std::filesystem::path &fixture) {
 
     create_file(*source, name("earlier", u"earlier"));
     IndexedPane refreshed(1);
-    list(refreshed, take(fs.open_native_directory(source_path)), factory, budget, std::byte{2});
+    list(refreshed, rescan(pane), factory, budget, std::byte{2});
     const auto previous_stamp = pane.state_stamp();
     const auto candidate_stamp = refreshed.state_stamp();
     check(!refreshed.reconcile_refresh_selection(pane, previous_stamp, candidate_stamp, stop.get_token()).value(),
@@ -143,6 +147,8 @@ void run(const std::filesystem::path &fixture) {
           "cancel leaves both panes unchanged");
     check(take(refreshed.reconcile_refresh_selection(pane, previous_stamp, candidate_stamp)), "reconcile fresh scan");
     check(previous_stamp.current() && !candidate_stamp.current(), "revoke only the changed candidate");
+    check(take(pane.hold_directory(previous_stamp)) == take(refreshed.hold_directory(refreshed.state_stamp())),
+          "keep the original parent anchor");
     const auto page = refreshed.capture_page(refreshed.state_stamp(), 0).page;
     check(page && page->rows().size() == 3 && page->rows()[0].display_name == "earlier" &&
           page->rows()[2].display_name == "two" && page->rows()[2].id.scope != second.scope &&
@@ -165,7 +171,7 @@ void run(const std::filesystem::path &fixture) {
         IndexedPane hidden(1);
         PaneView filtered;
         filtered.display_substring = "earlier";
-        list(hidden, take(fs.open_native_directory(source_path)), factory, budget, std::byte{4}, filtered);
+        list(hidden, rescan(refreshed), factory, budget, std::byte{4}, filtered);
         check(take(hidden.reconcile_refresh_selection(refreshed, refreshed.state_stamp(), hidden.state_stamp())),
               "reconcile another scan");
         const auto selected = hidden.selection();
@@ -182,7 +188,7 @@ void run(const std::filesystem::path &fixture) {
     create_file(*source, name("one", u"one"));
     {
         IndexedPane replaced(1);
-        list(replaced, take(fs.open_native_directory(source_path)), factory, budget, std::byte{5});
+        list(replaced, rescan(refreshed), factory, budget, std::byte{5});
         check(take(replaced.reconcile_refresh_selection(refreshed, refreshed.state_stamp(), replaced.state_stamp())),
               "reconcile a replaced mark");
         const auto selected = replaced.selection();
