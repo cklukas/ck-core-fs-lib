@@ -48,6 +48,9 @@ struct NativeArchiveProgress final {
 // durable journals remain visible evidence; anonymous hints are never I/O.
 class NativeArchiveWriteJob final {
 public:
+    // Memory-only platform check. A positive result identifies an implemented
+    // route. The held destination still requires native provider admission.
+    static bool platform_supports_publication() noexcept;
     static Observation<std::unique_ptr<NativeArchiveWriteJob>> begin(NativeArchiveWriteRequest);
     ~NativeArchiveWriteJob();
     NativeArchiveWriteJob(const NativeArchiveWriteJob&)=delete;

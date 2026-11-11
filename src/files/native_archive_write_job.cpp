@@ -174,6 +174,13 @@ struct NativeArchiveWriteJob::Impl final:MetadataCaptureFailureLatch {
 };
 NativeArchiveWriteJob::NativeArchiveWriteJob(std::unique_ptr<Impl> p):impl_(std::move(p)){}
 NativeArchiveWriteJob::~NativeArchiveWriteJob(){finish_io();}
+bool NativeArchiveWriteJob::platform_supports_publication() noexcept {
+#if defined(__linux__) || defined(_WIN32)
+    return true;
+#else
+    return false;
+#endif
+}
 Observation<std::unique_ptr<NativeArchiveWriteJob>> NativeArchiveWriteJob::begin(NativeArchiveWriteRequest r){
     using R=Observation<std::unique_ptr<NativeArchiveWriteJob>>;
     const auto bad=[](const char* op){return R::unavailable(ObservationState::Failed,{ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidLimit),op});};
@@ -183,6 +190,10 @@ Observation<std::unique_ptr<NativeArchiveWriteJob>> NativeArchiveWriteJob::begin
     std::uint64_t end=0,total=0;
     for(const auto& e:r.extents){if(e.bytes.empty()||e.offset<end||e.offset>r.logical_size||e.bytes.size()>r.logical_size-e.offset||
         e.bytes.size()>r.max_recipe_bytes-total)return bad("archive.extents");end=e.offset+e.bytes.size();total+=e.bytes.size();}
+    if (!platform_supports_publication())
+        return R::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery),
+             "create_staging_file.fd_publication_unqualified"});
     auto scope=JournalScopeGuard::create_for_namespace_child(r.journal_root,r.destination);if(!scope.value())return R::unavailable(scope.state(),scope.unavailable_detail()->error);
     auto journal=OperationJournal::create(FileOperation::Copy,r.journal_id,r.journal_limits);if(!journal.value())return R::unavailable(journal.state(),journal.unavailable_detail()->error);
     auto p=std::make_unique<Impl>(std::move(r));p->scope=std::move(scope).take_value();p->journal=std::move(journal).take_value();
