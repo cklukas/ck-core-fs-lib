@@ -144,6 +144,7 @@ endif()
 
 add_library(ck_files_platform STATIC)
 target_sources(ck_files_platform PRIVATE
+  src/files/native_operation_journal_id.cpp
   src/files/native_operation_copy_job.cpp
   src/files/native_operation_move_job.cpp
   src/files/regular_metadata_preservation.cpp

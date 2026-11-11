@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_sync_coordinator.hpp"
 #include "native_sync_internal.hpp"
+#include "native_operation_journal_id.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
 #include "native_filesystem.hpp"
 #include "retained_target.hpp"
@@ -19,37 +20,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <bcrypt.h>
 #else
 #include <sys/stat.h>
-#if !defined(__APPLE__)
-#include <sys/random.h>
-#include <cerrno>
-#endif
-#include <cstdlib>
 #endif
 namespace ck::files {
 namespace {
 using namespace sync_detail;
 SyncDigest policy_digest(const NativeSyncCoordinatorRequest& r) {
     return native_sync_policy_binding(r.application_policy,r.metadata);
-}
-OperationJournalId random_id() {
-    OperationJournalId id;
-#ifdef _WIN32
-    if(BCryptGenRandom(nullptr,reinterpret_cast<PUCHAR>(id.bytes.data()),static_cast<ULONG>(id.bytes.size()),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)
-        fail("native_sync.random",ObservationState::Failed,AdapterError::InvalidNativeResult);
-#elif defined(__APPLE__)
-    arc4random_buf(id.bytes.data(),id.bytes.size());
-#else
-    std::size_t offset=0;
-    while(offset<id.bytes.size()) {auto n=getrandom(id.bytes.data()+offset,id.bytes.size()-offset,0);
-        if(n<0&&errno==EINTR)continue;
-        if(n<=0)fail("native_sync.random",ObservationState::Failed,AdapterError::InvalidNativeResult);
-        offset+=static_cast<std::size_t>(n);}
-#endif
-    if(std::all_of(id.bytes.begin(),id.bytes.end(),[](auto b){return b==std::byte{};}))fail("native_sync.zero_random",ObservationState::Failed,AdapterError::InvalidNativeResult);
-    return id;
 }
 NativeName generated_name(std::string prefix,OperationJournalId id,NameEncoding encoding) {
     constexpr char hex[]="0123456789abcdef";for(auto byte:id.bytes) {auto b=std::to_integer<unsigned>(byte);prefix+=hex[b>>4];prefix+=hex[b&15];}
@@ -557,7 +535,7 @@ struct NativeSyncCoordinator::State {
     void prepare_ledger(std::stop_token token) {
         revalidate_inventory(token);
         if(stored_ledger_count>=request.ledger_limits.max_ledgers)fail("native_sync.ledger_capacity_review",ObservationState::Unknown,AdapterError::InventoryLimit);
-        transaction=random_id();ledger_name=generated_name(".ck-sync-ledger-",*transaction,session->storage_root()->encoding());
+        transaction=value(new_native_operation_journal_id());ledger_name=generated_name(".ck-sync-ledger-",*transaction,session->storage_root()->encoding());
         evidence.session=session->identity();evidence.expected_generation=session->snapshot().generation;evidence.artifacts=catalog;
         // Frozen exact records, side identities/digests and directional rules
         // are durable evidence. Labels remain indices; never parsed addresses.
@@ -576,7 +554,7 @@ struct NativeSyncCoordinator::State {
         for(auto& s:selected)if(!s.skip&&(is_copy(s.action)||is_delete(s.action))) {
             const bool side=destination_right(s.action);const auto& dest=inventories[side?1:0];auto it=dest.files.find(s.key);
             if(it==dest.files.end())continue;
-            auto artifact_name=generated_name(".ck-sync-retained-",random_id(),it->second.components.back().encoding());
+            auto artifact_name=generated_name(".ck-sync-retained-",value(new_native_operation_journal_id()),it->second.components.back().encoding());
             auto native_lookup=value(dest.root->lookup_child(artifact_name,ChildLookupMode::NativeDefault));
             if(native_lookup.state()!=ChildLookupState::Missing||!native_lookup.missing_witness())fail("native_sync.artifact_name_collision");
             auto parent=NativeDurableIdentity::from_live(*dest.root_metadata.identity.value());
@@ -621,7 +599,7 @@ struct NativeSyncCoordinator::State {
     }
     void start_retention(Selected& s,std::stop_token token) {
         const bool side=destination_right(s.action);auto& old=inventories[side?1:0].files.at(s.key);
-        RetainedTargetRequest r{old.held,s.artifact->components.back(),old.status.content_digest,request.coordinator.value_or(request.left),random_id(),
+        RetainedTargetRequest r{old.held,s.artifact->components.back(),old.status.content_digest,request.coordinator.value_or(request.left),value(new_native_operation_journal_id()),
             side?request.right:request.left,[this,&old,token]{return source_guard(old,token);},request.proof_limits.chunk_bytes};
         r.prepared_journal_root=session->storage_root();
         retained=value(RetainedTarget::create(std::move(r)));stop(token);
@@ -632,7 +610,7 @@ struct NativeSyncCoordinator::State {
         auto& dest=inventories[side?1:0];auto policy=value(RegularMetadataPreservation::create_with_policy(source.held,false,request.metadata,token));
         if(!policy->captured_metadata()||value(native_sync_metadata_digest(*source.native_source,*policy->captured_metadata(),token))!=source.status.required_metadata_digest||
             !native_sync_same_version(source.metadata.basic,policy->captured_metadata()->basic))fail("native_sync.metadata_review_changed");
-        auto id=random_id();auto name=generated_name(".ck-sync-copy-",id,session->storage_root()->encoding());
+        auto id=value(new_native_operation_journal_id());auto name=generated_name(".ck-sync-copy-",id,session->storage_root()->encoding());
         auto f=value(open_prepared_operation_journal_file(*session->storage_root(),name,true));auto j=value(OperationJournal::create(FileOperation::Copy,id));
         require(append_operation_journal_file(*f,*j,{1,0,OperationJournalState::Planned,{}}));
         NativeOperationCopyRequest r{

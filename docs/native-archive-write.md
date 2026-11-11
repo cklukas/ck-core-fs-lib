@@ -70,6 +70,11 @@ extent bytes written; `verified_bytes` counts full logical bytes read back.
 
 ## Journal and publication
 
+Use `new_native_operation_journal_id()` on the worker for each new operation.
+It returns a nonzero 128-bit ID from system entropy on Linux, macOS and
+Windows, or the native failure. The private root still creates the journal
+exclusively, so an existing record cannot be overwritten.
+
 The journal progresses through `Planned`, `Prepared`, `Copied`, `Verified`,
 `CommitIntended`, `DestinationCommitted` and `Complete`, with the required
 journal durability barriers. The stage is flushed before verification and

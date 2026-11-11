@@ -4,6 +4,7 @@
 #include "native_sync_resolution.hpp"
 #include "directory_name_rules.hpp"
 #include "native_sync_internal.hpp"
+#include "native_operation_journal_id.hpp"
 #include "platform/prepared_journal_root_bridge.hpp"
 #include "native_filesystem.hpp"
 #include "retained_target.hpp"
@@ -20,37 +21,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <bcrypt.h>
 #else
 #include <sys/stat.h>
-#if !defined(__APPLE__)
-#include <sys/random.h>
-#include <cerrno>
-#endif
-#include <cstdlib>
 #endif
 namespace ck::files {
 namespace {
 using namespace sync_detail;
 SyncDigest policy_digest(const NativeSyncCoordinatorRequest& r) {
     return native_sync_policy_binding(r.application_policy,r.metadata);
-}
-OperationJournalId random_id() {
-    OperationJournalId id;
-#ifdef _WIN32
-    if(BCryptGenRandom(nullptr,reinterpret_cast<PUCHAR>(id.bytes.data()),static_cast<ULONG>(id.bytes.size()),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)
-        fail("native_sync.random",ObservationState::Failed,AdapterError::InvalidNativeResult);
-#elif defined(__APPLE__)
-    arc4random_buf(id.bytes.data(),id.bytes.size());
-#else
-    std::size_t offset=0;
-    while(offset<id.bytes.size()) {auto n=getrandom(id.bytes.data()+offset,id.bytes.size()-offset,0);
-        if(n<0&&errno==EINTR)continue;
-        if(n<=0)fail("native_sync.random",ObservationState::Failed,AdapterError::InvalidNativeResult);
-        offset+=static_cast<std::size_t>(n);}
-#endif
-    if(std::all_of(id.bytes.begin(),id.bytes.end(),[](auto b){return b==std::byte{};}))fail("native_sync.zero_random",ObservationState::Failed,AdapterError::InvalidNativeResult);
-    return id;
 }
 NativeName generated_name(std::string prefix,OperationJournalId id,NameEncoding encoding) {
     constexpr char hex[]="0123456789abcdef";for(auto byte:id.bytes) {auto b=std::to_integer<unsigned>(byte);prefix+=hex[b>>4];prefix+=hex[b&15];}
@@ -355,7 +333,7 @@ struct NativeSyncResolution::State final : MetadataCaptureFailureLatch {
     }
     std::shared_ptr<NativeSyncResolutionReceiptState> assess(std::span<const NativeSyncNamedResolution> choices,std::stop_token token) {
         active();if(result.state!=NativeSyncCoordinatorState::AwaitingReview||choices.empty()||choices.size()>limits.max_resolutions||choices.size()>limits.max_added_paths/2||choices.size()>limits.max_protected_objects/2)fail("resolution.choice_bound",ObservationState::Failed,AdapterError::InvalidLimit);
-        fresh(token);revision=std::make_shared<const int>(0);auto id=random_id();auto receipt=std::make_shared<NativeSyncResolutionReceiptState>(generated_name(".ck-sync-ledger-",id,session->storage_root()->encoding()));
+        fresh(token);revision=std::make_shared<const int>(0);auto id=value(new_native_operation_journal_id());auto receipt=std::make_shared<NativeSyncResolutionReceiptState>(generated_name(".ck-sync-ledger-",id,session->storage_root()->encoding()));
         receipt->owner=owner;receipt->revision=revision;receipt->identity=session->identity();receipt->generation=session->snapshot().generation;receipt->transaction=id;
         auto& e=receipt->evidence;e.session=session->identity();e.expected_generation=receipt->generation;e.artifacts=catalog;
         // Every retained baseline key keeps its separate native component
@@ -433,7 +411,7 @@ struct NativeSyncResolution::State final : MetadataCaptureFailureLatch {
         auto policy=value(RegularMetadataPreservation::create_with_policy(source.held,false,request.metadata,token));
         if(!source.native_source||!policy->captured_metadata()||value(native_sync_metadata_digest(*source.native_source,*policy->captured_metadata(),token))!=source.status.required_metadata_digest||!native_sync_same_version(source.metadata.basic,policy->captured_metadata()->basic))fail("resolution.metadata_changed");
         copy_metadata=policy;published_object.reset();
-        auto id=random_id();auto jf=value(open_prepared_operation_journal_file(*session->storage_root(),generated_name(".ck-resolution-copy-",id,session->storage_root()->encoding()),true));auto journal=value(OperationJournal::create(FileOperation::Copy,id));require(append_operation_journal_file(*jf,*journal,{1,0,OperationJournalState::Planned,{}}));
+        auto id=value(new_native_operation_journal_id());auto jf=value(open_prepared_operation_journal_file(*session->storage_root(),generated_name(".ck-resolution-copy-",id,session->storage_root()->encoding()),true));auto journal=value(OperationJournal::create(FileOperation::Copy,id));require(append_operation_journal_file(*jf,*journal,{1,0,OperationJournalState::Planned,{}}));
         NativeOperationCopyRequest r{.journal=journal,.journal_file=std::shared_ptr<OperationJournalFile>(std::move(jf)),.item=0,
             .source_parent=source.held->parent(),.source_parent_identity=*source.held->parent_identity().value(),.source_name=source.components.back(),.source_identity=*source.metadata.basic.identity.value(),
             .destination=dest.root,.destination_identity=*dest.root_metadata.identity.value(),.destination_address=op.destination_right?request.right:request.left,
