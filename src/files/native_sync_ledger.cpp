@@ -15,13 +15,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
-#ifdef __linux__
-#include "platform/linux_anonymous_staging.hpp"
+#if defined(__linux__) || defined(__APPLE__)
 #include <cerrno>
 #include <fcntl.h>
+#include <utility>
+#endif
+#ifdef __linux__
+#include "platform/linux_anonymous_staging.hpp"
 #include <poll.h>
 #include <sys/inotify.h>
-#include <utility>
+#elif defined(__APPLE__)
+#include <sys/event.h>
 #endif
 #include <algorithm>
 #include <limits>
@@ -30,7 +34,7 @@ namespace ck::files {
 namespace {
 using namespace sync_detail;
 using Wire=std::vector<std::byte>;
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 [[noreturn]] void ledger_watch_error(int code, const char* operation) {
     auto state = ObservationState::Failed;
     if (code == EACCES || code == EPERM)
@@ -65,7 +69,9 @@ private:
     PreparedJournalRoot& root_;
     int fd_;
 };
+#endif
 
+#ifdef __linux__
 int start_linux_ledger_watch(PreparedJournalRoot& root) {
     LedgerWatchFd directory(root, value(detail::duplicate_prepared_journal_directory(root)));
     LedgerWatchFd proc(root, value(detail::open_linux_thread_fd_directory()));
@@ -115,6 +121,50 @@ void finish_linux_ledger_watch(LedgerWatchFd& watch, std::stop_token token) {
         return;
     }
 }
+#elif defined(__APPLE__)
+class MacLedgerDirectoryWatch final {
+public:
+    explicit MacLedgerDirectoryWatch(PreparedJournalRoot& root)
+        : directory_(root, value(detail::duplicate_prepared_journal_directory(root))),
+          queue_(root, ::kqueue()) {
+        if (queue_.get() < 0)
+            ledger_watch_error(errno, "native_sync.ledger_watch_create");
+        if (::fcntl(queue_.get(), F_SETFD, FD_CLOEXEC) < 0)
+            ledger_watch_error(errno, "native_sync.ledger_watch_cloexec");
+
+        struct kevent watch{};
+        constexpr unsigned events = NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK |
+            NOTE_RENAME | NOTE_DELETE | NOTE_REVOKE;
+        EV_SET(&watch, static_cast<std::uintptr_t>(directory_.get()), EVFILT_VNODE,
+               EV_ADD | EV_CLEAR, events, 0, nullptr);
+        const timespec now{};
+        if (::kevent(queue_.get(), &watch, 1, nullptr, 0, &now) < 0)
+            ledger_watch_error(errno, "native_sync.ledger_watch_bind");
+    }
+
+    void finish(std::stop_token token) {
+        for (;;) {
+            stop(token);
+            struct kevent event{};
+            const timespec now{};
+            const int ready = ::kevent(queue_.get(), nullptr, 0, &event, 1, &now);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready < 0)
+                ledger_watch_error(errno, "native_sync.ledger_watch_poll");
+            // This queue has one registration, for the retained directory.
+            // Any event (including revocation or an error) refuses the scan.
+            if (ready > 0)
+                fail("native_sync.ledger_namespace_changed");
+            queue_.finish();
+            directory_.finish();
+            return;
+        }
+    }
+private:
+    LedgerWatchFd directory_;
+    LedgerWatchFd queue_;
+};
 #endif
 
 // Native observations of the SAME provider-owned directory; never an address
@@ -494,6 +544,9 @@ Observation<std::vector<NativeSyncLoadedLedger>> load_native_sync_ledgers(Prepar
 #ifdef __linux__
         stop(token);
         LedgerWatchFd watch(*root, start_linux_ledger_watch(*root));
+#elif defined(__APPLE__)
+        stop(token);
+        MacLedgerDirectoryWatch watch(*root);
 #endif
         auto before=directory_version(*root);auto cursor=value(open_prepared_journal_directory(root));
         std::vector<NativeSyncLoadedLedger> out;std::size_t total=0,all_names=0;
@@ -516,6 +569,8 @@ Observation<std::vector<NativeSyncLoadedLedger>> load_native_sync_ledgers(Prepar
         require(cursor->finish_io());require(root->revalidate());
 #ifdef __linux__
         finish_linux_ledger_watch(watch, token);
+#elif defined(__APPLE__)
+        watch.finish(token);
 #endif
         return out;
     });
