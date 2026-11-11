@@ -361,6 +361,15 @@ if(BUILD_TESTING)
     message(FATAL_ERROR "CK_CORE_FS_NATIVE_TEST_ROOT must be absolute")
   endif()
   file(MAKE_DIRECTORY "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  if(CK_CORE_FS_BUILD_BROWSER)
+    add_executable(ck_fs_indexed_mark_binding_tests tests/indexed_mark_binding_tests.cpp)
+    target_link_libraries(ck_fs_indexed_mark_binding_tests PRIVATE ck_core_fs_browser ck_core_fs_native)
+    add_test(NAME indexed_mark_binding
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_native_fixture.py"
+      "$<TARGET_FILE:ck_fs_indexed_mark_binding_tests>" "${CK_CORE_FS_NATIVE_TEST_ROOT}")
+    set_tests_properties(indexed_mark_binding PROPERTIES TIMEOUT 180 LABELS "browser;native"
+      ENVIRONMENT "TMPDIR=${CK_CORE_FS_NATIVE_TEST_ROOT};TEMP=${CK_CORE_FS_NATIVE_TEST_ROOT};TMP=${CK_CORE_FS_NATIVE_TEST_ROOT}")
+  endif()
   add_executable(ck_fs_c_api_error_oom_tests tests/c_api_error_oom_tests.cpp)
   target_link_libraries(ck_fs_c_api_error_oom_tests PRIVATE ck_file_engine_c_test_support)
   add_test(NAME c_api_error_oom COMMAND ck_fs_c_api_error_oom_tests)

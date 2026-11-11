@@ -258,6 +258,12 @@ Observation<IndexedPaneDataJob::Result> IndexedPaneDataJob::completed() const {
         return Observation<Result>::unavailable(failure_->state, failure_->error);
     return {};
 }
+IndexedPane::IndexedPane(std::size_t retained_mark_limit) : retained_mark_limit_(retained_mark_limit) {
+    if (retained_mark_limit > max_mark_bindings)
+        throw std::invalid_argument("invalid indexed mark binding limit");
+    if (retained_mark_limit)
+        mark_binding_slots_ = std::make_shared<std::atomic_size_t>(0);
+}
 IndexedPane::~IndexedPane() {
     invalidate();
     mark_pending_ = false;
@@ -419,6 +425,7 @@ IndexedPanePublish IndexedPane::publish(Data data, std::stop_token stop) {
     invalidate();
     if (pending_kind_ == IndexedPaneDataOrigin::Listing) {
         marks_.reset();
+        mark_bindings_.reset();
         mark_error_.reset();
     }
     visible_marks_ = data->visible_marks_;
@@ -745,21 +752,28 @@ Observation<std::shared_ptr<const DirectoryCursor>> IndexedPane::hold_directory(
 Observation<OpenedIndexedRow> IndexedPane::open_row(const PaneStateStamp &stamp, PaneRowId row, EntryAccess access,
                                                     IndexedDirectoryOpenLimits limits, std::stop_token stop) {
     using Result = Observation<OpenedIndexedRow>;
-    const auto reject = [](const UnavailableObservation &e) { return Result::unavailable(e.state, e.error); };
     if (!valid_entry_access(access) || limits.wire_bytes < 16 || limits.wire_bytes > DirectoryIndexScanLimits::hard_wire_bytes ||
         !limits.native_name_bytes || limits.native_name_bytes > NativePathLimits::hard_native_bytes ||
         !limits.diagnostic_bytes || limits.diagnostic_bytes > 16 * 1024 * 1024)
         throw std::invalid_argument("invalid indexed row open limits");
-    if (!accepts(stamp) || !data_ || pending_ || mark_pending_)
-        return reject(error(AdapterError::InvalidAccess, "indexed_row.state"));
+    if (!accepts(stamp) || !data_ || pending_ || mark_pending_) {
+        const auto detail = error(AdapterError::InvalidAccess, "indexed_row.state");
+        return Result::unavailable(detail.state, detail.error);
+    }
     const auto data = data_;
-    if (row.scope != data->row_scope() || !row.number || row.number > data->rows())
+    return data->bind_row(stamp, std::move(row), access, limits, stop);
+}
+Observation<OpenedIndexedRow> CompletedIndexedPaneData::bind_row(const PaneStateStamp &stamp, PaneRowId row,
+                                                               EntryAccess access, IndexedDirectoryOpenLimits limits,
+                                                               std::stop_token stop, bool require_kind) const {
+    using Result = Observation<OpenedIndexedRow>;
+    const auto reject = [](const UnavailableObservation &e) { return Result::unavailable(e.state, e.error); };
+    if (row.scope != row_scope() || !row.number || row.number > rows())
         return reject(error(AdapterError::InvalidIdentifier, "indexed_row.row"));
     const auto boundary = [&](bool check_stop = true) -> std::optional<UnavailableObservation> {
-        if (!accepts(stamp))
+        if (!stamp.current())
             return error(AdapterError::InvalidAccess, "indexed_row.stale", ObservationState::Changed);
-        if (data->lookup_->state() != DirectoryIndexLookupState::Ready ||
-            data->store_->state() != DirectoryIndexStoreState::Sealed)
+        if (lookup_->state() != DirectoryIndexLookupState::Ready || store_->state() != DirectoryIndexStoreState::Sealed)
             return error(AdapterError::InvalidAccess, "indexed_row.dataset");
         if (check_stop && stop.stop_requested())
             return error(AdapterError::InterruptedRead, "indexed_row.cancelled", ObservationState::Unknown);
@@ -767,12 +781,12 @@ Observation<OpenedIndexedRow> IndexedPane::open_row(const PaneStateStamp &stamp,
     };
     if (auto e = boundary())
         return reject(*e);
-    auto found = data->lookup_->locate_row({row.scope, row.number});
+    auto found = lookup_->locate_row({row.scope, row.number});
     if (!found.value())
         return reject(*found.unavailable_detail());
     if (!*found.value())
         return reject(error(AdapterError::InvalidIdentifier, "indexed_row.excluded_row"));
-    auto read = data->lookup_->read_page(**found.value(), {1, limits.wire_bytes});
+    auto read = lookup_->read_page(**found.value(), {1, limits.wire_bytes});
     if (!read.value())
         return reject(*read.unavailable_detail());
     if (read.value()->rows.size() != 1 || read.value()->rows.front().record.row_id != row.number)
@@ -786,25 +800,35 @@ Observation<OpenedIndexedRow> IndexedPane::open_row(const PaneStateStamp &stamp,
         return reject(*record.metadata.unavailable_detail());
     if (auto e = boundary())
         return reject(*e);
-    auto parent = data->pin_->inspect_basic();
+    auto parent = pin_->inspect_basic();
     if (!parent.value())
         return reject(*parent.unavailable_detail());
-    if (!data->directory_.value() || !parent.value()->identity.value() ||
-        compare_identity(*data->directory_.value(), *parent.value()->identity.value()) != IdentityComparison::Same)
+    if (!directory_.value() || !parent.value()->identity.value() ||
+        compare_identity(*directory_.value(), *parent.value()->identity.value()) != IdentityComparison::Same)
         return reject(error(AdapterError::UnqualifiedIdentity, "indexed_row.parent_identity", ObservationState::Changed));
-    auto held = HeldChild::observe_with_access(data->pin_, record.name, access, stop);
+    auto held = HeldChild::observe_with_access(pin_, record.name, access, stop);
     if (!held.value())
         return reject(*held.unavailable_detail());
     if (!(*held.value())->metadata().identity.value() || !record.metadata.value()->identity.value() ||
         compare_identity(*record.metadata.value()->identity.value(), *(*held.value())->metadata().identity.value()) != IdentityComparison::Same)
         return reject(error(AdapterError::UnqualifiedIdentity, "indexed_row.identity", ObservationState::Changed));
+    if (require_kind) {
+        const auto &record_kind = record.metadata.value()->kind;
+        const auto &held_kind = (*held.value())->metadata().kind;
+        if (!record_kind.value())
+            return reject(*record_kind.unavailable_detail());
+        if (!held_kind.value())
+            return reject(*held_kind.unavailable_detail());
+        if (*record_kind.value() != *held_kind.value())
+            return reject(error(AdapterError::MetadataChanged, "indexed_row.kind", ObservationState::Changed));
+    }
     if (auto e = boundary())
         return reject(*e);
-    auto after = data->pin_->inspect_basic();
+    auto after = pin_->inspect_basic();
     if (!after.value())
         return reject(*after.unavailable_detail());
-    if (!data->directory_.value() || !after.value()->identity.value() ||
-        compare_identity(*data->directory_.value(), *after.value()->identity.value()) != IdentityComparison::Same)
+    if (!directory_.value() || !after.value()->identity.value() ||
+        compare_identity(*directory_.value(), *after.value()->identity.value()) != IdentityComparison::Same)
         return reject(error(AdapterError::UnqualifiedIdentity, "indexed_row.parent_changed", ObservationState::Changed));
     return Result::available({std::move(record.name), std::move(held).take_value()});
 }
@@ -871,7 +895,8 @@ IndexedPane::begin_mark_change(const PaneStateStamp &stamp, const IndexedMarkCom
     auto prepared = [&] {
         try {
             return std::unique_ptr<IndexedPaneMarkJob>(
-                new IndexedPaneMarkJob(data, marks, visible_marks_, next, command, rows_per_step, max_bytes));
+                new IndexedPaneMarkJob(data, marks, visible_marks_, next, command, rows_per_step, max_bytes,
+                                       mark_bindings_, retained_mark_limit_, mark_binding_slots_));
         } catch (...) {
             if (accepts(stamp))
                 invalidate();
@@ -904,13 +929,16 @@ IndexedPanePublish IndexedPane::publish_marks(IndexedPaneMarkJob::Result result)
         return IndexedPanePublish::InvalidData;
     const auto &target = result->target_;
     const auto &counts = result->counts_;
+    const auto &bindings = result->bindings_;
     if ((target && (target->state() != DirectoryIndexMarksState::Ready || target->row_scope() != data_->row_scope() ||
                     target->rows() != data_->rows() || target->marked() != counts.total)) ||
         (!target && counts.total) || counts.visible > counts.total || counts.visible > data_->visible_rows() ||
-        counts.hidden != counts.total - counts.visible)
+        counts.hidden != counts.total - counts.visible ||
+        (bindings && (bindings->size() > counts.total || bindings->size() > retained_mark_limit_)))
         return IndexedPanePublish::InvalidData;
     invalidate();
     marks_ = target;
+    mark_bindings_ = bindings;
     visible_marks_ = counts.visible;
     mark_pending_ = false;
     mark_error_.reset();

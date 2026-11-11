@@ -3,6 +3,7 @@
 #include "indexed_pane_marks.hpp"
 #include "indexed_pane.hpp"
 #include "index_storage_slot.hpp"
+#include "pane_page_budget.hpp"
 #include <algorithm>
 #include <limits>
 namespace ck::files {
@@ -14,9 +15,13 @@ UnavailableObservation error(AdapterError code, const char *op) {
 IndexedPaneMarkJob::IndexedPaneMarkJob(std::shared_ptr<const CompletedIndexedPaneData> data,
                                        std::shared_ptr<DirectoryIndexMarks> previous, std::uint64_t visible,
                                        PaneStateStamp stamp, const IndexedMarkCommand &command, std::size_t step,
-                                       std::uint64_t max_bytes)
-    : data_(std::move(data)), previous_(std::move(previous)), stamp_(std::move(stamp)), command_(command),
-      dataset_(data_->revision_), visible_(visible), step_(step) {
+                                       std::uint64_t max_bytes,
+                                       std::shared_ptr<const CompletedIndexedMarkChange::Bindings> bindings,
+                                       std::size_t retained_mark_limit,
+                                       std::shared_ptr<std::atomic_size_t> binding_slots)
+    : data_(std::move(data)), previous_(std::move(previous)), binding_slots_(std::move(binding_slots)),
+      stamp_(std::move(stamp)), command_(command),
+      dataset_(data_->revision_), visible_(visible), step_(step), retained_mark_limit_(retained_mark_limit) {
     if (!step_ || step_ > 4096 || !max_bytes ||
         max_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
         throw std::invalid_argument("invalid mark limits");
@@ -107,11 +112,47 @@ IndexedPaneMarkJob::IndexedPaneMarkJob(std::shared_ptr<const CompletedIndexedPan
                                 data_->store_->context_.generation, rows, bytes));
     slot.transfer();
     target_ = std::move(owner);
+    if (retained_mark_limit_) {
+        if (bindings)
+            bindings_ = std::make_shared<CompletedIndexedMarkChange::Bindings>(*bindings);
+        else
+            bindings_ = std::make_shared<CompletedIndexedMarkChange::Bindings>();
+    }
+}
+bool IndexedPaneMarkJob::bind_mark(std::uint64_t number, std::stop_token stop) {
+    // Only the serialized pane worker acquires slots. Completed results can
+    // release them independently. Leave room for the staged second generation.
+    if (bindings_->size() == retained_mark_limit_ || binding_attempts_ == retained_mark_limit_ ||
+        binding_slots_->load(std::memory_order_relaxed) >= 2 * retained_mark_limit_)
+        return true;
+    ++binding_attempts_;
+    auto binding = std::make_shared<CompletedIndexedMarkChange::Binding>(binding_slots_);
+    const IndexedDirectoryOpenLimits limits;
+    auto bound = data_->bind_row(stamp_, {data_->row_scope(), number}, EntryAccess::MetadataOnly, limits, stop, true);
+    if (stop.stop_requested() || !stamp_.current()) {
+        cancel();
+        return false;
+    }
+    if (!bound.value()) {
+        if (data_->lookup_->state() == DirectoryIndexLookupState::Failed ||
+            data_->store_->state() != DirectoryIndexStoreState::Sealed) {
+            fail(*bound.unavailable_detail());
+            return false;
+        }
+        return true;
+    }
+    std::size_t diagnostics = 0;
+    if (detail::charge(bound.value()->child->metadata(), diagnostics, limits.diagnostic_bytes)) {
+        binding->child = std::move(bound).take_value().child;
+        bindings_->emplace(number, std::move(binding));
+    }
+    return true;
 }
 void IndexedPaneMarkJob::release() noexcept {
     bits_.reset();
     target_.reset();
     previous_.reset();
+    bindings_.reset();
     data_.reset();
 }
 void IndexedPaneMarkJob::fail(UnavailableObservation detail) {
@@ -148,7 +189,7 @@ IndexedMarkJobState IndexedPaneMarkJob::advance(std::stop_token stop) {
             return state_;
         }
         if (std::holds_alternative<IndexedClearMarks>(command_) || !data_->rows()) {
-            result_ = Result(new const CompletedIndexedMarkChange(stamp_, dataset_, base_, {}, {}));
+            result_ = Result(new const CompletedIndexedMarkChange(stamp_, dataset_, base_, {}, {}, {}));
             state_ = IndexedMarkJobState::Complete;
             release();
             return state_;
@@ -177,6 +218,15 @@ IndexedMarkJobState IndexedPaneMarkJob::advance(std::stop_token stop) {
                     previous_->fail(detail);
                 fail(std::move(detail));
                 return false;
+            }
+            if (bindings_) {
+                const auto number = block_ * 4096 + at + 1;
+                if (value) {
+                    if (!bind_mark(number, stop))
+                        return false;
+                } else {
+                    bindings_->erase(number);
+                }
             }
             if (value)
                 ++visible_;
@@ -255,8 +305,10 @@ IndexedMarkJobState IndexedPaneMarkJob::advance(std::stop_token stop) {
             target_->state_ = DirectoryIndexMarksState::Ready;
             if (!total_)
                 target_.reset();
+            if (bindings_ && bindings_->empty())
+                bindings_.reset();
             result_ = Result(new const CompletedIndexedMarkChange(stamp_, dataset_, base_, target_,
-                                                                  {total_, visible_, total_ - visible_}));
+                                                                  {total_, visible_, total_ - visible_}, bindings_));
             state_ = IndexedMarkJobState::Complete;
             release();
         }

@@ -10,6 +10,13 @@ namespace ck::files {
 enum class IndexedPaneDataOrigin { Listing, Reorder };
 class IndexedPaneDataJob;
 class IndexedPane;
+struct IndexedDirectoryOpenLimits;
+// Live worker-only binding. The native name and handle refer to one observed
+// entry under the retained directory, without following the final component.
+struct OpenedIndexedRow {
+    NativeName name;
+    HeldChild::Pointer child;
+};
 // Worker-owned certificate binding completed collection, order, lookup and
 // directory pin. Construction is private to the complete preparation job.
 // Pages never retain this object or any of its native/file owners.
@@ -45,6 +52,9 @@ class CompletedIndexedPaneData final {
     friend class IndexedPane;
     friend class IndexedPaneMarkJob;
     friend class IndexedPaneSourceJob;
+    Observation<OpenedIndexedRow> bind_row(const PaneStateStamp &stamp, PaneRowId row, EntryAccess access,
+                                         IndexedDirectoryOpenLimits limits, std::stop_token stop,
+                                         bool require_kind = false) const;
     CompletedIndexedPaneData(PaneListingRequest request, PaneOrder order, PaneView view, IndexedPaneDataOrigin origin,
                              AdapterScope scope, std::optional<AdapterScope> predecessor,
                              Observation<ObjectIdentity> directory, Observation<BasicMetadata> before,
@@ -222,10 +232,6 @@ struct OpenedIndexedDirectory {
     NativeName name;
     std::unique_ptr<DirectoryCursor> directory;
 };
-struct OpenedIndexedRow {
-    NativeName name;
-    HeldChild::Pointer child;
-};
 // Serialized worker state. Navigation/reorder requests and all successful state
 // changes revoke previously issued stamps. Existing data survives navigation
 // failures. Capture returns only bounded owner-free immutable display payloads.
@@ -235,7 +241,8 @@ struct OpenedIndexedRow {
 class IndexedPane final {
   public:
     using Data = IndexedPaneDataJob::Result;
-    IndexedPane() = default;
+    static constexpr std::size_t max_mark_bindings = 1024;
+    explicit IndexedPane(std::size_t retained_mark_limit = 0);
     ~IndexedPane();
     IndexedPane(const IndexedPane &) = delete;
     IndexedPane &operator=(const IndexedPane &) = delete;
@@ -282,6 +289,11 @@ class IndexedPane final {
     const std::shared_ptr<DirectoryIndexMarks> &marks() const noexcept {
         return marks_;
     } // worker only
+    // The bitmap can also contain marks without a live binding. Only bindings
+    // retained by the selection transaction can establish refresh continuity.
+    std::size_t retained_mark_bindings() const noexcept {
+        return mark_bindings_ ? mark_bindings_->size() : 0;
+    }
     bool marking_pending() const noexcept {
         return mark_pending_;
     }
@@ -324,6 +336,9 @@ class IndexedPane final {
     std::optional<std::uint64_t> focus_position_;
     std::optional<UnavailableObservation> error_;
     std::shared_ptr<DirectoryIndexMarks> marks_;
+    const std::size_t retained_mark_limit_;
+    std::shared_ptr<std::atomic_size_t> mark_binding_slots_;
+    std::shared_ptr<const CompletedIndexedMarkChange::Bindings> mark_bindings_;
     std::uint64_t visible_marks_ = 0;
     bool mark_pending_ = false;
     std::optional<UnavailableObservation> mark_error_;
