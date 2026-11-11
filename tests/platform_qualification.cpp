@@ -639,12 +639,20 @@ int main(int argc, char** argv) {
             Directory d(out, ckfe_directory_destroy); auto e = entry(d.get(), L"longfile"); regular(e.get(), 17);
         });
         Path exact = L"exact_"; exact.push_back(wchar_t(0xd800)); exact += L". ";
+#elif defined(__APPLE__)
+        // APFS requires well-formed UTF-8. Keep the exact non-ASCII bytes and trailing dot/space.
+        const Path exact = "exact_\xc3\xa9. ";
 #else
         Path exact = "exact_"; exact.push_back(char(0xff)); exact += ". ";
 #endif
         fixtures.file(root + sep + exact, 23);
         fixtures.file(longdir + sep + exact, 43);
-        test("exact-native-unpaired-surrogate-or-nonUTF8-name", [&] { check_directory(raw, fs, root, exact, 23); cursor_checks(fs, root, exact); });
+#if defined(__APPLE__)
+        constexpr auto exact_name_case = "exact-native-utf8-name";
+#else
+        constexpr auto exact_name_case = "exact-native-unpaired-surrogate-or-nonUTF8-name";
+#endif
+        test(exact_name_case, [&] { check_directory(raw, fs, root, exact, 23); cursor_checks(fs, root, exact); });
         test("held-rescan-long-path-and-exact-name", [&] {
             held_scan_names(fs, longdir, sorted_names({name(ascii("longfile")), name(exact)}));
         }, true);
