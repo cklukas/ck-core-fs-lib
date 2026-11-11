@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "indexed_pane_marks.hpp"
 #include "indexed_pane.hpp"
-#include "index_storage_slot.hpp"
 #include "pane_page_budget.hpp"
 #include <algorithm>
 #include <limits>
@@ -73,45 +72,14 @@ IndexedPaneMarkJob::IndexedPaneMarkJob(std::shared_ptr<const CompletedIndexedPan
         low_ = std::min(*a, *b);
         high_ = std::max(*a, *b);
     }
-    const auto rows = data_->rows();
-    if (!rows)
+    if (!data_->rows())
         return;
-    const auto blocks = rows / 4096 + (rows % 4096 != 0);
-    if (blocks > max_bytes / 576) {
-        fail(error(AdapterError::InventoryLimit, "marks.table_limit"));
-        return;
-    }
-    const auto bytes = blocks * 576;
-    auto factory = data_->store_->factory_;
-    auto budget = data_->store_->budget_;
-    IndexStorageBudget::FileSlot slot(budget, bytes);
-    if (!slot.acquired()) {
-        fail(error(AdapterError::InventoryLimit, "marks.budget"));
+    auto writer = DirectoryIndexMarks::create_writer(*data_->store_, max_bytes);
+    if (!writer.value()) {
+        fail(*writer.unavailable_detail());
         return;
     }
-    auto file = factory->create_file();
-    if (!file.value()) {
-        fail(*file.unavailable_detail());
-        return;
-    }
-    if (!*file.value()) {
-        fail(error(AdapterError::InvalidNativeResult, "marks.null_file"));
-        return;
-    }
-    auto size = (*file.value())->size();
-    if (!size.value()) {
-        fail(*size.unavailable_detail());
-        return;
-    }
-    if (*size.value() != 0) {
-        fail(error(AdapterError::InvalidNativeResult, "marks.nonempty"));
-        return;
-    }
-    auto owner = std::unique_ptr<DirectoryIndexMarks>(
-        new DirectoryIndexMarks(std::move(file).take_value(), factory, budget, data_->row_scope(),
-                                data_->store_->context_.generation, rows, bytes));
-    slot.transfer();
-    target_ = std::move(owner);
+    target_ = std::move(writer).take_value();
     if (retained_mark_limit_) {
         if (bindings)
             bindings_ = std::make_shared<CompletedIndexedMarkChange::Bindings>(*bindings);
@@ -292,17 +260,16 @@ IndexedMarkJobState IndexedPaneMarkJob::advance(std::stop_token stop) {
                 fail(std::move(detail));
                 return state_;
             }
-            auto size = target_->size_matches();
-            if (!size.value()) {
-                fail(*size.unavailable_detail());
+            auto finished = target_->finish(total_, stop);
+            if (!finished.value()) {
+                const auto &detail = *finished.unavailable_detail();
+                if (stop.stop_requested() && detail.error.domain == ErrorDomain::Adapter &&
+                    detail.error.code == static_cast<std::int64_t>(AdapterError::InterruptedRead))
+                    cancel();
+                else
+                    fail(detail);
                 return state_;
             }
-            if (stop.stop_requested()) {
-                cancel();
-                return state_;
-            }
-            target_->marked_ = total_;
-            target_->state_ = DirectoryIndexMarksState::Ready;
             if (!total_)
                 target_.reset();
             if (bindings_ && bindings_->empty())

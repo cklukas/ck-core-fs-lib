@@ -128,6 +128,7 @@ if(CK_CORE_FS_BUILD_BROWSER)
     src/files/directory_index_sort_job.cpp
     src/files/indexed_pane.cpp
     src/files/indexed_pane_marks.cpp
+    src/files/indexed_pane_refresh.cpp
     src/files/indexed_pane_sources.cpp
     src/files/pane_acquire_job.cpp
     src/files/pane_command.cpp

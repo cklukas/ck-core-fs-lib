@@ -255,6 +255,13 @@ class IndexedPane final {
     PaneListingRequest begin_listing(const PaneView &view);
     Observation<PaneListingRequest> begin_view_change(const PaneStateStamp &stamp, const PaneView &view);
     IndexedPanePublish publish(Data data, std::stop_token stop = {});
+    // Reconcile a privately prepared listing with the previous live pane.
+    // Both worker-owned parent handles must establish the same directory.
+    // Marks transfer only through a successor of a previously held binding.
+    // A successful result installs the reconciled selection in this candidate;
+    // callers still own the final candidate publication and old stamp retirement.
+    Observation<bool> reconcile_refresh_marks(const IndexedPane &previous, const PaneStateStamp &previous_stamp,
+                                               const PaneStateStamp &candidate_stamp, std::stop_token stop = {});
     bool fail_listing(PaneListingRequest request, UnavailableObservation failure);
     bool cancel_listing(PaneListingRequest request) noexcept;
     IndexedPaneCapture capture_page(const PaneStateStamp &stamp, std::uint64_t first, IndexedPanePageLimits limits = {},
@@ -340,6 +347,7 @@ class IndexedPane final {
     std::shared_ptr<std::atomic_size_t> mark_binding_slots_;
     std::shared_ptr<const CompletedIndexedMarkChange::Bindings> mark_bindings_;
     std::uint64_t visible_marks_ = 0;
+    std::uint64_t invalidated_refresh_marks_ = 0;
     bool mark_pending_ = false;
     std::optional<UnavailableObservation> mark_error_;
 };

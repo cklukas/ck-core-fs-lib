@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "directory_index_marks.hpp"
+#include "index_storage_slot.hpp"
 #include <algorithm>
 #include <bit>
 namespace ck::files {
@@ -35,6 +36,68 @@ DirectoryIndexMarks::~DirectoryIndexMarks() {
     factory_.reset();
     budget_->used_bytes_ -= bytes_;
     --budget_->used_files_;
+}
+Observation<std::shared_ptr<DirectoryIndexMarks>>
+DirectoryIndexMarks::create_writer(const DirectoryIndexStore &store, std::uint64_t max_bytes, std::stop_token stop) {
+    using Pointer = std::shared_ptr<DirectoryIndexMarks>;
+    if (store.state() != DirectoryIndexStoreState::Sealed || !store.rows())
+        return unavailable<Pointer>(error(AdapterError::InvalidAccess, "marks.writer_store"));
+    if (stop.stop_requested())
+        return Observation<Pointer>::unavailable(ObservationState::Unknown,
+            {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InterruptedRead), "marks.cancelled"});
+    const auto rows = store.rows();
+    const auto blocks = rows / block_rows + (rows % block_rows != 0);
+    if (blocks > max_bytes / block_bytes)
+        return unavailable<Pointer>(error(AdapterError::InventoryLimit, "marks.table_limit"));
+    const auto bytes = blocks * block_bytes;
+    IndexStorageBudget::FileSlot slot(store.budget_, bytes);
+    if (!slot.acquired())
+        return unavailable<Pointer>(error(AdapterError::InventoryLimit, "marks.budget"));
+    auto file = store.factory_->create_file();
+    if (!file.value())
+        return unavailable<Pointer>(*file.unavailable_detail());
+    if (!*file.value())
+        return unavailable<Pointer>(error(AdapterError::InvalidNativeResult, "marks.null_file"));
+    auto size = (*file.value())->size();
+    if (!size.value())
+        return unavailable<Pointer>(*size.unavailable_detail());
+    if (*size.value() != 0)
+        return unavailable<Pointer>(error(AdapterError::InvalidNativeResult, "marks.nonempty"));
+    auto owner = std::unique_ptr<DirectoryIndexMarks>(new DirectoryIndexMarks(
+        std::move(file).take_value(), store.factory_, store.budget_, store.row_scope(),
+        store.context_.generation, rows, bytes));
+    slot.transfer();
+    return Observation<Pointer>::available(Pointer(std::move(owner)));
+}
+Observation<bool> DirectoryIndexMarks::finish(std::uint64_t marked, std::stop_token stop) {
+    if (state_ != DirectoryIndexMarksState::Writing || marked > rows_)
+        return unavailable<bool>(error(AdapterError::InvalidAccess, "marks.finish"));
+    auto size = size_matches();
+    if (!size.value())
+        return size;
+    if (stop.stop_requested())
+        return Observation<bool>::unavailable(ObservationState::Unknown,
+            {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InterruptedRead), "marks.cancelled"});
+    marked_ = marked;
+    state_ = DirectoryIndexMarksState::Ready;
+    return Observation<bool>::available(true);
+}
+Observation<std::uint64_t> DirectoryIndexMarks::checked_count(std::stop_token stop) {
+    std::uint64_t seen = 0;
+    for (std::uint64_t block = 0; block < bytes_ / block_bytes; ++block) {
+        if (stop.stop_requested())
+            return Observation<std::uint64_t>::unavailable(ObservationState::Unknown,
+                {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InterruptedRead), "marks.cancelled"});
+        auto bits = read_block(block);
+        if (!bits.value())
+            return unavailable<std::uint64_t>(*bits.unavailable_detail());
+        seen += count(*bits.value());
+    }
+    if (seen != marked_) {
+        fail(error(AdapterError::InvalidNativeResult, "marks.checked_count"));
+        return unavailable<std::uint64_t>(*failure_);
+    }
+    return Observation<std::uint64_t>::available(seen);
 }
 void DirectoryIndexMarks::fail(UnavailableObservation detail) {
     state_ = DirectoryIndexMarksState::Failed;

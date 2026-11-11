@@ -38,10 +38,16 @@ class DirectoryIndexMarks final {
     Observation<bool> contains(const IndexRowKey &key);
 
   private:
+    friend class IndexedPane;
     friend class IndexedPaneMarkJob;
     friend class DirectoryMarksRecountJob;
     friend class IndexedPaneSourceJob;
     using Bits = std::array<std::byte, 512>;
+    static constexpr std::uint64_t block_rows = 4096, block_bytes = 576;
+    static Observation<std::shared_ptr<DirectoryIndexMarks>>
+    create_writer(const DirectoryIndexStore &store, std::uint64_t max_bytes, std::stop_token stop = {});
+    Observation<bool> finish(std::uint64_t marked, std::stop_token stop);
+    Observation<std::uint64_t> checked_count(std::stop_token stop);
     DirectoryIndexMarks(std::unique_ptr<IndexByteFile> file, std::shared_ptr<IndexFileFactory> factory,
                         std::shared_ptr<IndexStorageBudget> budget, AdapterScope scope,
                         std::array<std::byte, 16> generation, std::uint64_t rows, std::uint64_t bytes);

@@ -426,6 +426,7 @@ IndexedPanePublish IndexedPane::publish(Data data, std::stop_token stop) {
     if (pending_kind_ == IndexedPaneDataOrigin::Listing) {
         marks_.reset();
         mark_bindings_.reset();
+        invalidated_refresh_marks_ = 0;
         mark_error_.reset();
     }
     visible_marks_ = data->visible_marks_;
@@ -940,6 +941,7 @@ IndexedPanePublish IndexedPane::publish_marks(IndexedPaneMarkJob::Result result)
     marks_ = target;
     mark_bindings_ = bindings;
     visible_marks_ = counts.visible;
+    invalidated_refresh_marks_ = 0;
     mark_pending_ = false;
     mark_error_.reset();
     return IndexedPanePublish::Applied;
@@ -971,10 +973,13 @@ IndexedPaneSelection IndexedPane::selection() const noexcept {
     }
     const auto total = marks_ ? marks_->marked() : 0;
     result.marks = IndexedPaneMarkCounts{total, visible_marks_, total - visible_marks_};
-    if (total)
+    result.invalidated_refresh_marks = invalidated_refresh_marks_;
+    if (total || invalidated_refresh_marks_)
         result.origin = PaneSourcesOrigin::Marks;
     if (pending_ || mark_pending_)
         result.state = PaneSourcesState::ListingPending;
+    else if (invalidated_refresh_marks_)
+        result.state = PaneSourcesState::SelectionInvalidated;
     else if (total) {
         result.state = total > visible_marks_ ? PaneSourcesState::HiddenMarksNeedReview : PaneSourcesState::Ready;
         if (result.state == PaneSourcesState::Ready)

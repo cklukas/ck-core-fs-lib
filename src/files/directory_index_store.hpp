@@ -174,6 +174,7 @@ class DirectoryIndexStore final {
     friend class DirectoryIndexSortJob;
     friend class DirectoryIndexLookup;
     friend class DirectoryIndexLookupJob;
+    friend class DirectoryIndexMarks;
     friend class IndexedPaneMarkJob;
     DirectoryIndexStore(std::unique_ptr<IndexByteFile> file, std::shared_ptr<IndexStorageBudget> budget,
                         DirectoryIndexContext context, DirectoryIndexStoreLimits limits,

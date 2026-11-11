@@ -39,21 +39,13 @@ void mark(IndexedPane &pane, const IndexedMarkCommand &command) {
     check(pane.publish_marks(take(job->completed())) == IndexedPanePublish::Applied, "publish marks");
 }
 
-void run(const std::filesystem::path &fixture) {
-    const auto address = [](const std::filesystem::path &path) { return take(NativeAbsolutePath::from_host(path)); };
-    NativeFileSystem fs;
-    auto parent = take(fs.open_native_directory(address(fixture)));
-    auto source = take(parent->create_child_directory(name("source", u"source")));
-    auto cache = take(parent->create_child_directory(name("cache", u"cache")));
-    for (const auto &entry : {name("one", u"one"), name("two", u"two")}) {
-        auto file = take(source->create_child_file(entry));
-        (void)take(file->finish_content_writes());
-    }
-    source.reset();
-    cache.reset();
-    auto factory = take(open_native_index_workspace(address(fixture / "cache")));
-    auto budget = std::make_shared<IndexStorageBudget>(1024 * 1024, 16);
-    IndexedPane pane(1);
+NativeAbsolutePath address(const std::filesystem::path &path) {
+    return take(NativeAbsolutePath::from_host(path));
+}
+
+void list(IndexedPane &pane, std::unique_ptr<DirectoryCursor> directory,
+          const std::shared_ptr<IndexFileFactory> &factory, const std::shared_ptr<IndexStorageBudget> &budget,
+          std::byte serial, const PaneView &view = {}) {
 #if defined(_WIN32)
     constexpr auto model = StorageModel::WindowsHandleAttributes;
 #elif defined(__APPLE__)
@@ -61,11 +53,10 @@ void run(const std::filesystem::path &fixture) {
 #else
     constexpr auto model = StorageModel::LinuxStatx;
 #endif
-    const PaneView view;
     const auto request = pane.begin_listing(view);
-    std::array<std::byte, 16> generation{std::byte{1}};
-    DirectoryIndexListingJob collection(request, std::make_unique<DirectoryListing>(
-        take(fs.open_native_directory(address(fixture / "source")))), model, factory, budget, generation);
+    std::array<std::byte, 16> generation{serial};
+    DirectoryIndexListingJob collection(request, std::make_unique<DirectoryListing>(std::move(directory)),
+                                        model, factory, budget, generation);
     auto collection_state = collection.advance();
     while (collection_state == DirectoryIndexListingState::Collecting ||
            collection_state == DirectoryIndexListingState::SortingNames ||
@@ -78,6 +69,26 @@ void run(const std::filesystem::path &fixture) {
            preparation_state == IndexedPaneDataJobState::CountingMarks)
         preparation_state = preparation.advance();
     check(pane.publish(take(preparation.completed())) == IndexedPanePublish::Applied, "publish indexed listing");
+}
+
+void create_file(const DirectoryCursor &directory, const NativeName &entry) {
+    auto file = take(directory.create_child_file(entry));
+    (void)take(file->finish_content_writes());
+}
+
+void run(const std::filesystem::path &fixture) {
+    NativeFileSystem fs;
+    auto parent = take(fs.open_native_directory(address(fixture)));
+    auto source = take(parent->create_child_directory(name("source", u"source")));
+    auto cache = take(parent->create_child_directory(name("cache", u"cache")));
+    for (const auto &entry : {name("one", u"one"), name("two", u"two")})
+        create_file(*source, entry);
+    cache.reset();
+    auto factory = take(open_native_index_workspace(address(fixture / "cache")));
+    auto budget = std::make_shared<IndexStorageBudget>(1024 * 1024, 16);
+    IndexedPane pane(1);
+    const auto source_path = address(fixture / "source");
+    list(pane, take(fs.open_native_directory(source_path)), factory, budget, std::byte{1});
     const auto captured = pane.capture_page(pane.state_stamp(), 0);
     check(captured.page && captured.page->rows().size() == 2, "read two native rows");
     const auto first = captured.page->rows()[0].id;
@@ -119,6 +130,64 @@ void run(const std::filesystem::path &fixture) {
     abandoned_first.reset();
     mark(pane, IndexedMarkRow{second, true});
     check(pane.retained_mark_bindings() == 1 && pane.selection().marks->total == 2, "retiring a result returns its slot");
+    abandoned_second.reset();
+
+    create_file(*source, name("earlier", u"earlier"));
+    IndexedPane refreshed(1);
+    list(refreshed, take(fs.open_native_directory(source_path)), factory, budget, std::byte{2});
+    const auto previous_stamp = pane.state_stamp();
+    const auto candidate_stamp = refreshed.state_stamp();
+    check(!refreshed.reconcile_refresh_marks(pane, previous_stamp, candidate_stamp, stop.get_token()).value(),
+          "cancel refresh before publication");
+    check(previous_stamp.current() && candidate_stamp.current() && !refreshed.retained_mark_bindings(),
+          "cancel leaves both panes unchanged");
+    check(take(refreshed.reconcile_refresh_marks(pane, previous_stamp, candidate_stamp)), "reconcile fresh scan");
+    check(previous_stamp.current() && !candidate_stamp.current(), "revoke only the changed candidate");
+    const auto page = refreshed.capture_page(refreshed.state_stamp(), 0).page;
+    check(page && page->rows().size() == 3 && page->rows()[0].display_name == "earlier" &&
+          page->rows()[2].display_name == "two" && page->rows()[2].id.scope != second.scope &&
+          page->rows()[2].marked && !page->rows()[1].marked,
+          "carry the held mark to its new row ID");
+    check(refreshed.selection().marks->total == 1 && refreshed.selection().invalidated_refresh_marks == 1 &&
+          refreshed.selection().state == PaneSourcesState::SelectionInvalidated &&
+          !refreshed.begin_source_acquisition(refreshed.state_stamp()).value(),
+          "unbound mark requires acknowledgement before using sources");
+
+    IndexedPane unrelated(1);
+    auto foreign = take(parent->create_child_directory(name("other", u"other")));
+    list(unrelated, std::move(foreign), factory, budget, std::byte{3});
+    check(!unrelated.reconcile_refresh_marks(pane, previous_stamp, unrelated.state_stamp()).value() &&
+          previous_stamp.current() && !unrelated.retained_mark_bindings(), "refuse a different held parent");
+    mark(pane, IndexedClearMarks{}); // Model retirement of the predecessor.
+    {
+        IndexedPane hidden(1);
+        PaneView filtered;
+        filtered.display_substring = "earlier";
+        list(hidden, take(fs.open_native_directory(source_path)), factory, budget, std::byte{4}, filtered);
+        check(take(hidden.reconcile_refresh_marks(refreshed, refreshed.state_stamp(), hidden.state_stamp())),
+              "reconcile another scan");
+        const auto selected = hidden.selection();
+        check(selected.marks && selected.marks->total == 1 && selected.marks->hidden == 1 &&
+              selected.invalidated_refresh_marks == 1, "retain a filtered mark and prior loss");
+    }
+#if !defined(_WIN32)
+    // Keep the original marked handle open while changing its name and
+    // inserting a different native object under the original basename.
+    std::filesystem::rename(fixture / "source" / "two", fixture / "source" / "retired-two");
+    create_file(*source, name("two", u"two"));
+    {
+        IndexedPane replaced(1);
+        list(replaced, take(fs.open_native_directory(source_path)), factory, budget, std::byte{5});
+        check(take(replaced.reconcile_refresh_marks(refreshed, refreshed.state_stamp(), replaced.state_stamp())),
+              "reconcile a replaced mark");
+        const auto selected = replaced.selection();
+        check(selected.marks && selected.marks->total == 0 && selected.invalidated_refresh_marks == 2 &&
+              selected.state == PaneSourcesState::SelectionInvalidated && !selected.candidates,
+              "refuse to transfer a mark to a replacement or renamed object");
+    }
+#endif
+    mark(refreshed, IndexedClearMarks{});
+    check(refreshed.selection().invalidated_refresh_marks == 0, "explicit mark command acknowledges refresh losses");
 }
 } // namespace
 
@@ -130,7 +199,7 @@ int main(int argc, char **argv) {
     try {
         check(argc == 2, "one absolute native fixture directory is required");
         run(std::filesystem::path(argv[1]));
-        std::puts("PASS indexed native mark bindings, cap and cancellation");
+        std::puts("PASS indexed native mark binding and refresh reconciliation");
         return 0;
     } catch (const std::exception &failure) {
         std::fprintf(stderr, "FAIL indexed native mark binding: %s\n", failure.what());
