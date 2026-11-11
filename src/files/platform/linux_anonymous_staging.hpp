@@ -5,6 +5,12 @@
 #include "../observation.hpp"
 
 namespace ck::files::detail {
+#ifdef __linux__
+// Own a verified procfs view of this thread's descriptor table. The caller
+// must keep every descriptor named through this view alive during use.
+Observation<int> open_linux_thread_fd_directory();
+#endif
+
 // Available transfers one CLOEXEC O_TMPFILE descriptor to the caller. No
 // temporary name is created and no named staging fallback is attempted.
 Observation<int> create_linux_anonymous_staging(int directory);

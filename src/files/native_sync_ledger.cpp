@@ -15,6 +15,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include "platform/linux_anonymous_staging.hpp"
+#include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/inotify.h>
+#include <utility>
+#endif
 #include <algorithm>
 #include <limits>
 #include <set>
@@ -22,6 +30,93 @@ namespace ck::files {
 namespace {
 using namespace sync_detail;
 using Wire=std::vector<std::byte>;
+#ifdef __linux__
+[[noreturn]] void ledger_watch_error(int code, const char* operation) {
+    auto state = ObservationState::Failed;
+    if (code == EACCES || code == EPERM)
+        state = ObservationState::Denied;
+    if (code == ENOSYS || code == EOPNOTSUPP)
+        state = ObservationState::Unsupported;
+    throw Failure{{state, {ErrorDomain::Posix, code, operation}}};
+}
+
+class LedgerWatchFd final {
+public:
+    LedgerWatchFd(PreparedJournalRoot& root, int fd) noexcept : root_(root), fd_(fd) {}
+    LedgerWatchFd(const LedgerWatchFd&) = delete;
+    LedgerWatchFd& operator=(const LedgerWatchFd&) = delete;
+    ~LedgerWatchFd() { (void)consume(); }
+    int get() const noexcept { return fd_; }
+    int release() noexcept { return std::exchange(fd_, -1); }
+    void finish() {
+        if (const int error = consume())
+            ledger_watch_error(error, "native_sync.ledger_watch_close");
+    }
+private:
+    int consume() noexcept {
+        const int fd = release();
+        if (fd < 0 || ::close(fd) == 0)
+            return 0;
+        const int error = errno;
+        detail::record_prepared_journal_consumer_failure(root_, ObservationState::Unknown,
+            ErrorDomain::Posix, error, "native_sync.ledger_watch_close");
+        return error;
+    }
+    PreparedJournalRoot& root_;
+    int fd_;
+};
+
+int start_linux_ledger_watch(PreparedJournalRoot& root) {
+    LedgerWatchFd directory(root, value(detail::duplicate_prepared_journal_directory(root)));
+    LedgerWatchFd proc(root, value(detail::open_linux_thread_fd_directory()));
+    const auto component = std::to_string(directory.get());
+    struct stat held{}, kernel_link{}, target{};
+    if (::fstat(directory.get(), &held) != 0 ||
+        ::fstatat(proc.get(), component.c_str(), &kernel_link, AT_SYMLINK_NOFOLLOW) != 0 ||
+        ::fstatat(proc.get(), component.c_str(), &target, 0) != 0)
+        ledger_watch_error(errno, "native_sync.ledger_watch_identity");
+    if (!S_ISLNK(kernel_link.st_mode) || !S_ISDIR(held.st_mode) || !S_ISDIR(target.st_mode) ||
+        held.st_dev != target.st_dev || held.st_ino != target.st_ino)
+        fail("native_sync.ledger_watch_identity");
+
+    // inotify takes a pathname. This kernel-owned procfs alias starts at the
+    // verified thread fd table and follows the retained directory descriptor.
+    // Neither the original directory name nor the recovery hint is used.
+    const auto alias = "/proc/thread-self/fd/" + std::to_string(proc.get()) + "/" + component;
+    LedgerWatchFd watch(root, ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC));
+    if (watch.get() < 0)
+        ledger_watch_error(errno, "native_sync.ledger_watch_create");
+    constexpr std::uint32_t events = IN_ONLYDIR | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
+        IN_ATTRIB | IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF;
+    if (::inotify_add_watch(watch.get(), alias.c_str(), events) < 0)
+        ledger_watch_error(errno, "native_sync.ledger_watch_bind");
+    proc.finish();
+    directory.finish();
+    return watch.release();
+}
+
+void finish_linux_ledger_watch(LedgerWatchFd& watch, std::stop_token token) {
+    for (;;) {
+        stop(token);
+        pollfd event{watch.get(), POLLIN, 0};
+        const int ready = ::poll(&event, 1, 0);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0)
+            ledger_watch_error(errno, "native_sync.ledger_watch_poll");
+        // Any queued notification, including overflow or watch loss,
+        // invalidates this inventory. Read-only enumeration is unsubscribed.
+        if (ready > 0 && (event.revents & POLLIN))
+            fail("native_sync.ledger_namespace_changed");
+        if (ready != 0)
+            fail("native_sync.ledger_watch_unavailable", ObservationState::Unknown,
+                 AdapterError::InvalidNativeResult);
+        watch.finish();
+        return;
+    }
+}
+#endif
+
 // Native observations of the SAME provider-owned directory; never an address
 // or injected cursor. Enumeration changes access time, so only namespace/version
 // fields participate. This does not claim exclusion of unrelated writers.
@@ -396,6 +491,10 @@ Observation<bool> NativeSyncLedger::finish_io() {
 Observation<std::vector<NativeSyncLoadedLedger>> load_native_sync_ledgers(PreparedJournalRoot::Pointer root,NativeSyncLedgerLimits limits,std::stop_token token) {
     return attempt<std::vector<NativeSyncLoadedLedger>>([&]{
         if(!root)fail("native_sync.null_storage_owner",ObservationState::Failed,AdapterError::InvalidAccess);
+#ifdef __linux__
+        stop(token);
+        LedgerWatchFd watch(*root, start_linux_ledger_watch(*root));
+#endif
         auto before=directory_version(*root);auto cursor=value(open_prepared_journal_directory(root));
         std::vector<NativeSyncLoadedLedger> out;std::size_t total=0,all_names=0;
         for(;;) {stop(token);auto batch=cursor->read(128,token);
@@ -415,6 +514,9 @@ Observation<std::vector<NativeSyncLoadedLedger>> load_native_sync_ledgers(Prepar
         }
         auto after=directory_version(*root);if(before!=after)fail("native_sync.ledger_namespace_changed");
         require(cursor->finish_io());require(root->revalidate());
+#ifdef __linux__
+        finish_linux_ledger_watch(watch, token);
+#endif
         return out;
     });
 }

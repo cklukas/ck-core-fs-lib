@@ -60,6 +60,7 @@ template<class T> Observation<T> invalid(AdapterError code, const char* op,
 bool same(const struct stat& a, const struct stat& b) {
     return a.st_dev == b.st_dev && a.st_ino == b.st_ino && S_ISREG(a.st_mode) && S_ISREG(b.st_mode);
 }
+} // namespace
 
 // The proc path is an acquisition route for an owning directory handle only.
 // Kernel resolution must remain beneath an actual procfs root, without bind
@@ -68,7 +69,7 @@ bool same(const struct stat& a, const struct stat& b) {
 // basename. Worker ownership forbids concurrent close/reuse of the source fd.
 // Administrative mutation of the process/mount namespace is outside this
 // boundary, just as closing another worker's owned fd is outside its contract.
-Observation<int> own_proc_fd_directory() {
+Observation<int> open_linux_thread_fd_directory() {
 #if defined(CK_HAVE_STAGING_OPENAT2) && defined(SYS_openat2)
     Fd root(::open("/proc", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
     if (root.get() < 0) return unsupported<int>("staging.proc_root_unavailable");
@@ -92,6 +93,7 @@ Observation<int> own_proc_fd_directory() {
 #endif
 }
 
+namespace {
 Observation<bool> finish_publication(int file, int directory, const char* name, const struct stat& expected) {
     struct stat held{}, published{};
     if (::fstat(file, &held) != 0)
@@ -152,7 +154,7 @@ Observation<bool> publish_linux_anonymous_staging(int file, int directory, const
     // especially EEXIST, never trigger an alternative publication attempt.
     if (direct_error != EPERM && direct_error != EACCES && direct_error != ENOENT)
         return error<bool>(direct_error, "staging.link_empty_path");
-    auto opened = own_proc_fd_directory();
+    auto opened = open_linux_thread_fd_directory();
     if (!opened.value()) return Observation<bool>::unavailable(opened.state(), opened.unavailable_detail()->error);
     Fd proc(std::move(opened).take_value());
     const auto number = std::to_string(file);
