@@ -92,8 +92,10 @@ int start_linux_ledger_watch(PreparedJournalRoot& root) {
     LedgerWatchFd watch(root, ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC));
     if (watch.get() < 0)
         ledger_watch_error(errno, "native_sync.ledger_watch_create");
+    // Ledger verification opens an existing file with write access for its
+    // shared I/O protocol. IN_CLOSE_WRITE would report that read-only use.
     constexpr std::uint32_t events = IN_ONLYDIR | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
-        IN_ATTRIB | IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF;
+        IN_ATTRIB | IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF;
     if (::inotify_add_watch(watch.get(), alias.c_str(), events) < 0)
         ledger_watch_error(errno, "native_sync.ledger_watch_bind");
     proc.finish();
