@@ -371,7 +371,9 @@ IndexedPanePublish IndexedPane::publish(Data data, std::stop_token stop) {
     bool have_focus = false;
     std::uint64_t next_position = 0;
     bool have_position = false;
+    HeldChild::Pointer next_focus_binding = focus_binding_;
     if (pending_kind_ == IndexedPaneDataOrigin::Listing) {
+        next_focus_binding.reset();
         if (data->visible_rows()) {
             auto first = [&] {
                 try {
@@ -393,6 +395,18 @@ IndexedPanePublish IndexedPane::publish(Data data, std::stop_token stop) {
             next_focus.number = first.value()->rows.front().record.row_id;
             have_focus = true;
             have_position = true;
+            if (retained_mark_limit_) {
+                auto bound = data->bind_row(state_stamp(), next_focus, EntryAccess::MetadataOnly, {}, stop, true);
+                if (bound.value())
+                    next_focus_binding = std::move(bound).take_value().child;
+                else if (data->lookup_->state() != DirectoryIndexLookupState::Ready ||
+                         data->store_->state() != DirectoryIndexStoreState::Sealed) {
+                    fail_listing(data->request_, *bound.unavailable_detail());
+                    return IndexedPanePublish::Failed;
+                }
+                if (stop.stop_requested())
+                    return IndexedPanePublish::Cancelled;
+            }
         }
     }
     if (pending_kind_ == IndexedPaneDataOrigin::Reorder && focus_) {
@@ -427,10 +441,12 @@ IndexedPanePublish IndexedPane::publish(Data data, std::stop_token stop) {
         marks_.reset();
         mark_bindings_.reset();
         invalidated_refresh_marks_ = 0;
+        invalidated_refresh_focus_ = false;
         mark_error_.reset();
     }
     visible_marks_ = data->visible_marks_;
     data_ = std::move(data);
+    focus_binding_ = std::move(next_focus_binding);
     if (have_focus)
         focus_.emplace(std::move(next_focus));
     else
@@ -822,6 +838,9 @@ Observation<OpenedIndexedRow> CompletedIndexedPaneData::bind_row(const PaneState
             return reject(*held_kind.unavailable_detail());
         if (*record_kind.value() != *held_kind.value())
             return reject(error(AdapterError::MetadataChanged, "indexed_row.kind", ObservationState::Changed));
+        std::size_t diagnostics = 0;
+        if (!detail::charge((*held.value())->metadata(), diagnostics, limits.diagnostic_bytes))
+            return reject(error(AdapterError::InventoryLimit, "indexed_row.diagnostics"));
     }
     if (auto e = boundary())
         return reject(*e);
@@ -864,11 +883,29 @@ IndexedPaneFocus IndexedPane::focus(const PaneStateStamp &stamp, PaneRowId row, 
         return IndexedPaneFocus::Cancelled;
     if (!accepts(stamp))
         return IndexedPaneFocus::Stale;
-    if (focus_ && *focus_ == row)
+    if (focus_ && *focus_ == row && (!retained_mark_limit_ || focus_binding_))
         return IndexedPaneFocus::Applied;
+    HeldChild::Pointer binding;
+    if (retained_mark_limit_) {
+        auto bound = data->bind_row(stamp, row, EntryAccess::MetadataOnly, {}, stop, true);
+        if (bound.value())
+            binding = std::move(bound).take_value().child;
+        else if (data->lookup_->state() != DirectoryIndexLookupState::Ready ||
+                 data->store_->state() != DirectoryIndexStoreState::Sealed) {
+            io_failure(*bound.unavailable_detail());
+            return IndexedPaneFocus::Failed;
+        }
+        if (stop.stop_requested())
+            return IndexedPaneFocus::Cancelled;
+        if (!accepts(stamp))
+            return IndexedPaneFocus::Stale;
+    }
     invalidate();
     focus_ = std::move(row);
     focus_position_ = **found.value();
+    focus_binding_ = std::move(binding);
+    if (focus_binding_)
+        invalidated_refresh_focus_ = false;
     return IndexedPaneFocus::Applied;
 }
 Observation<std::unique_ptr<IndexedPaneMarkJob>>
@@ -974,11 +1011,12 @@ IndexedPaneSelection IndexedPane::selection() const noexcept {
     const auto total = marks_ ? marks_->marked() : 0;
     result.marks = IndexedPaneMarkCounts{total, visible_marks_, total - visible_marks_};
     result.invalidated_refresh_marks = invalidated_refresh_marks_;
+    result.invalidated_refresh_focus = invalidated_refresh_focus_;
     if (total || invalidated_refresh_marks_)
         result.origin = PaneSourcesOrigin::Marks;
     if (pending_ || mark_pending_)
         result.state = PaneSourcesState::ListingPending;
-    else if (invalidated_refresh_marks_)
+    else if (invalidated_refresh_marks_ || (!total && invalidated_refresh_focus_))
         result.state = PaneSourcesState::SelectionInvalidated;
     else if (total) {
         result.state = total > visible_marks_ ? PaneSourcesState::HiddenMarksNeedReview : PaneSourcesState::Ready;

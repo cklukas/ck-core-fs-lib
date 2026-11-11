@@ -257,11 +257,11 @@ class IndexedPane final {
     IndexedPanePublish publish(Data data, std::stop_token stop = {});
     // Reconcile a privately prepared listing with the previous live pane.
     // Both worker-owned parent handles must establish the same directory.
-    // Marks transfer only through a successor of a previously held binding.
+    // Marks and focus transfer only through successors of held bindings.
     // A successful result installs the reconciled selection in this candidate;
     // callers still own the final candidate publication and old stamp retirement.
-    Observation<bool> reconcile_refresh_marks(const IndexedPane &previous, const PaneStateStamp &previous_stamp,
-                                               const PaneStateStamp &candidate_stamp, std::stop_token stop = {});
+    Observation<bool> reconcile_refresh_selection(const IndexedPane &previous, const PaneStateStamp &previous_stamp,
+                                                   const PaneStateStamp &candidate_stamp, std::stop_token stop = {});
     bool fail_listing(PaneListingRequest request, UnavailableObservation failure);
     bool cancel_listing(PaneListingRequest request) noexcept;
     IndexedPaneCapture capture_page(const PaneStateStamp &stamp, std::uint64_t first, IndexedPanePageLimits limits = {},
@@ -341,6 +341,7 @@ class IndexedPane final {
     Data data_;
     std::optional<PaneRowId> focus_;
     std::optional<std::uint64_t> focus_position_;
+    HeldChild::Pointer focus_binding_;
     std::optional<UnavailableObservation> error_;
     std::shared_ptr<DirectoryIndexMarks> marks_;
     const std::size_t retained_mark_limit_;
@@ -348,6 +349,7 @@ class IndexedPane final {
     std::shared_ptr<const CompletedIndexedMarkChange::Bindings> mark_bindings_;
     std::uint64_t visible_marks_ = 0;
     std::uint64_t invalidated_refresh_marks_ = 0;
+    bool invalidated_refresh_focus_ = false;
     bool mark_pending_ = false;
     std::optional<UnavailableObservation> mark_error_;
 };

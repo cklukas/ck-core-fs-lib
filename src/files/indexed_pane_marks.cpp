@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "indexed_pane_marks.hpp"
 #include "indexed_pane.hpp"
-#include "pane_page_budget.hpp"
 #include <algorithm>
 #include <limits>
 namespace ck::files {
@@ -109,11 +108,8 @@ bool IndexedPaneMarkJob::bind_mark(std::uint64_t number, std::stop_token stop) {
         }
         return true;
     }
-    std::size_t diagnostics = 0;
-    if (detail::charge(bound.value()->child->metadata(), diagnostics, limits.diagnostic_bytes)) {
-        binding->child = std::move(bound).take_value().child;
-        bindings_->emplace(number, std::move(binding));
-    }
+    binding->child = std::move(bound).take_value().child;
+    bindings_->emplace(number, std::move(binding));
     return true;
 }
 void IndexedPaneMarkJob::release() noexcept {

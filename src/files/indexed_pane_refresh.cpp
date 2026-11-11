@@ -40,11 +40,27 @@ bool matches_scan(const BasicMetadata &bound, const Observation<BasicMetadata> &
            *row->kind.value() == *bound.kind.value() &&
            compare_identity(*row->identity.value(), *bound.identity.value()) == IdentityComparison::Same;
 }
+
+HeldChild::Pointer refresh_binding(const HeldChild &old, const ObjectIdentity &parent,
+                                  const DirectoryIndexRecord &record, std::stop_token stop) {
+    if (old.name() != record.name || !old.parent_identity().value() ||
+        compare_identity(*old.parent_identity().value(), parent) != IdentityComparison::Same)
+        return {};
+    auto observed = old.refresh(stop);
+    if (!observed.value() || !(*observed.value())->continues(old) ||
+        !matches_scan((*observed.value())->metadata(), record.metadata))
+        return {};
+    std::size_t diagnostics = 0;
+    if (!detail::charge((*observed.value())->metadata(), diagnostics, IndexedDirectoryOpenLimits{}.diagnostic_bytes))
+        return {};
+    return std::move(observed).take_value();
+}
 } // namespace
 
-Observation<bool> IndexedPane::reconcile_refresh_marks(const IndexedPane &previous,
-                                                       const PaneStateStamp &previous_stamp,
-                                                       const PaneStateStamp &candidate_stamp, std::stop_token stop) {
+Observation<bool> IndexedPane::reconcile_refresh_selection(const IndexedPane &previous,
+                                                           const PaneStateStamp &previous_stamp,
+                                                           const PaneStateStamp &candidate_stamp,
+                                                           std::stop_token stop) {
     const auto current_selection = [&] {
         return previous.accepts(previous_stamp) && accepts(candidate_stamp);
     };
@@ -53,7 +69,8 @@ Observation<bool> IndexedPane::reconcile_refresh_marks(const IndexedPane &previo
     };
     if (this == &previous || !current_selection() || !data_ || !previous.data_ || pending_ ||
         mark_pending_ || previous.pending_ || previous.mark_pending_ || marks_ || mark_bindings_ ||
-        invalidated_refresh_marks_ || retained_mark_limit_ != previous.retained_mark_limit_ ||
+        invalidated_refresh_marks_ || invalidated_refresh_focus_ ||
+        retained_mark_limit_ != previous.retained_mark_limit_ ||
         data_->row_scope() == previous.data_->row_scope() || data_->source_scope_ != previous.data_->source_scope_)
         return refuse(ObservationState::Changed, AdapterError::InvalidAccess, "indexed_refresh.selection_state");
     if (stop.stop_requested())
@@ -64,6 +81,7 @@ Observation<bool> IndexedPane::reconcile_refresh_marks(const IndexedPane &previo
     const auto slots = previous.mark_binding_slots_;
     const auto old_bitmap = previous.marks_;
     const auto old_bindings = previous.mark_bindings_;
+    const auto old_focus = previous.focus_binding_;
     const auto verify_parents = [&]() -> Observation<bool> {
         auto held = prior->pin_->inspect_basic();
         if (!held.value())
@@ -107,7 +125,10 @@ Observation<bool> IndexedPane::reconcile_refresh_marks(const IndexedPane &previo
     }
 
     auto survivors = std::make_shared<Completed::Bindings>();
-    if (!names.empty()) {
+    std::optional<PaneRowId> focus;
+    std::optional<std::uint64_t> focus_position;
+    HeldChild::Pointer focus_binding;
+    if (!names.empty() || old_focus) {
         auto scan = candidate->store_->begin_scan();
         if (!scan.value())
             return forward_failure(scan);
@@ -120,25 +141,27 @@ Observation<bool> IndexedPane::reconcile_refresh_marks(const IndexedPane &previo
                 if (stop.stop_requested())
                     return cancelled();
                 const auto &record = row.record;
+                if (old_focus && !focus && old_focus->name() == record.name) {
+                    auto observed = refresh_binding(*old_focus, *prior->directory_.value(), record, stop);
+                    if (observed) {
+                        auto rank = candidate->lookup_->locate_row({candidate->row_scope(), record.row_id}, stop);
+                        if (!rank.value())
+                            return forward_failure(rank);
+                        focus = PaneRowId{candidate->row_scope(), record.row_id};
+                        focus_position = *rank.value();
+                        focus_binding = std::move(observed);
+                    }
+                }
                 const auto found = names.find(record.name);
                 if (found == names.end() || slots->load(std::memory_order_relaxed) >= 2 * retained_mark_limit_)
                     continue;
                 const auto *old = found->second;
-                if (!old->parent_identity().value() ||
-                    compare_identity(*old->parent_identity().value(), *prior->directory_.value()) != IdentityComparison::Same)
-                    continue;
                 auto binding = std::make_shared<Completed::Binding>(slots);
-                auto observed = old->refresh(stop);
+                binding->child = refresh_binding(*old, *prior->directory_.value(), record, stop);
                 if (stop.stop_requested())
                     return cancelled();
-                if (!observed.value() || !(*observed.value())->continues(*old) ||
-                    !matches_scan((*observed.value())->metadata(), record.metadata))
+                if (!binding->child)
                     continue;
-                std::size_t diagnostics = 0;
-                if (!detail::charge((*observed.value())->metadata(), diagnostics,
-                                    IndexedDirectoryOpenLimits{}.diagnostic_bytes))
-                    continue;
-                binding->child = std::move(observed).take_value();
                 if (!survivors->emplace(record.row_id, std::move(binding)).second)
                     return refuse(ObservationState::Failed, AdapterError::InvalidNativeResult, "indexed_refresh.duplicate_row");
                 names.erase(found);
@@ -202,6 +225,12 @@ Observation<bool> IndexedPane::reconcile_refresh_marks(const IndexedPane &previo
     mark_bindings_ = survivors->empty() ? nullptr : std::move(survivors);
     visible_marks_ = visible;
     invalidated_refresh_marks_ = lost > maximum - older_loss ? maximum : lost + older_loss;
+    if (previous.focus_ || previous.invalidated_refresh_focus_) {
+        focus_ = std::move(focus);
+        focus_position_ = focus_position;
+        focus_binding_ = std::move(focus_binding);
+        invalidated_refresh_focus_ = !focus_;
+    }
     return Observation<bool>::available(true);
 }
 } // namespace ck::files

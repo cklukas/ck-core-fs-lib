@@ -137,17 +137,19 @@ void run(const std::filesystem::path &fixture) {
     list(refreshed, take(fs.open_native_directory(source_path)), factory, budget, std::byte{2});
     const auto previous_stamp = pane.state_stamp();
     const auto candidate_stamp = refreshed.state_stamp();
-    check(!refreshed.reconcile_refresh_marks(pane, previous_stamp, candidate_stamp, stop.get_token()).value(),
+    check(!refreshed.reconcile_refresh_selection(pane, previous_stamp, candidate_stamp, stop.get_token()).value(),
           "cancel refresh before publication");
     check(previous_stamp.current() && candidate_stamp.current() && !refreshed.retained_mark_bindings(),
           "cancel leaves both panes unchanged");
-    check(take(refreshed.reconcile_refresh_marks(pane, previous_stamp, candidate_stamp)), "reconcile fresh scan");
+    check(take(refreshed.reconcile_refresh_selection(pane, previous_stamp, candidate_stamp)), "reconcile fresh scan");
     check(previous_stamp.current() && !candidate_stamp.current(), "revoke only the changed candidate");
     const auto page = refreshed.capture_page(refreshed.state_stamp(), 0).page;
     check(page && page->rows().size() == 3 && page->rows()[0].display_name == "earlier" &&
           page->rows()[2].display_name == "two" && page->rows()[2].id.scope != second.scope &&
           page->rows()[2].marked && !page->rows()[1].marked,
           "carry the held mark to its new row ID");
+    check(refreshed.focused_position() == 1 && refreshed.focused() == page->rows()[1].id &&
+          !refreshed.selection().invalidated_refresh_focus, "carry the held focus to its new rank");
     check(refreshed.selection().marks->total == 1 && refreshed.selection().invalidated_refresh_marks == 1 &&
           refreshed.selection().state == PaneSourcesState::SelectionInvalidated &&
           !refreshed.begin_source_acquisition(refreshed.state_stamp()).value(),
@@ -156,7 +158,7 @@ void run(const std::filesystem::path &fixture) {
     IndexedPane unrelated(1);
     auto foreign = take(parent->create_child_directory(name("other", u"other")));
     list(unrelated, std::move(foreign), factory, budget, std::byte{3});
-    check(!unrelated.reconcile_refresh_marks(pane, previous_stamp, unrelated.state_stamp()).value() &&
+    check(!unrelated.reconcile_refresh_selection(pane, previous_stamp, unrelated.state_stamp()).value() &&
           previous_stamp.current() && !unrelated.retained_mark_bindings(), "refuse a different held parent");
     mark(pane, IndexedClearMarks{}); // Model retirement of the predecessor.
     {
@@ -164,26 +166,38 @@ void run(const std::filesystem::path &fixture) {
         PaneView filtered;
         filtered.display_substring = "earlier";
         list(hidden, take(fs.open_native_directory(source_path)), factory, budget, std::byte{4}, filtered);
-        check(take(hidden.reconcile_refresh_marks(refreshed, refreshed.state_stamp(), hidden.state_stamp())),
+        check(take(hidden.reconcile_refresh_selection(refreshed, refreshed.state_stamp(), hidden.state_stamp())),
               "reconcile another scan");
         const auto selected = hidden.selection();
         check(selected.marks && selected.marks->total == 1 && selected.marks->hidden == 1 &&
-              selected.invalidated_refresh_marks == 1, "retain a filtered mark and prior loss");
+              selected.invalidated_refresh_marks == 1 && hidden.focused() && !hidden.focused_position() &&
+              !selected.invalidated_refresh_focus, "retain filtered mark and focus and prior loss");
     }
 #if !defined(_WIN32)
     // Keep the original marked handle open while changing its name and
     // inserting a different native object under the original basename.
     std::filesystem::rename(fixture / "source" / "two", fixture / "source" / "retired-two");
     create_file(*source, name("two", u"two"));
+    std::filesystem::rename(fixture / "source" / "one", fixture / "source" / "retired-one");
+    create_file(*source, name("one", u"one"));
     {
         IndexedPane replaced(1);
         list(replaced, take(fs.open_native_directory(source_path)), factory, budget, std::byte{5});
-        check(take(replaced.reconcile_refresh_marks(refreshed, refreshed.state_stamp(), replaced.state_stamp())),
+        check(take(replaced.reconcile_refresh_selection(refreshed, refreshed.state_stamp(), replaced.state_stamp())),
               "reconcile a replaced mark");
         const auto selected = replaced.selection();
         check(selected.marks && selected.marks->total == 0 && selected.invalidated_refresh_marks == 2 &&
-              selected.state == PaneSourcesState::SelectionInvalidated && !selected.candidates,
-              "refuse to transfer a mark to a replacement or renamed object");
+              selected.state == PaneSourcesState::SelectionInvalidated && !selected.candidates &&
+              selected.invalidated_refresh_focus && !replaced.focused(),
+              "refuse to transfer marks or focus to a replacement or renamed object");
+        mark(replaced, IndexedClearMarks{});
+        check(replaced.selection().state == PaneSourcesState::SelectionInvalidated,
+              "clearing lost marks does not choose a new cursor");
+        const auto first_visible = replaced.capture_page(replaced.state_stamp(), 0).page;
+        check(first_visible && !first_visible->rows().empty() &&
+              replaced.focus(replaced.state_stamp(), first_visible->rows().front().id) == IndexedPaneFocus::Applied &&
+              replaced.selection().state == PaneSourcesState::Ready,
+              "binding a new explicit cursor restores source selection");
     }
 #endif
     mark(refreshed, IndexedClearMarks{});

@@ -124,5 +124,6 @@ struct IndexedPaneSelection {
     std::uint64_t candidates = 0;
     std::optional<IndexedPaneMarkCounts> marks;
     std::uint64_t invalidated_refresh_marks = 0;
+    bool invalidated_refresh_focus = false;
 };
 } // namespace ck::files
