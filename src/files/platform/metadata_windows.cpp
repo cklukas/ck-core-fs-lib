@@ -2,6 +2,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "native_filesystem.hpp"
+#include "held_directory_scan.hpp"
 #include "native_close_test_faults.hpp"
 #include "legacy_native_fixture_windows.hpp"
 #include "native_windows_checked_metadata_io.hpp"
@@ -2461,7 +2462,9 @@ Observation<VolumeSpaceCounters> volume_space(HANDLE handle) {
 }
 
 class WindowsDirectoryCursor final : public DirectoryCursor {
+    friend class ::ck::files::DirectoryCursor;
     friend class WindowsOpenedEntry;
+    friend class WindowsHeldDirectoryScan;
     friend class WindowsTargetReadSeed;
 public:
     Observation<std::shared_ptr<const OpenedEntry>> open_progressive_directory_source(const MetadataReplayPolicy& policy)const {
@@ -3633,18 +3636,25 @@ private:
     Observation<DirectoryStep> next_step() override {
         using Result = Observation<DirectoryStep>;
         if(journal_scan_finished_)return failure<DirectoryStep>(ERROR_INVALID_HANDLE,"journal_reader.root_finished");
+        if(target_read_enumeration_finished_)return Result::available(DirectoryEnd{});
+        auto step = read_native_step();
+        if (target_read_enumeration_lease_ && step.value() && std::holds_alternative<DirectoryEnd>(*step.value())) {
+            target_read_enumeration_finished_ = true;
+            target_read_enumeration_lease_.reset();
+        }
+        return step;
+    }
+    Observation<DirectoryStep> read_native_step() const {
+        using Result = Observation<DirectoryStep>;
         static_assert(offsetof(FILE_ID_BOTH_DIR_INFO, FileName) == detail::windows_directory_name_offset);
         static_assert(offsetof(FILE_ID_BOTH_DIR_INFO, FileNameLength) == detail::windows_directory_name_length_offset);
-        if(target_read_enumeration_finished_)return Result::available(DirectoryEnd{});
         if (!offset_) {
             buffer_.fill(std::byte{});
             const auto info_class = started_ ? FileIdBothDirectoryInfo : FileIdBothDirectoryRestartInfo;
             if (!detail::legacy_query(handle_.get(), info_class, buffer_.data(), static_cast<DWORD>(buffer_.size()),"legacy.metadata_windows.GetFileInformationByHandleEx.19")) {
                 const DWORD code = GetLastError();
-                if (code == ERROR_NO_MORE_FILES) {
-                    if(target_read_enumeration_lease_){target_read_enumeration_finished_=true;target_read_enumeration_lease_.reset();}
+                if (code == ERROR_NO_MORE_FILES)
                     return Result::available(DirectoryEnd{});
-                }
                 return failure<DirectoryStep>(code, "FileIdBothDirectoryInfo");
             }
             started_ = true;
@@ -3667,9 +3677,80 @@ private:
     AdapterScope scope_;
     // Fixed bound, sufficient for a full native UTF-16 component plus header.
     // A provider rejecting the query reports an error; never reopen by path.
-    alignas(8) std::array<std::byte, 128 * 1024> buffer_{};
-    std::optional<std::size_t> offset_;
-    bool started_ = false;
+    alignas(8) mutable std::array<std::byte, 128 * 1024> buffer_{};
+    mutable std::optional<std::size_t> offset_;
+    mutable bool started_ = false;
+    mutable bool read_only_scan_active_ = false;
+};
+
+class WindowsHeldDirectoryScan final : public detail::HeldDirectoryScan {
+public:
+    WindowsHeldDirectoryScan(std::shared_ptr<const DirectoryCursor> parent, const WindowsDirectoryCursor& native)
+        : HeldDirectoryScan(std::move(parent)), native_(native) {
+        native_.read_only_scan_active_ = true;
+        native_.started_ = false;
+        native_.offset_.reset();
+    }
+    ~WindowsHeldDirectoryScan() override { release_position(); }
+
+    Observation<bool> verify_directory() const {
+        using Result = Observation<bool>;
+        const auto current = native_.inspect_basic();
+        if (const auto* error = current.unavailable_detail())
+            return Result::unavailable(error->state, error->error);
+        const auto& metadata = *current.value();
+        if (const auto* error = metadata.windows_attributes.unavailable_detail())
+            return Result::unavailable(error->state, error->error);
+        if (const auto* error = metadata.kind.unavailable_detail())
+            return Result::unavailable(error->state, error->error);
+        if (*metadata.windows_attributes.value() & FILE_ATTRIBUTE_REPARSE_POINT)
+            return Result::unavailable(ObservationState::Failed,
+                {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::FinalLinkRejected), "directory_scan.reparse"});
+        if (*metadata.kind.value() != ObjectKind::Directory)
+            return Result::unavailable(ObservationState::Changed,
+                {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::NotDirectory), "directory_scan.kind"});
+        if (const auto* error = native_.identity().unavailable_detail())
+            return Result::unavailable(error->state, error->error);
+        if (const auto* error = metadata.identity.unavailable_detail())
+            return Result::unavailable(error->state, error->error);
+        switch (compare_identity(*native_.identity().value(), *metadata.identity.value())) {
+        case IdentityComparison::Same:
+            return Result::available(true);
+        case IdentityComparison::Different:
+            return Result::unavailable(ObservationState::Changed,
+                {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::MetadataChanged), "directory_scan.identity"});
+        default:
+            return Result::unavailable(ObservationState::Unknown,
+                {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnqualifiedIdentity), "directory_scan.identity"});
+        }
+    }
+
+private:
+    void release_position() noexcept {
+        if (owns_position_) {
+            native_.read_only_scan_active_ = false;
+            owns_position_ = false;
+        }
+    }
+    Observation<DirectoryStep> next_step() override {
+        try {
+            auto step = native_.read_native_step();
+            if (!step.value()) {
+                release_position();
+            } else if (std::holds_alternative<DirectoryEnd>(*step.value())) {
+                auto verified = verify_directory();
+                release_position();
+                if (const auto* error = verified.unavailable_detail())
+                    return Observation<DirectoryStep>::unavailable(error->state, error->error);
+            }
+            return step;
+        } catch (...) {
+            release_position();
+            throw;
+        }
+    }
+    const WindowsDirectoryCursor& native_; // lifetime held by the base
+    bool owns_position_ = true;
 };
 
 // Prepared target observation owners are independent of the metadata writer.
@@ -4469,6 +4550,29 @@ Observation<std::unique_ptr<DirectoryCursor>> NativeFileSystem::open_directory(
     auto native_identity = identity(handle.get(), scope_);
     return Result::available(std::make_unique<WindowsDirectoryCursor>(std::move(handle), std::move(native_identity), scope_));
 }
+Observation<std::unique_ptr<DirectoryCursor>>
+DirectoryCursor::open_read_only_scan(std::shared_ptr<const DirectoryCursor> parent) {
+    using Result = Observation<std::unique_ptr<DirectoryCursor>>;
+    if (!parent)
+        return Result::unavailable(ObservationState::Failed,
+            {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidIdentifier), "directory_scan.parent"});
+    const auto* native = dynamic_cast<const WindowsDirectoryCursor*>(parent.get());
+    if (!native || native->journal_scan_ || native->target_read_consumer_)
+        return Result::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::ProviderReviewRequired), "directory_scan.native_cursor_required"});
+    // Only a parent at sticky End can lend its position without disrupting a
+    // caller's original scan. No handle is duplicated, reopened or exchanged.
+    if (!parent->ended_ || native->read_only_scan_active_)
+        return Result::unavailable(ObservationState::Denied,
+            {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidAccess),
+             parent->ended_ ? "directory_scan.busy" : "directory_scan.requires_end"});
+    auto scan = std::make_unique<WindowsHeldDirectoryScan>(std::move(parent), *native);
+    const auto verified = scan->verify_directory();
+    if (const auto* error = verified.unavailable_detail())
+        return Result::unavailable(error->state, error->error);
+    return Result::available(std::move(scan));
+}
+
 Observation<std::unique_ptr<DirectoryCursor>> open_native_operation_journal_directory(const NativeAbsolutePath& address) {
     using R=Observation<std::unique_ptr<DirectoryCursor>>;
     auto host=address.host_path();

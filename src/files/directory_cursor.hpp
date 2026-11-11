@@ -53,6 +53,17 @@ public:
     // At most max_batch_size native steps per read, including omitted entries;
     // a More batch may therefore contain fewer names than the requested limit.
     DirectoryRead read(std::size_t limit, std::stop_token stop = {});
+    // Native worker-only rescan of the exact held directory, with a new
+    // enumeration lifetime. Link ck_files_platform for this optional boundary.
+    // The view retains parent and offers enumeration, metadata and MetadataOnly
+    // child opens. Keep parent itself as the anchor for existing HeldChild
+    // families and later scans. Neither the view nor End certifies a snapshot.
+    // Windows requires parent to have reached native End and allows one live
+    // scan at a time. Its lease ends on native End/error or view destruction.
+    // An incomplete or busy Windows parent is Denied; unrecognized or
+    // special-purpose cursors can return Unsupported. No pathname reopen.
+    static Observation<std::unique_ptr<DirectoryCursor>>
+    open_read_only_scan(std::shared_ptr<const DirectoryCursor> parent);
     // One native component only, opened without following the final link or
     // reparse point. This captures the object present at open time, not an
     // earlier enumeration snapshot. Revalidate identity before later actions.

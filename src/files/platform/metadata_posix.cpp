@@ -17,6 +17,7 @@
 #include "../operation_journal_file.hpp"
 #include "prepared_journal_failure_latch.hpp"
 #include "native_directory_reader.hpp"
+#include "held_directory_scan.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -2193,8 +2194,8 @@ using OwnedDirectory = std::unique_ptr<DIR, DirectoryCloser>;
 
 class PosixDirectoryCursor final : public DirectoryCursor {
 public:
-    Observation<std::unique_ptr<DirectoryCursor>> open_current_directory_reader()const {
-        using R=Observation<std::unique_ptr<DirectoryCursor>>;
+    Observation<std::unique_ptr<PosixDirectoryCursor>> open_current_directory_reader()const {
+        using R=Observation<std::unique_ptr<PosixDirectoryCursor>>;
         const auto before=inspect_basic();
         if(!before.value()){const auto&e=*before.unavailable_detail();return R::unavailable(e.state,e.error);}
         if(!identity().value()||!before.value()->identity.value()||
@@ -2225,6 +2226,12 @@ public:
         if(!same(after)||!same(opened))return R::unavailable(ObservationState::Changed,
             adapter_error(AdapterError::MetadataChanged,"directory_reader.open_bookend"));
         return R::available(std::move(reader));
+    }
+    bool supports_read_only_scan() const noexcept {
+#if defined(__linux__)
+        if (target_read_budget_) return false;
+#endif
+        return !journal_scan_;
     }
     Observation<std::shared_ptr<const OpenedEntry>> open_progressive_directory_source()const {
         using R=Observation<std::shared_ptr<const OpenedEntry>>;
@@ -3120,6 +3127,7 @@ public:
     }
 private:
     friend class PosixTargetReadSeed;
+    friend class PosixHeldDirectoryScan;
     Observation<DirectoryStep> next_step() override {
         if(journal_scan_finished_)return Observation<DirectoryStep>::unavailable(ObservationState::Denied,{ErrorDomain::Posix,EBADF,"journal_reader.root_finished"});
         using Result = Observation<DirectoryStep>;
@@ -3165,6 +3173,17 @@ private:
 #endif
     OwnedDirectory directory_;
     AdapterScope scope_;
+};
+
+class PosixHeldDirectoryScan final : public detail::HeldDirectoryScan {
+public:
+    PosixHeldDirectoryScan(std::shared_ptr<const DirectoryCursor> parent,
+                           std::unique_ptr<PosixDirectoryCursor> reader)
+        : HeldDirectoryScan(std::move(parent)), reader_(std::move(reader)) {}
+
+private:
+    Observation<DirectoryStep> next_step() override { return reader_->next_step(); }
+    std::unique_ptr<PosixDirectoryCursor> reader_;
 };
 
 #if defined(__linux__)
@@ -3608,12 +3627,33 @@ Observation<std::unique_ptr<DirectoryCursor>> NativeFileSystem::open_directory(
     return Result::available(std::make_unique<PosixDirectoryCursor>(std::move(directory), std::move(identity), scope_));
 }
 
+Observation<std::unique_ptr<DirectoryCursor>>
+DirectoryCursor::open_read_only_scan(std::shared_ptr<const DirectoryCursor> parent) {
+    using Result = Observation<std::unique_ptr<DirectoryCursor>>;
+    if (!parent)
+        return Result::unavailable(ObservationState::Failed,
+            adapter_error(AdapterError::InvalidIdentifier, "directory_scan.parent"));
+    const auto* native = dynamic_cast<const PosixDirectoryCursor*>(parent.get());
+    if (!native || !native->supports_read_only_scan())
+        return Result::unavailable(ObservationState::Unsupported,
+            adapter_error(AdapterError::ProviderReviewRequired, "directory_scan.native_cursor_required"));
+    auto reader = native->open_current_directory_reader();
+    if (const auto* error = reader.unavailable_detail())
+        return Result::unavailable(error->state, error->error);
+    return Result::available(std::make_unique<PosixHeldDirectoryScan>(
+        std::move(parent), std::move(reader).take_value()));
+}
+
 namespace detail {
 Observation<std::unique_ptr<DirectoryCursor>> open_posix_directory_reader(const DirectoryCursor& cursor) {
+    using Result = Observation<std::unique_ptr<DirectoryCursor>>;
     auto* native=dynamic_cast<const PosixDirectoryCursor*>(&cursor);
-    if(!native)return Observation<std::unique_ptr<DirectoryCursor>>::unavailable(ObservationState::Unsupported,
+    if(!native)return Result::unavailable(ObservationState::Unsupported,
         adapter_error(AdapterError::ProviderReviewRequired,"directory_reader.native_cursor_required"));
-    return native->open_current_directory_reader();
+    auto reader = native->open_current_directory_reader();
+    if (const auto* error = reader.unavailable_detail())
+        return Result::unavailable(error->state, error->error);
+    return Result::available(std::move(reader).take_value());
 }
 #if defined(__linux__)
 Observation<NativeTargetReadSeed::Pointer> begin_native_target_read_seed(

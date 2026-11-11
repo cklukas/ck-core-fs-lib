@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #ifdef _WIN32
 #define NOMINMAX
@@ -215,6 +217,135 @@ void cursor_checks(NativeFileSystem& fs, const Path& p, const Path& expected) {
     require(found && ended, "exact native enumeration/resume");
     require(d->read(1).state == DirectoryReadState::End, "sticky cursor end");
 }
+std::vector<NativeName> drain_names(DirectoryCursor& cursor, std::vector<NativeName> names = {}) {
+    for (int steps = 0; steps < 128; ++steps) {
+        auto batch = cursor.read(1);
+        if (batch.error) {
+            const auto& error = batch.error->error;
+            throw std::runtime_error("scan read domain=" + std::to_string(int(error.domain)) +
+                " code=" + std::to_string(error.code) + " operation=" + error.operation);
+        }
+        require(batch.names.size() <= 1 && batch.state != DirectoryReadState::Cancelled, "bounded scan read");
+        names.insert(names.end(), batch.names.begin(), batch.names.end());
+        if (batch.state == DirectoryReadState::End) {
+            std::sort(names.begin(), names.end(), NativeNameLess{});
+            return names;
+        }
+    }
+    throw std::runtime_error("scan did not reach native End");
+}
+std::vector<NativeName> sorted_names(std::initializer_list<NativeName> names) {
+    std::vector<NativeName> result(names);
+    std::sort(result.begin(), result.end(), NativeNameLess{});
+    return result;
+}
+void held_scan_names(NativeFileSystem& fs, const Path& path, const std::vector<NativeName>& expected) {
+    auto parent = std::shared_ptr<DirectoryCursor>(take(fs.open_directory(std::filesystem::path(path))));
+    require(drain_names(*parent) == expected, "initial exact scan names");
+    auto scan = take(DirectoryCursor::open_read_only_scan(parent));
+    require(compare_identity(take(parent->identity()), take(scan->identity())) == IdentityComparison::Same,
+        "rescan parent identity");
+    require(take(parent->source_scope()) == take(scan->source_scope()), "rescan parent scope");
+    require(drain_names(*scan) == expected, "held exact scan names");
+    require(parent->read(1).state == DirectoryReadState::End, "parent End changed by rescan");
+}
+void held_scan_after_replacement(NativeFileSystem& fs, Fixtures& f) {
+    const auto original = f.root + sep + ascii("scan-original");
+    const auto moved = f.root + sep + ascii("scan-moved");
+    const auto first_leaf = ascii("one"), second_leaf = ascii("two"), fresh_leaf = ascii("new");
+    f.dir(original);
+    f.file(original + sep + first_leaf, 13);
+    f.file(original + sep + second_leaf, 17);
+    auto parent = std::shared_ptr<DirectoryCursor>(take(fs.open_directory(std::filesystem::path(original))));
+    const auto identity = take(parent->identity());
+    const auto old_names = sorted_names({name(first_leaf), name(second_leaf)});
+    auto partial = parent->read(1);
+    require(partial.state == DirectoryReadState::More && partial.names.size() == 1, "initial scan part");
+#ifdef _WIN32
+    auto incomplete = DirectoryCursor::open_read_only_scan(parent);
+    require(incomplete.state() == ObservationState::Denied &&
+        incomplete.unavailable_detail()->error.operation == "directory_scan.requires_end",
+        "active original cursor must keep its position");
+#else
+    {
+        auto independent = take(DirectoryCursor::open_read_only_scan(parent));
+        require(drain_names(*independent) == old_names, "independent scan starts at the beginning");
+    }
+#endif
+    require(drain_names(*parent, std::move(partial.names)) == old_names, "original partial scan resumed exactly");
+
+    // The only open fixture handle is the held parent. Replace its old path
+    // after native End, then make a change visible only through that parent.
+    f.moved(original, moved);
+    f.dir(original);
+    f.file(original + sep + ascii("decoy"), 23);
+    f.file(moved + sep + fresh_leaf, 29);
+    auto replacement = take(fs.open_directory(std::filesystem::path(original)));
+    require(compare_identity(identity, take(replacement->identity())) == IdentityComparison::Different,
+        "fixture path replacement did not change the parent");
+    auto first = take(DirectoryCursor::open_read_only_scan(parent));
+    const auto new_names = sorted_names({name(first_leaf), name(second_leaf), name(fresh_leaf)});
+    std::stop_source stop;
+    stop.request_stop();
+    require(first->read(1, stop.get_token()).state == DirectoryReadState::Cancelled, "rescan pre-cancel");
+    auto first_part = first->read(1);
+    require(first_part.state == DirectoryReadState::More && first_part.names.size() == 1, "rescan part");
+    require(parent->read(1).state == DirectoryReadState::End, "original cursor revived during rescan");
+    auto opened = take(first->open_child(name(fresh_leaf)));
+    require(take(take(opened->inspect_basic()).logical_size) == 29, "scan did not retain the old parent for child lookup");
+    opened.reset();
+    require(first->open_child(name(fresh_leaf), EntryAccess::ContentRead).state() == ObservationState::Denied,
+        "read-only scan granted content access");
+    require(first->create_child_file(name(ascii("unexpected"))).state() == ObservationState::Unsupported,
+        "read-only scan granted creation");
+#ifdef _WIN32
+    auto busy = DirectoryCursor::open_read_only_scan(parent);
+    require(busy.state() == ObservationState::Denied && busy.unavailable_detail()->error.operation == "directory_scan.busy",
+        "second scan acquired a live Windows position");
+#else
+    auto simultaneous = take(DirectoryCursor::open_read_only_scan(parent));
+    require(drain_names(*simultaneous) == new_names, "second POSIX scan shares the first scan's position");
+#endif
+    require(compare_identity(identity, take(take(first->inspect_basic()).identity)) == IdentityComparison::Same,
+        "rescan inspected the path replacement");
+    require(drain_names(*first, std::move(first_part.names)) == new_names, "rescan listed the replacement or lost entries");
+
+    auto abandoned = take(DirectoryCursor::open_read_only_scan(parent));
+    require(abandoned->read(1).state == DirectoryReadState::More, "second rescan must restart before abandonment");
+    first.reset(); // destroying an older completed view must not release a newer lease
+#ifdef _WIN32
+    require(DirectoryCursor::open_read_only_scan(parent).state() == ObservationState::Denied,
+        "older completed view released a newer lease");
+#endif
+    abandoned.reset();
+    auto last = take(DirectoryCursor::open_read_only_scan(parent));
+    std::weak_ptr<DirectoryCursor> retained = parent;
+    parent.reset();
+#ifndef _WIN32
+    simultaneous.reset();
+#endif
+    require(!retained.expired() && drain_names(*last) == new_names, "scan lost its original parent pin");
+    last.reset();
+    require(retained.expired(), "scan leaked its original parent pin");
+}
+class UnrecognizedScanParent final : public DirectoryCursor {
+private:
+    Observation<DirectoryStep> next_step() override { throw std::runtime_error("non-native cursor consumed"); }
+};
+void held_scan_unsupported() {
+    require(DirectoryCursor::open_read_only_scan(std::make_shared<UnrecognizedScanParent>()).state() ==
+        ObservationState::Unsupported, "unrecognized cursor accepted as a native scan");
+}
+void held_scan_after_empty_end(NativeFileSystem& fs, Fixtures& f) {
+    const auto empty = f.root + sep + ascii("scan-empty");
+    const auto first = ascii("first");
+    f.dir(empty);
+    auto parent = std::shared_ptr<DirectoryCursor>(take(fs.open_directory(std::filesystem::path(empty))));
+    require(drain_names(*parent).empty(), "initial empty directory");
+    f.file(empty + sep + first, 41);
+    auto scan = take(DirectoryCursor::open_read_only_scan(parent));
+    require(drain_names(*scan) == sorted_names({name(first)}), "rescan inherited the empty cursor's End");
+}
 void rejection(ckfe_engine* engine, const Path& p) {
     auto d = directory(engine, p); Error error;
     for (const char* invalid : {"..", "a/b", ".", ""}) {
@@ -341,15 +472,28 @@ void native_rename_flush(ckfe_engine* engine, NativeFileSystem& fs, Fixtures& f)
 }
 void sharing_denied(ckfe_engine* engine, NativeFileSystem& fs, Fixtures& f) {
     auto path = f.root + L"\\sharing"; f.file(path, 59);
-    auto d = directory(engine, f.root); auto parent = take(fs.open_directory(std::filesystem::path(f.root)));
-    HANDLE lock = CreateFileW(extended(path).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+    auto d = directory(engine, f.root);
+    auto parent = std::shared_ptr<DirectoryCursor>(take(fs.open_directory(std::filesystem::path(f.root))));
+    (void)drain_names(*parent);
+    auto scan = take(DirectoryCursor::open_read_only_scan(parent));
+    const auto lock_handle = CreateFileW(extended(path).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
         OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    require(lock != INVALID_HANDLE_VALUE, "exclusive sharing fixture");
+    require(lock_handle != INVALID_HANDLE_VALUE, "exclusive sharing fixture");
+    auto lock = std::unique_ptr<void, decltype(&CloseHandle)>(lock_handle, CloseHandle);
     Error error; ckfe_entry* out = nullptr;
     auto status = ckfe_entry_open_utf8(d.get(), "sharing", &out, &error.value);
-    auto native = parent->open_child(name(L"sharing"), EntryAccess::ContentRead);
-    CloseHandle(lock);
     Entry owned(out, ckfe_entry_destroy);
+    auto native = parent->open_child(name(L"sharing"), EntryAccess::ContentRead);
+    auto native_metadata = parent->open_child(name(L"sharing"));
+    auto scan_metadata = scan->open_child(name(L"sharing"));
+    require(native_metadata.state() == scan_metadata.state(), "rescan changed native metadata sharing result");
+    if (const auto* native_error = native_metadata.unavailable_detail())
+        require(scan_metadata.unavailable_detail()->error == native_error->error, "rescan changed native sharing error");
+    else
+        require(compare_identity(take(take((*native_metadata.value())->inspect_basic()).identity),
+            take(take((*scan_metadata.value())->inspect_basic()).identity)) == IdentityComparison::Same,
+            "rescan metadata sharing opened another object");
+    lock.reset();
     require(status == CKFE_API_OPERATION_UNAVAILABLE && !out && error.value.state == CKFE_OBSERVATION_DENIED,
         "C sharing violation lost typed Denied");
     require(!native.value() && native.state() == ObservationState::Denied, "native sharing violation lost typed Denied");
@@ -420,8 +564,13 @@ void reparse(ckfe_engine* engine, NativeFileSystem& fs, Fixtures& f) {
     auto followed = directory(engine, link, 1); auto sentinel = entry(followed.get(), ascii("sentinel")); regular(sentinel.get(), 37);
     auto rejected_child = parent->open_directory_child(name(ascii("link")));
     require(!rejected_child.value(), "child directory unexpectedly followed link");
+    auto scan_parent = std::shared_ptr<DirectoryCursor>(std::move(parent));
+    (void)drain_names(*scan_parent);
+    auto scan = take(DirectoryCursor::open_read_only_scan(scan_parent));
+    auto scan_link = take(scan->open_child(name(ascii("link"))));
+    require(take(take(scan_link->inspect_basic()).kind) == expected_kind, "read-only scan followed final link");
     // Remove only the link; the target sentinel must survive.
-    held.reset(); followed.reset(); sentinel.reset();
+    scan_link.reset(); scan.reset(); held.reset(); followed.reset(); sentinel.reset();
     require(remove_exact(link,
 #ifdef _WIN32
         true
@@ -435,7 +584,12 @@ void reparse(ckfe_engine* engine, NativeFileSystem& fs, Fixtures& f) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 3) { std::cerr << "usage: platform_qualification NEW_ABSOLUTE_FIXTURE_ROOT [UNC_ALIAS_OF_ROOT]\n"; return 1; }
+    const bool scan_only = argc > 1 && std::string_view(argv[1]) == "--held-scan-only";
+    if (scan_only) { --argc; ++argv; }
+    if (argc < 2 || argc > 3) {
+        std::cerr << "usage: platform_qualification [--held-scan-only] NEW_ABSOLUTE_FIXTURE_ROOT [UNC_ALIAS_OF_ROOT]\n";
+        return 1;
+    }
     int failed = 0, gaps = 0, passed = 0;
     try {
 #ifdef _WIN32
@@ -450,7 +604,8 @@ int main(int argc, char** argv) {
         Fixtures fixtures(root);
         ckfe_engine* raw = nullptr; require(ckfe_engine_create(&raw) == CKFE_API_OK, "engine create");
         Engine engine(raw, ckfe_engine_destroy); NativeFileSystem fs;
-        auto test = [&](const char* label, const std::function<void()>& run) {
+        auto test = [&](const char* label, const std::function<void()>& run, bool held_scan = false) {
+            if (scan_only && !held_scan) return;
             try { run(); ++passed; std::cout << "PASS " << label << '\n'; }
             catch (const Gap& e) { ++gaps; std::cout << "GAP " << label << " " << e.what() << '\n'; }
             catch (const std::exception& e) { ++failed; std::cout << "FAIL " << label << " " << e.what() << '\n'; }
@@ -459,11 +614,14 @@ int main(int argc, char** argv) {
         test("ordinary-public-and-native", [&] { check_directory(raw, fs, root, ascii("ordinary"), 11); });
         test("invalid-components-and-error-ownership", [&] { rejection(raw, root); });
         test("retained-parent-and-entry-after-replacement", [&] { retained(raw, fs, fixtures); });
-        test("real-reparse-no-follow-and-target-survival", [&] { reparse(raw, fs, fixtures); });
+        test("held-rescan-after-path-replacement-and-restart", [&] { held_scan_after_replacement(fs, fixtures); }, true);
+        test("held-rescan-after-empty-end", [&] { held_scan_after_empty_end(fs, fixtures); }, true);
+        test("held-rescan-refuses-unrecognized-cursor", held_scan_unsupported, true);
+        test("real-reparse-no-follow-and-target-survival", [&] { reparse(raw, fs, fixtures); }, true);
         test("native-no-clobber-and-wrong-identity-mutation-guards", [&] { mutation_guards(raw, fs, fixtures); });
         test("native-exclusive-create-write-flush", [&] { native_create(raw, fs, fixtures); });
 #ifdef _WIN32
-        test("sharing-denial-and-retry-through-public-and-native", [&] { sharing_denied(raw, fs, fixtures); });
+        test("sharing-denial-and-retry-through-public-and-native", [&] { sharing_denied(raw, fs, fixtures); }, true);
         test("native-directory-FlushFileBuffers-API", [&] { raw_directory_flush(fixtures); });
         test("library-create-directory-parent-flush-gate", [&] { native_directory_flush(fs, fixtures); });
         test("library-rename-source-destination-flush-gates", [&] { native_rename_flush(raw, fs, fixtures); });
@@ -485,7 +643,11 @@ int main(int argc, char** argv) {
         Path exact = "exact_"; exact.push_back(char(0xff)); exact += ". ";
 #endif
         fixtures.file(root + sep + exact, 23);
+        fixtures.file(longdir + sep + exact, 43);
         test("exact-native-unpaired-surrogate-or-nonUTF8-name", [&] { check_directory(raw, fs, root, exact, 23); cursor_checks(fs, root, exact); });
+        test("held-rescan-long-path-and-exact-name", [&] {
+            held_scan_names(fs, longdir, sorted_names({name(ascii("longfile")), name(exact)}));
+        }, true);
         auto exact_directory = root + sep + exact + ascii("_directory");
         fixtures.dir(exact_directory); fixtures.file(exact_directory + sep + ascii("inner"), 53);
         test("exact-native-directory-address", [&] { check_directory(raw, fs, exact_directory, ascii("inner"), 53); });
@@ -501,10 +663,11 @@ int main(int argc, char** argv) {
             check_directory(raw, fs, extended(alias + suffix), L"longfile", 17);
             check_directory(raw, fs, alias, exact, 23);
             check_directory(raw, fs, alias + exact_directory.substr(root.size()), L"inner", 53);
+            held_scan_names(fs, alias + suffix, sorted_names({name(L"longfile"), name(exact)}));
             auto local = take(fs.inspect_basic(std::filesystem::path(longdir + L"\\longfile")));
             auto remote = take(fs.inspect_basic(std::filesystem::path(alias + suffix + L"\\longfile")));
             require(compare_identity(take(local.identity), take(remote.identity)) == IdentityComparison::Same, "UNC alias identity mismatch");
-        });
+        }, true);
 #endif
         if (!fixtures.cleanup()) ++failed;
     } catch (const std::exception& e) { ++failed; std::cout << "FAIL setup " << e.what() << '\n'; }
