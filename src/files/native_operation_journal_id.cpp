@@ -10,7 +10,11 @@
 #include <bcrypt.h>
 #else
 #include <cerrno>
+#if defined(__APPLE__)
+#include <sys/random.h>
+#else
 #include <unistd.h>
+#endif
 #endif
 
 namespace ck::files {
