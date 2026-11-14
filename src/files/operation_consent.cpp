@@ -188,6 +188,12 @@ Observation<ConsentReceipt> OperationPlan::bind(ConsentAction action,
         skips_conflicts_with_reviewed_losses(reviewed_issues, resolved_conflicts))
         return Observation<ConsentReceipt>::available(ConsentReceipt{identity_, action,
             std::move(reviewed_issues), std::move(resolved_conflicts), {}});
+    if (action == ConsentAction::KeepBoth && all_losses_reviewable() &&
+        all_indices_present(reviewed_issues, issues_.size()) &&
+        all_indices_present(resolved_conflicts, conflicts_.size()) &&
+        conflict_action_valid(action, resolved_conflicts, keep_both_names))
+        return Observation<ConsentReceipt>::available(ConsentReceipt{identity_, action,
+            std::move(reviewed_issues), std::move(resolved_conflicts), std::move(keep_both_names)});
     if (action == ConsentAction::ContinueWithListedLosses || action == ConsentAction::SkipAffectedItems) {
         if (!all_indices_present(reviewed_issues, issues_.size()) || issues_.empty() || !resolved_conflicts.empty() ||
             !keep_both_names.empty())
@@ -200,20 +206,20 @@ Observation<ConsentReceipt> OperationPlan::bind(ConsentAction action,
         return Observation<ConsentReceipt>::available(ConsentReceipt{identity_, action,
             std::move(reviewed_issues), std::move(resolved_conflicts), {}});
     }
-    if (reviewed_issues.empty() && (action != ConsentAction::SkipConflict || issues_.empty()) &&
+    if (reviewed_issues.empty() &&
+        ((action != ConsentAction::SkipConflict && action != ConsentAction::KeepBoth) || issues_.empty()) &&
         conflict_action_valid(action, resolved_conflicts, keep_both_names))
         return Observation<ConsentReceipt>::available(ConsentReceipt{identity_, action,
             std::move(reviewed_issues), std::move(resolved_conflicts), std::move(keep_both_names)});
     return rejected<ConsentReceipt>(AdapterError::ProviderReviewRequired, "operation_plan.conflict_review");
 }
 
+bool OperationPlan::all_losses_reviewable() const noexcept {
+    return std::all_of(issues_.begin(), issues_.end(), known_reviewable_loss);
+}
+
 bool OperationPlan::continue_with_listed_losses_allowed() const noexcept {
-    if (issues_.empty() || !conflicts_.empty())
-        return false;
-    for (const auto& issue : issues_)
-        if (!known_reviewable_loss(issue))
-            return false;
-    return true;
+    return !issues_.empty() && conflicts_.empty() && all_losses_reviewable();
 }
 
 bool OperationPlan::skips_conflicts_with_reviewed_losses(
@@ -264,6 +270,10 @@ bool OperationPlan::receipt_matches(const ConsentReceipt& receipt) const noexcep
         return issues_.empty() && receipt.reviewed_issues.empty() &&
             conflict_action_valid(receipt.action, receipt.resolved_conflicts, receipt.keep_both_names);
     case ConsentAction::KeepBoth:
+        return (issues_.empty() || (all_losses_reviewable() &&
+                all_indices_present(receipt.reviewed_issues, issues_.size()) &&
+                all_indices_present(receipt.resolved_conflicts, conflicts_.size()))) &&
+            conflict_action_valid(receipt.action, receipt.resolved_conflicts, receipt.keep_both_names);
     case ConsentAction::Replace:
     case ConsentAction::MergeDirectories:
         return receipt.reviewed_issues.empty() &&

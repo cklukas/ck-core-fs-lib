@@ -124,6 +124,7 @@ public:
     const std::vector<DestinationConflict>& conflicts() const noexcept { return conflicts_; }
     PlanIdentity identity() const noexcept { return identity_; }
     bool requires_review() const noexcept { return !issues_.empty() || !conflicts_.empty(); }
+    bool all_losses_reviewable() const noexcept;
     bool continue_with_listed_losses_allowed() const noexcept;
     // Flat batches can keep every occupied target and process the other
     // items. Only losses on items that will be processed need consent.
