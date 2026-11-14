@@ -2794,18 +2794,24 @@ public:
             return Result::unavailable(ObservationState::Unsupported,
                 {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::UnsupportedQuery), "retire_child.hard_link"});
 
-        FILE_DISPOSITION_INFO disposition{};
-        disposition.DeleteFile = TRUE;
-        if (!detail::legacy_set_info(source.get(), FileDispositionInfo, &disposition, sizeof(disposition),"legacy.metadata_windows.SetFileInformationByHandle.4")) {
-            const DWORD code = GetLastError();
-            return Result::unavailable(code == ERROR_IO_PENDING ? ObservationState::Unknown : error_state(code),
-                {ErrorDomain::Win32, code, "retire_child.disposition"});
-        }
         auto parent_access = open_namespace_write_handle();
         if (!parent_access.value()) {
             const auto& error = *parent_access.unavailable_detail();
             return Result::unavailable(error.state, error.error);
         }
+        // Indexed panes can retain metadata handles after this call returns.
+        // Remove the name when this delete handle closes even if those handles
+        // still refer to the old object.
+        FILE_DISPOSITION_INFO_EX disposition{};
+        disposition.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+        if (!detail::legacy_set_info(source.get(), FileDispositionInfoEx, &disposition, sizeof(disposition),"legacy.metadata_windows.SetFileInformationByHandle.4")) {
+            const DWORD code = GetLastError();
+            return Result::unavailable(code == ERROR_IO_PENDING ? ObservationState::Unknown : error_state(code),
+                {ErrorDomain::Win32, code, "retire_child.disposition"});
+        }
+        if (!close_native_consumer_handle(source.release(), "retire_child.disposition_close"))
+            return Result::unavailable(ObservationState::Unknown,
+                {ErrorDomain::Win32, GetLastError(), "retire_child.disposition_close"});
         if (!detail::legacy_flush(parent_access.value()->get(),"legacy.metadata_windows.FlushFileBuffers.4"))
             return Result::unavailable(ObservationState::Unknown,
                 {ErrorDomain::Win32, GetLastError(), "retire_child.directory_flush"});
