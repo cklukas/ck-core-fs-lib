@@ -125,6 +125,11 @@ public:
     PlanIdentity identity() const noexcept { return identity_; }
     bool requires_review() const noexcept { return !issues_.empty() || !conflicts_.empty(); }
     bool continue_with_listed_losses_allowed() const noexcept;
+    // Flat batches can keep every occupied target and process the other
+    // items. Only losses on items that will be processed need consent.
+    bool skips_conflicts_with_reviewed_losses(
+        std::span<const std::size_t> reviewed_issues,
+        std::span<const std::size_t> skipped_conflicts) const noexcept;
 
     // A receipt is a review result only. It never authorizes a filesystem
     // mutation; a later execution engine must revalidate the frozen plan.
@@ -145,7 +150,7 @@ private:
         std::vector<PreservationIssue> issues, std::vector<DestinationConflict> conflicts) noexcept;
 
     static bool all_indices_present(const std::vector<std::size_t>& selected, std::size_t count) noexcept;
-    static bool indices_valid_and_unique(const std::vector<std::size_t>& selected, std::size_t count) noexcept;
+    static bool indices_valid_and_unique(std::span<const std::size_t> selected, std::size_t count) noexcept;
     bool conflict_action_valid(ConsentAction action, const std::vector<std::size_t>& selected,
         const std::vector<NativeName>& keep_both_names) const noexcept;
 
