@@ -421,6 +421,11 @@ void OperationEvidenceJob::advance_ancestry(std::stop_token stop) {
 }
 
 OperationEvidenceJobState OperationEvidenceJob::advance(std::stop_token stop) {
+    return advance(stop, nullptr);
+}
+
+OperationEvidenceJobState OperationEvidenceJob::advance(std::stop_token stop,
+    std::shared_ptr<const CompletedRecursiveInventory>* sealed_sources) {
     if (state_ == OperationEvidenceJobState::Complete || state_ == OperationEvidenceJobState::Failed ||
         state_ == OperationEvidenceJobState::Abandoned)
         return state_;
@@ -476,6 +481,8 @@ OperationEvidenceJobState OperationEvidenceJob::advance(std::stop_token stop) {
             completed_ = Result(new const CompletedOperationEvidence(request_.operation,
                 recursive_result_->inventory(), std::move(source_objects_), source_target_result_->destination(),
                 source_target_result_->entries(), std::move(ancestry_results_), std::move(destination_capabilities_)));
+            if (sealed_sources)
+                *sealed_sources = std::move(recursive_result_);
             release_staging();
             state_ = OperationEvidenceJobState::Complete;
             break;

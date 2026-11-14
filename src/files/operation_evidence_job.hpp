@@ -99,6 +99,10 @@ public:
     OperationEvidenceJob& operator=(const OperationEvidenceJob&) = delete;
 
     OperationEvidenceJobState advance(std::stop_token stop = {});
+    // When supplied for the sealing step, return the exact sources used to
+    // collect evidence. This output stays on the worker, separate from completed().
+    OperationEvidenceJobState advance(std::stop_token stop,
+        std::shared_ptr<const CompletedRecursiveInventory>* sealed_sources);
     bool abandon() noexcept;
     OperationEvidenceJobState state() const noexcept { return state_; }
     const std::optional<UnavailableObservation>& failure() const noexcept { return failure_; }
