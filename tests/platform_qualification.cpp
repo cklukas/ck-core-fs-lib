@@ -554,6 +554,10 @@ void reparse(ckfe_engine* engine, NativeFileSystem& fs, Fixtures& f) {
     auto held = take(parent->open_child(name(ascii("link"))));
     auto payload = take(held->read_link_metadata());
 #ifdef _WIN32
+    const auto refused_retirement = parent->retire_child(name(L"link"), take(take(held->inspect_basic()).identity));
+    require(!refused_retirement.value() && refused_retirement.state() == ObservationState::Unsupported,
+        "retirement must refuse the junction itself");
+    require(take(take(held->inspect_basic()).kind) == ObjectKind::Junction, "retirement changed the junction");
     auto* w = std::get_if<WindowsReparseData>(&payload.payload);
     require(w && w->tag == IO_REPARSE_TAG_MOUNT_POINT && w->names &&
         w->names->substitute == units(substitute), "exact junction payload");
@@ -581,13 +585,49 @@ void reparse(ckfe_engine* engine, NativeFileSystem& fs, Fixtures& f) {
     f.created.erase(std::remove_if(f.created.begin(), f.created.end(), [&](const auto& v) { return v.first == link; }), f.created.end());
     check_directory(engine, fs, target, ascii("sentinel"), 37);
 }
+
+#ifdef _WIN32
+void retire_while_held(NativeFileSystem& fs, Fixtures& fixture, const Path& parent_path,
+                       const Path& fixture_parent, const Path& leaf, bool network) {
+    const auto on_disk = fixture_parent + sep + leaf;
+    fixture.file(on_disk, 37);
+    auto parent = take(fs.open_directory(std::filesystem::path(parent_path)));
+    if (network) {
+        const auto local = take(fs.open_directory(std::filesystem::path(fixture_parent)));
+        require(compare_identity(take(local->identity()), take(parent->identity())) == IdentityComparison::Same,
+            "UNC retirement fixture is not the owned local directory");
+    }
+    auto original = take(parent->open_child(name(leaf), EntryAccess::ContentRead));
+    const auto id = take(take(original->inspect_basic()).identity);
+    const auto removed = parent->retire_child(name(leaf), id);
+    if (network && removed.state() == ObservationState::Unsupported) {
+        require(take(parent->lookup_child(name(leaf), ChildLookupMode::NativeDefault)).state() == ChildLookupState::Found,
+            "unsupported UNC retirement removed the entry");
+        native_regular(*parent, leaf, 37);
+        return;
+    }
+    require(take(removed), "retirement did not acknowledge deletion");
+    require(take(parent->lookup_child(name(leaf), ChildLookupMode::NativeDefault)).state() == ChildLookupState::Missing,
+        "successful retirement left the name present or delete-pending");
+    fixture.created.pop_back();
+    require(take(original->read_content({37}, 0)).bytes == std::vector<std::byte>(37, std::byte{'q'}),
+        "retirement invalidated the held reader");
+
+    fixture.file(on_disk, 41);
+    const auto refused = parent->retire_child(name(leaf), id);
+    require(!refused.value() && refused.state() == ObservationState::Changed,
+        "stale retirement identity did not refuse the replacement");
+    native_regular(*parent, leaf, 41);
+}
+#endif
 }
 
 int main(int argc, char** argv) {
     const bool scan_only = argc > 1 && std::string_view(argv[1]) == "--held-scan-only";
-    if (scan_only) { --argc; ++argv; }
+    const bool retirement_only = argc > 1 && std::string_view(argv[1]) == "--retirement-only";
+    if (scan_only || retirement_only) { --argc; ++argv; }
     if (argc < 2 || argc > 3) {
-        std::cerr << "usage: platform_qualification [--held-scan-only] NEW_ABSOLUTE_FIXTURE_ROOT [UNC_ALIAS_OF_ROOT]\n";
+        std::cerr << "usage: platform_qualification [--held-scan-only|--retirement-only] NEW_ABSOLUTE_FIXTURE_ROOT [UNC_ALIAS_OF_ROOT]\n";
         return 1;
     }
     int failed = 0, gaps = 0, passed = 0;
@@ -604,8 +644,9 @@ int main(int argc, char** argv) {
         Fixtures fixtures(root);
         ckfe_engine* raw = nullptr; require(ckfe_engine_create(&raw) == CKFE_API_OK, "engine create");
         Engine engine(raw, ckfe_engine_destroy); NativeFileSystem fs;
-        auto test = [&](const char* label, const std::function<void()>& run, bool held_scan = false) {
-            if (scan_only && !held_scan) return;
+        auto test = [&](const char* label, const std::function<void()>& run, bool held_scan = false,
+                        bool retirement = false) {
+            if ((scan_only && !held_scan) || (retirement_only && !retirement)) return;
             try { run(); ++passed; std::cout << "PASS " << label << '\n'; }
             catch (const Gap& e) { ++gaps; std::cout << "GAP " << label << " " << e.what() << '\n'; }
             catch (const std::exception& e) { ++failed; std::cout << "FAIL " << label << " " << e.what() << '\n'; }
@@ -617,7 +658,7 @@ int main(int argc, char** argv) {
         test("held-rescan-after-path-replacement-and-restart", [&] { held_scan_after_replacement(fs, fixtures); }, true);
         test("held-rescan-after-empty-end", [&] { held_scan_after_empty_end(fs, fixtures); }, true);
         test("held-rescan-refuses-unrecognized-cursor", held_scan_unsupported, true);
-        test("real-reparse-no-follow-and-target-survival", [&] { reparse(raw, fs, fixtures); }, true);
+        test("real-reparse-no-follow-and-target-survival", [&] { reparse(raw, fs, fixtures); }, true, true);
         test("native-no-clobber-and-wrong-identity-mutation-guards", [&] { mutation_guards(raw, fs, fixtures); });
         test("native-exclusive-create-write-flush", [&] { native_create(raw, fs, fixtures); });
 #ifdef _WIN32
@@ -647,6 +688,22 @@ int main(int argc, char** argv) {
 #endif
         fixtures.file(root + sep + exact, 23);
         fixtures.file(longdir + sep + exact, 43);
+#ifdef _WIN32
+        const auto retirement_leaf = [&](const Path& suffix) { return L"retire-" + suffix + exact; };
+        test("retire-while-held-ordinary-DOS", [&] {
+            retire_while_held(fs, fixtures, root, root, L"retire-local", false);
+        }, false, true);
+        test("retire-while-held-long-exact-DOS", [&] {
+            retire_while_held(fs, fixtures, longdir, longdir, retirement_leaf(L"long-"), false);
+        }, false, true);
+        test("retire-while-held-long-exact-UNC", [&] {
+            if (argc != 3) throw Gap("no reachable UNC alias supplied");
+            auto alias = wide(argv[2]);
+            if (GetFileAttributesW(extended(alias).c_str()) == INVALID_FILE_ATTRIBUTES)
+                throw Gap("actual UNC fixture alias unavailable Win32=" + std::to_string(GetLastError()));
+            retire_while_held(fs, fixtures, alias + longdir.substr(root.size()), longdir, retirement_leaf(L"unc-"), true);
+        }, false, true);
+#endif
 #if defined(__APPLE__)
         constexpr auto exact_name_case = "exact-native-utf8-name";
 #else
