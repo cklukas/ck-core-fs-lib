@@ -84,6 +84,7 @@ Observation<RetainedTarget::Pointer> RetainedTarget::create(RetainedTargetReques
     if (!*file.value()) return unavailable<Pointer>(rejected("retained_target.null_journal",ObservationState::Failed,AdapterError::InvalidNativeResult));
     NativeOperationRecoveryEvidence evidence{r.target->name(),r.retained_name,*parent,*object,*parent,*object,
         r.parent_address,r.reviewed_digest,{}};
+    evidence.source_name = r.target->name();
     auto value = Pointer(new RetainedTarget(std::move(r),*guard.value(),*journal.value(),
         std::move(file).take_value(),std::move(evidence)));
     const auto planned = value->append(OperationJournalState::Planned);

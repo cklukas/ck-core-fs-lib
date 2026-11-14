@@ -80,4 +80,12 @@ Observation<NativeOperationRecoveryInspection> inspect_native_operation_recovery
     OperationJournalCodecLimits codec_limits = {},
     NativeOperationRecoveryEvidenceLimits evidence_limits = {});
 
+// Read-only projection for an old-target retention journal. Its terminal
+// receipt remains useful because it names the preserved object. The original
+// target name is also present in the legacy staging-name field.
+Observation<NativeOperationRecoveryInspection> inspect_native_retention_recovery(
+    OperationJournalFile& file, OperationJournalLimits journal_limits = {},
+    OperationJournalCodecLimits codec_limits = {},
+    NativeOperationRecoveryEvidenceLimits evidence_limits = {});
+
 } // namespace ck::files

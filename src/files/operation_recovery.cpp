@@ -93,9 +93,23 @@ Observation<OperationRecoveryReport> inspect_operation_recovery(
     return Observation<OperationRecoveryReport>::available(std::move(report));
 }
 
-Observation<NativeOperationRecoveryInspection> inspect_native_operation_recovery_evidence(
+namespace {
+
+bool retention_evidence(const NativeOperationRecoveryEvidence& evidence, OperationJournalState state) {
+    return evidence.staging_namespace == StagingNamespace::Named &&
+        evidence.staging_name != evidence.destination_name &&
+        (!evidence.source_name || *evidence.source_name == evidence.staging_name) &&
+        evidence.source_parent_identity == evidence.destination_identity &&
+        evidence.staging_identity == evidence.source_identity && evidence.content_digest &&
+        (!evidence.published_identity || *evidence.published_identity == evidence.source_identity) &&
+        (state != OperationJournalState::Complete || evidence.published_identity.has_value());
+}
+
+Observation<NativeOperationRecoveryInspection> inspect_native_evidence(
     const OperationJournal& journal, std::optional<UnavailableObservation> tail,
-    NativeOperationRecoveryEvidenceLimits evidence_limits) {
+    NativeOperationRecoveryEvidenceLimits evidence_limits, bool retention) {
+    if (retention && journal.operation() != FileOperation::Move)
+        return rejected<NativeOperationRecoveryInspection>(AdapterError::PlanInvalid, "native_recovery.retention_operation");
     auto generic = inspect_operation_recovery(journal, tail);
     if (!generic.value())
         return Observation<NativeOperationRecoveryInspection>::unavailable(
@@ -113,11 +127,13 @@ Observation<NativeOperationRecoveryInspection> inspect_native_operation_recovery
     result.journal_id = journal.id();
     result.report = std::move(generic).take_value();
     result.has_untrusted_evidence = result.report.has_untrusted_tail;
+    if (retention && (result.report.items.size() != 1 || result.report.items.front().item != 0))
+        return rejected<NativeOperationRecoveryInspection>(AdapterError::PlanInvalid, "native_recovery.retention_items");
     for (auto& item : result.report.items) {
         const auto* record = latest[item.item];
         const bool retained_move = journal.operation() == FileOperation::Move &&
             item.state == OperationJournalState::RetainedSource && record && !record->evidence.empty();
-        if (item.action == OperationRecoveryAction::IgnoreTerminal && !retained_move) continue;
+        if (item.action == OperationRecoveryAction::IgnoreTerminal && !retained_move && !retention) continue;
         if (!record || record->evidence.empty()) {
             item.action = OperationRecoveryAction::RequireReview;
             item.requires_reconciliation = true;
@@ -142,16 +158,26 @@ Observation<NativeOperationRecoveryInspection> inspect_native_operation_recovery
             continue;
         }
         auto evidence = decode_native_operation_recovery_evidence(record->evidence, evidence_limits);
-        if (!evidence.value()) {
+        if (!evidence.value() || (retention && !retention_evidence(*evidence.value(), item.state))) {
             item.action = OperationRecoveryAction::RequireReview;
             item.requires_reconciliation = true;
             result.report.requires_reconciliation = true;
             result.has_untrusted_evidence = true;
             continue;
         }
+        if (retention && item.requires_reconciliation)
+            item.action = OperationRecoveryAction::RequireReview;
         result.artifacts.push_back({item.item, item.state, std::move(evidence).take_value(), std::nullopt});
     }
     return Observation<NativeOperationRecoveryInspection>::available(std::move(result));
+}
+
+} // namespace
+
+Observation<NativeOperationRecoveryInspection> inspect_native_operation_recovery_evidence(
+    const OperationJournal& journal, std::optional<UnavailableObservation> tail,
+    NativeOperationRecoveryEvidenceLimits evidence_limits) {
+    return inspect_native_evidence(journal, std::move(tail), evidence_limits, false);
 }
 
 Observation<OperationRecoveryReport> inspect_native_operation_recovery(
@@ -175,6 +201,15 @@ Observation<NativeOperationRecoveryInspection> inspect_native_operation_recovery
     }
     return inspect_native_operation_recovery_evidence(
         *loaded.value()->journal, loaded.value()->tail, evidence_limits);
+}
+
+Observation<NativeOperationRecoveryInspection> inspect_native_retention_recovery(
+    OperationJournalFile& file, OperationJournalLimits journal_limits,
+    OperationJournalCodecLimits codec_limits, NativeOperationRecoveryEvidenceLimits evidence_limits) {
+    const auto loaded = load_operation_journal(file, journal_limits, codec_limits);
+    if (const auto* failure = loaded.unavailable_detail())
+        return Observation<NativeOperationRecoveryInspection>::unavailable(failure->state, failure->error);
+    return inspect_native_evidence(*loaded.value()->journal, loaded.value()->tail, evidence_limits, true);
 }
 
 } // namespace ck::files
