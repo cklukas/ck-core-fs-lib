@@ -56,6 +56,9 @@ struct NativeOperationRecoveryEvidence final {
     // Legacy records describe Named staging. Anonymous records retain the
     // first name only as a diagnostic hint; it must NEVER be reopened/deleted.
     StagingNamespace staging_namespace = StagingNamespace::Named;
+    // Exact leaf of the move source under source_parent_identity. Older
+    // receipts omit it. A leaf and stored identities are inspection data.
+    std::optional<NativeName> source_name = std::nullopt;
 };
 
 struct NativeOperationRecoveryEvidenceLimits final {

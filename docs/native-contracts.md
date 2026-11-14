@@ -434,6 +434,13 @@ filename. Recovery evidence version 6 records that distinction; the retained
 name is only a diagnostic hint and is never reopened or deleted. Old evidence
 versions remain named and cannot manufacture live creator ownership.
 
+Recovery evidence version 7 records the original source leaf for
+copy-based moves. It preserves exact POSIX bytes or Windows UTF-16 units
+alongside the source parent and object identities. A tree move records the
+root leaf even after its live source handles have been released. These
+fields support read-only reconciliation. Source retirement requires fresh
+native authority and a stability proof. Versions 1–6 remain readable.
+
 Ordinary named creation is separate from staging. POSIX name-based publication
 cannot satisfy the source-identity contract by checking before and after
 rename. It is refused rather than silently substituted for held-object

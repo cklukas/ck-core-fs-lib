@@ -246,6 +246,8 @@ Observation<NativeOperationCopyJob::Pointer> NativeOperationCopyJob::create(
             *source_parent, *source, *destination, {}, state->request.destination_address,
             state->content_digest, state->published_identity};
         recovery_evidence.staging_namespace=state->staging_namespace;
+        if (state->request.operation == FileOperation::Move)
+            recovery_evidence.source_name = state->request.source_name;
         if (state->staging) {
             auto metadata = state->finalized_metadata ? Observation<BasicMetadata>::available(*state->finalized_metadata)
                                                       : state->staging->inspect_basic();
@@ -699,7 +701,8 @@ struct NativeOperationCopyTreeJob::State final {
         : request(std::move(value)), journal(std::move(root_journal)),
           journal_file(std::move(root_journal_file)), staging_name(std::move(root_staging_name)),
           destination_identity(std::move(root_destination_identity)),
-          retirement_sources(request.inventory->sources()) {}
+          retirement_sources(request.inventory->sources()),
+          root_source_name(retirement_sources.front()->name()) {}
 
     NativeOperationCopyTreeRequest request;
     OperationJournal::Pointer journal;
@@ -711,6 +714,7 @@ struct NativeOperationCopyTreeJob::State final {
     std::vector<std::shared_ptr<const DirectoryCursor>> directories;
     OperationBatchJob::Pointer child_batch;
     std::vector<HeldChild::Pointer> retirement_sources;
+    NativeName root_source_name;
     std::optional<ObjectIdentity> root_source_parent_identity;
     std::optional<ObjectIdentity> root_source_identity;
     std::size_t next_entry = 1;
@@ -762,6 +766,8 @@ struct NativeOperationCopyTreeJob::State final {
         evidence.source_parent_identity = *source_parent;
         evidence.source_identity = *source;
         evidence.destination_identity = *destination;
+        if (request.operation == FileOperation::Move)
+            evidence.source_name = root_source_name;
         if (staging_identity) {
             const auto durable_staging = NativeDurableIdentity::from_live(*staging_identity);
             if (!durable_staging)
