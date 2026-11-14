@@ -114,8 +114,10 @@ Observation<NativeOperationRecoveryInspection> inspect_native_operation_recovery
     result.report = std::move(generic).take_value();
     result.has_untrusted_evidence = result.report.has_untrusted_tail;
     for (auto& item : result.report.items) {
-        if (item.action == OperationRecoveryAction::IgnoreTerminal) continue;
         const auto* record = latest[item.item];
+        const bool retained_move = journal.operation() == FileOperation::Move &&
+            item.state == OperationJournalState::RetainedSource && record && !record->evidence.empty();
+        if (item.action == OperationRecoveryAction::IgnoreTerminal && !retained_move) continue;
         if (!record || record->evidence.empty()) {
             item.action = OperationRecoveryAction::RequireReview;
             item.requires_reconciliation = true;

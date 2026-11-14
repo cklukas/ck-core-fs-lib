@@ -701,8 +701,8 @@ struct NativeOperationCopyTreeJob::State final {
         : request(std::move(value)), journal(std::move(root_journal)),
           journal_file(std::move(root_journal_file)), staging_name(std::move(root_staging_name)),
           destination_identity(std::move(root_destination_identity)),
-          retirement_sources(request.inventory->sources()),
-          root_source_name(retirement_sources.front()->name()) {}
+          held_sources(request.inventory->sources()),
+          root_source_name(held_sources.front()->name()) {}
 
     NativeOperationCopyTreeRequest request;
     OperationJournal::Pointer journal;
@@ -713,17 +713,16 @@ struct NativeOperationCopyTreeJob::State final {
     std::optional<ObjectIdentity> staging_identity;
     std::vector<std::shared_ptr<const DirectoryCursor>> directories;
     OperationBatchJob::Pointer child_batch;
-    std::vector<HeldChild::Pointer> retirement_sources;
+    std::vector<HeldChild::Pointer> held_sources;
     NativeName root_source_name;
     std::optional<ObjectIdentity> root_source_parent_identity;
     std::optional<ObjectIdentity> root_source_identity;
     std::size_t next_entry = 1;
-    std::size_t next_retirement = 0;
     std::uint64_t observed_bytes = 0;
 
     const FrozenInventory& inventory() const noexcept { return *request.inventory->inventory(); }
     const std::vector<HeldChild::Pointer>& sources() const noexcept {
-        return retirement_sources;
+        return held_sources;
     }
 
     std::optional<std::size_t> parent_index(std::size_t entry) const noexcept {
@@ -942,7 +941,8 @@ OperationProgress NativeOperationCopyTreeJob::progress() const noexcept {
 
 OperationExecutionState NativeOperationCopyTreeJob::advance(std::stop_token stop) {
     if (state_ == OperationExecutionState::Complete || state_ == OperationExecutionState::Failed ||
-        state_ == OperationExecutionState::Cancelled || state_ == OperationExecutionState::NeedsReconciliation)
+        state_ == OperationExecutionState::Cancelled || state_ == OperationExecutionState::RetainedSource ||
+        state_ == OperationExecutionState::NeedsReconciliation)
         return state_;
 
     auto fail = [&](UnavailableObservation detail, bool force_reconciliation = false) {
@@ -1142,12 +1142,18 @@ OperationExecutionState NativeOperationCopyTreeJob::advance(std::stop_token stop
             return state_;
         }
         if (state_data_->request.operation == FileOperation::Move) {
-            state_data_->next_retirement = state_data_->sources().size();
-            const auto intended = state_data_->append(OperationJournalState::SourceRemovalIntended);
-            if (!intended.value()) {
-                journal_failure(*intended.unavailable_detail());
+            // A frozen inventory binds names and identities. It does not
+            // exclude writes to the held files or to their metadata while
+            // they are copied and published. Keep the whole source tree
+            // until this worker has a provider-qualified stability proof.
+            const auto retained = state_data_->append(OperationJournalState::RetainedSource);
+            if (!retained.value()) {
+                journal_failure(*retained.unavailable_detail());
                 return state_;
             }
+            result_.failure = tree_error(AdapterError::ProviderReviewRequired,
+                "native_operation_copy_tree.source_stability", ObservationState::Unsupported);
+            state_ = result_.state = OperationExecutionState::RetainedSource;
             return state_;
         }
         const auto complete = state_data_->append(OperationJournalState::Complete);
@@ -1156,83 +1162,6 @@ OperationExecutionState NativeOperationCopyTreeJob::advance(std::stop_token stop
             return state_;
         }
         state_ = result_.state = OperationExecutionState::Complete;
-        return state_;
-    }
-
-    if (*journal_state == OperationJournalState::SourceRemovalIntended) {
-        auto retain = [&](UnavailableObservation detail) {
-            result_.failure = std::move(detail);
-            const auto appended = state_data_->append(OperationJournalState::RetainedSource);
-            if (!appended.value()) {
-                result_.failure = *appended.unavailable_detail();
-                state_ = result_.state = OperationExecutionState::NeedsReconciliation;
-            } else {
-                state_ = result_.state = OperationExecutionState::RetainedSource;
-            }
-        };
-        if (stop.stop_requested()) {
-            retain(tree_error(AdapterError::InterruptedRead, "native_operation_copy_tree.retire_cancelled",
-                              ObservationState::Unknown));
-            return state_;
-        }
-        if (state_data_->next_retirement == 0) {
-            const auto retired = state_data_->append(OperationJournalState::SourceRetired);
-            if (!retired.value()) {
-                journal_failure(*retired.unavailable_detail());
-                return state_;
-            }
-            const auto complete = state_data_->append(OperationJournalState::Complete);
-            if (!complete.value()) {
-                journal_failure(*complete.unavailable_detail());
-                return state_;
-            }
-            state_ = result_.state = OperationExecutionState::Complete;
-            return state_;
-        }
-        const auto index = state_data_->next_retirement - 1;
-        const auto& source = state_data_->sources()[index];
-        if (!source || !source->metadata().identity.value()) {
-            retain(tree_error(AdapterError::UnqualifiedIdentity,
-                              "native_operation_copy_tree.retire_identity", ObservationState::Unknown));
-            return state_;
-        }
-        auto current = source->inspect_basic();
-        if (!current.value()) {
-            if (current.state() == ObservationState::Unsupported) {
-                retain(*current.unavailable_detail());
-            } else {
-                result_.failure = *current.unavailable_detail();
-                state_ = result_.state = OperationExecutionState::NeedsReconciliation;
-            }
-            return state_;
-        }
-        if (!current.value()->identity.value() || !current.value()->kind.value() ||
-            !same(*current.value()->identity.value(), state_data_->inventory().entries()[index].identity) ||
-            *current.value()->kind.value() != state_data_->inventory().entries()[index].kind) {
-            retain(tree_error(AdapterError::MetadataChanged,
-                              "native_operation_copy_tree.retire_changed", ObservationState::Changed));
-            return state_;
-        }
-        auto retired = source->parent()->retire_child(source->name(),
-                                                       state_data_->inventory().entries()[index].identity);
-        if (!retired.value()) {
-            if (retired.state() == ObservationState::Unsupported) {
-                retain(*retired.unavailable_detail());
-            } else {
-                result_.failure = *retired.unavailable_detail();
-                state_ = result_.state = OperationExecutionState::NeedsReconciliation;
-            }
-            return state_;
-        }
-        if (!*retired.value()) {
-            result_.failure = tree_error(AdapterError::InvalidNativeResult,
-                                         "native_operation_copy_tree.retire_result",
-                                         ObservationState::Unknown);
-            state_ = result_.state = OperationExecutionState::NeedsReconciliation;
-            return state_;
-        }
-        state_data_->retirement_sources[index].reset();
-        --state_data_->next_retirement;
         return state_;
     }
 

@@ -186,9 +186,9 @@ public:
     const OperationExecutionResult& result() const noexcept { return result_; }
     OperationExecutionState advance(std::stop_token stop = {});
 
-    // Cleanup of an unpublished recursive tree remains explicitly refused;
-    // a Move tree retires originals only after verified publication, in
-    // reverse inventory order.
+    // A published Move tree retains the original until the worker has a
+    // qualified source-stability protocol. Unpublished tree cleanup requires
+    // its own ownership protocol.
     Observation<bool> cleanup_unpublished_staging();
 
 private:
