@@ -47,6 +47,16 @@ RecursiveInventoryJob::RecursiveInventoryJob(std::shared_ptr<DirectoryCursor> ro
     }
 }
 
+RecursiveInventoryJob::RecursiveInventoryJob(LeafObserver observer, std::shared_ptr<DirectoryCursor> root,
+    NativeAbsolutePath root_path, InventoryMountPolicy mount_policy, InventoryLinkPolicy link_policy,
+    RecursiveInventoryLimits limits, std::shared_ptr<const MonotonicClock> clock)
+    : RecursiveInventoryJob(std::move(root), std::move(root_path), mount_policy, link_policy,
+          limits, std::move(clock), HeldChild::Pointer{}) {
+    if (!observer)
+        throw std::invalid_argument("missing recursive inventory observer");
+    leaf_observer_ = std::move(observer);
+}
+
 bool RecursiveInventoryJob::link_kind(ObjectKind kind) noexcept {
     return kind == ObjectKind::SymbolicLink || kind == ObjectKind::Junction || kind == ObjectKind::ReparsePoint;
 }
@@ -217,31 +227,43 @@ RecursiveInventoryState RecursiveInventoryJob::advance(std::stop_token stop) {
             if (frame.depth >= limits_.max_depth) {
                 fail(AdapterError::InventoryLimit, "recursive_inventory.depth", ObservationState::Unknown); return state_;
             }
+            std::shared_ptr<DirectoryCursor> child_directory;
+            if (*kind == ObjectKind::Directory) {
+                auto child = frame.directory->open_directory_child(name);
+                if (!child.value()) {
+                    if (stop.stop_requested()) { state_ = RecursiveInventoryState::Paused; return state_; }
+                    fail(*child.unavailable_detail()); return state_;
+                }
+                child_directory = std::move(child).take_value();
+                if (!child_directory || !available_identity(child_directory->identity()) ||
+                    compare_identity(*metadata.identity.value(), *child_directory->identity().value()) !=
+                        IdentityComparison::Same) {
+                    fail(AdapterError::MetadataChanged, "recursive_inventory.child_identity", ObservationState::Changed);
+                    return state_;
+                }
+                for (const auto& prior : directory_identities_)
+                    if (compare_identity(prior, *child_directory->identity().value()) == IdentityComparison::Same) {
+                        fail(AdapterError::PlanTopologyUnsafe, "recursive_inventory.directory_cycle");
+                        return state_;
+                    }
+            }
             auto child_path = std::move(path).take_value();
             if (!add_metadata(child_path, metadata,
                     link_kind(*kind) ? LinkTraversalEvidence::NotFollowed : LinkTraversalEvidence::NotLink)) return state_;
             if (root_source_) held_sources_.push_back(held_source);
-            if (*kind != ObjectKind::Directory) { frame.pending.reset(); continue; }
-            auto child = frame.directory->open_directory_child(name);
-            if (!child.value()) {
-                if (stop.stop_requested()) { state_ = RecursiveInventoryState::Paused; return state_; }
-                fail(*child.unavailable_detail()); return state_;
-            }
-            auto child_cursor = std::move(child).take_value();
-            if (!child_cursor || !available_identity(child_cursor->identity()) ||
-                compare_identity(*metadata.identity.value(), *child_cursor->identity().value()) != IdentityComparison::Same) {
-                fail(AdapterError::MetadataChanged, "recursive_inventory.child_identity", ObservationState::Changed); return state_;
-            }
-            const auto child_identity = *metadata.identity.value();
-            for (const auto& prior : directory_identities_)
-                if (compare_identity(prior, child_identity) == IdentityComparison::Same) {
-                    fail(AdapterError::PlanTopologyUnsafe, "recursive_inventory.directory_cycle"); return state_;
+            if (leaf_observer_) {
+                if (auto failure = leaf_observer_(child_path, *held_source, stop)) {
+                    fail(std::move(*failure));
+                    return state_;
                 }
-            std::shared_ptr<DirectoryCursor> child_shared(std::move(child_cursor));
+            }
             const auto child_depth = frame.depth + 1;
             frame.pending.reset();
-            frames_.push_back({std::move(child_shared), std::move(child_path), child_identity, {}, child_depth});
-            directory_identities_.push_back(child_identity);
+            if (child_directory) {
+                const auto child_identity = *child_directory->identity().value();
+                frames_.push_back({std::move(child_directory), std::move(child_path), child_identity, {}, child_depth});
+                directory_identities_.push_back(child_identity);
+            }
         }
         return state_;
     } catch (...) {

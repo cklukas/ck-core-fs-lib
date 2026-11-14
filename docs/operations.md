@@ -35,6 +35,16 @@ These platforms refuse the inventory if the watch cannot be established,
 reports a change, or loses coverage. The existing root identity and directory
 version checks also apply through the end of the scan.
 
+## Recursive inventory observers
+
+The C++ recursive inventory worker can visit each descendant with a borrowed
+metadata handle. The walk releases leaf handles as it advances and retains its
+current chain of directory cursors. A visitor can collect read-only evidence
+alongside the frozen inventory. It must discard partial evidence if the walk
+fails or is abandoned. The completed inventory has no retained leaf handles in
+this mode. A consumer needs a qualified continuity proof before rebinding an
+entry for mutation.
+
 ## Available in the first C ABI revision
 
 - Engine creation and deterministic API/state names.

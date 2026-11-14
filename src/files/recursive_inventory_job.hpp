@@ -8,6 +8,7 @@
 #include "monotonic_clock.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stop_token>
@@ -58,12 +59,24 @@ private:
 class RecursiveInventoryJob final {
 public:
     using Result = FrozenInventory::Pointer;
+    // Runs on the traversal worker with one borrowed leaf handle. A visitor
+    // can collect read-only evidence. A successful visit is an observation,
+    // never a continuity witness after the handle is released.
+    using LeafObserver = std::function<std::optional<UnavailableObservation>(
+        const NativeAbsolutePath&, const HeldChild&, std::stop_token)>;
 
     RecursiveInventoryJob(std::shared_ptr<DirectoryCursor> root,
         NativeAbsolutePath root_path, InventoryMountPolicy mount_policy,
         InventoryLinkPolicy link_policy, RecursiveInventoryLimits limits = {},
         std::shared_ptr<const MonotonicClock> clock = system_monotonic_clock(),
         HeldChild::Pointer root_source = {});
+    // Walk without retaining leaf handles. Observes every descendant,
+    // including a directory before descending into it. Root metadata is
+    // available in completed(); this mode never yields completed_sources().
+    RecursiveInventoryJob(LeafObserver observer, std::shared_ptr<DirectoryCursor> root,
+        NativeAbsolutePath root_path, InventoryMountPolicy mount_policy,
+        InventoryLinkPolicy link_policy, RecursiveInventoryLimits limits,
+        std::shared_ptr<const MonotonicClock> clock);
     RecursiveInventoryJob(const RecursiveInventoryJob&) = delete;
     RecursiveInventoryJob& operator=(const RecursiveInventoryJob&) = delete;
 
@@ -110,6 +123,7 @@ private:
     Result completed_;
     std::shared_ptr<const CompletedRecursiveInventory> completed_sources_;
     std::vector<HeldChild::Pointer> held_sources_;
+    LeafObserver leaf_observer_;
 };
 
 } // namespace ck::files
