@@ -26,6 +26,7 @@ bool FrozenInventoryBuilder::fail(AdapterError code, const char* operation, Obse
     state_ = FrozenInventoryState::Failed;
     entries_.clear();
     hard_link_groups_.clear();
+    first_identity_row_.clear();
     root_identity_.reset();
     root_mount_id_.reset();
     logical_bytes_ = 0;
@@ -62,13 +63,6 @@ bool FrozenInventoryBuilder::valid_mount(const FrozenInventoryEntry& entry) cons
     return !root_mount_id_ || *root_mount_id_ == value;
 }
 
-std::size_t FrozenInventoryBuilder::group_for(const ObjectIdentity& identity) const noexcept {
-    for (std::size_t index = 0; index < entries_.size(); ++index)
-        if (compare_identity(entries_[index].identity, identity) == IdentityComparison::Same)
-            return hard_link_groups_[index];
-    return entries_.size();
-}
-
 bool FrozenInventoryBuilder::add(FrozenInventoryEntry entry) {
     if (state_ != FrozenInventoryState::Collecting) return false;
     if (entries_.size() >= limits_.max_entries) return fail(AdapterError::InventoryLimit, "frozen_inventory.entries", ObservationState::Unknown);
@@ -77,23 +71,42 @@ bool FrozenInventoryBuilder::add(FrozenInventoryEntry entry) {
     if (!valid_mount(entry)) return fail(AdapterError::MetadataChanged, "frozen_inventory.mount", ObservationState::Unknown);
     if (entry.logical_size > limits_.max_logical_bytes - logical_bytes_)
         return fail(AdapterError::InventoryLimit, "frozen_inventory.bytes", ObservationState::Unknown);
-    if (!root_identity_) {
-        root_identity_ = entry.identity;
-        if (mount_policy_ != InventoryMountPolicy::DirectObjects)
-            root_mount_id_ = *entry.mount_id.value();
-    } else if (entry.identity.scope != root_identity_->scope) {
+    if (root_identity_ && entry.identity.scope != root_identity_->scope) {
         return fail(AdapterError::UnqualifiedIdentity, "frozen_inventory.scope");
     }
 
-    const std::size_t group = group_for(entry.identity);
-    entries_.push_back(std::move(entry));
-    hard_link_groups_.push_back(group);
+    const auto& identity = entry.identity;
+    auto group = entries_.size();
+    auto inserted = first_identity_row_.end();
+    if (compare_identity(identity, identity) == IdentityComparison::Same) {
+        const auto [row, added] = first_identity_row_.try_emplace(
+            GroupKey(identity.scheme, identity.volume.bytes, identity.object.bytes, identity.generation), group);
+        group = row->second;
+        if (added)
+            inserted = row;
+    }
+    try {
+        entries_.push_back(std::move(entry));
+        hard_link_groups_.push_back(group);
+    } catch (...) {
+        if (entries_.size() > hard_link_groups_.size())
+            entries_.pop_back();
+        if (inserted != first_identity_row_.end())
+            first_identity_row_.erase(inserted);
+        throw;
+    }
+    if (!root_identity_) {
+        root_identity_ = entries_.back().identity;
+        if (mount_policy_ != InventoryMountPolicy::DirectObjects)
+            root_mount_id_ = *entries_.back().mount_id.value();
+    }
     logical_bytes_ += entries_.back().logical_size;
     return true;
 }
 
 bool FrozenInventoryBuilder::seal() noexcept {
     if (state_ != FrozenInventoryState::Collecting || entries_.empty()) return false;
+    first_identity_row_.clear();
     state_ = FrozenInventoryState::Complete;
     return true;
 }
@@ -105,6 +118,7 @@ bool FrozenInventoryBuilder::abandon() noexcept {
     state_ = FrozenInventoryState::Abandoned;
     entries_.clear();
     hard_link_groups_.clear();
+    first_identity_row_.clear();
     root_identity_.reset();
     root_mount_id_.reset();
     logical_bytes_ = 0;

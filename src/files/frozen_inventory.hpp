@@ -7,8 +7,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <vector>
 
 namespace ck::files {
@@ -97,13 +99,16 @@ private:
     bool valid_entry(const FrozenInventoryEntry& entry) const noexcept;
     bool valid_link(const FrozenInventoryEntry& entry) const noexcept;
     bool valid_mount(const FrozenInventoryEntry& entry) const noexcept;
-    std::size_t group_for(const ObjectIdentity& identity) const noexcept;
+    // add() has already checked that all entries share the root's scope.
+    using GroupKey = std::tuple<IdentityScheme, decltype(NativeIdentifier::bytes),
+        decltype(NativeIdentifier::bytes), std::optional<std::uint64_t>>;
 
     InventoryMountPolicy mount_policy_;
     InventoryLinkPolicy link_policy_;
     FrozenInventoryLimits limits_;
     std::vector<FrozenInventoryEntry> entries_;
     std::vector<std::size_t> hard_link_groups_;
+    std::map<GroupKey, std::size_t> first_identity_row_;
     std::optional<UnavailableObservation> failure_;
     std::optional<ObjectIdentity> root_identity_;
     std::optional<std::uint64_t> root_mount_id_;
