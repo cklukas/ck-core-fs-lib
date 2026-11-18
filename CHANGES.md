@@ -2,6 +2,13 @@
 
 ## Unreleased 0.5 development checkpoint
 
+- Release the transient `2 * max_native_bytes` native attribute/security read
+  scratch reservation from `MetadataCaptureBudget` once a `MetadataCaptureJob`
+  seals its `NativeMetadataProof` (or terminates), retaining only the sealed
+  proof's actual metadata footprint so multi-file `ckfet_start_v1` tree
+  executions with retained target-verification seeds do not exhaust the 64 MiB
+  metadata budget after 32 files.
+
 - Add `include/ck_fs_search.h` (`ckfes_*`), a worker-owned, cancellable
   recursive filename (substring/glob) and regular-file content search C ABI
   built on handle-relative `DirectoryCursor` and `OpenedEntry` primitives
