@@ -216,7 +216,7 @@ target_compile_features(ck_core_fs_native PUBLIC cxx_std_20)
 
 add_library(ck_file_engine_c_objects OBJECT src/c-api/ck_file_engine.cpp src/c-api/preservation_policy_c.cpp
   src/c-api/comparison_plan_c.cpp src/c-api/tree_c.cpp src/c-api/actions_c.cpp src/c-api/session_c.cpp
-  src/c-api/retry_c.cpp src/c-api/journal_root_c.cpp)
+  src/c-api/retry_c.cpp src/c-api/journal_root_c.cpp src/c-api/search_c.cpp)
 set_target_properties(ck_file_engine_c_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(ck_file_engine_c_objects PRIVATE cxx_std_20)
 target_compile_definitions(ck_file_engine_c_objects PRIVATE CK_FILE_ENGINE_BUILD)
@@ -453,6 +453,10 @@ if(BUILD_TESTING)
   target_compile_definitions(ck_fs_journal_root_c_abi_tests PRIVATE CKFJR_C_SMOKE_MAIN)
   target_link_libraries(ck_fs_journal_root_c_abi_tests PRIVATE ck_file_engine_c)
   add_test(NAME journal_root_c_abi COMMAND ck_fs_journal_root_c_abi_tests)
+  add_executable(ck_fs_search_c_abi_tests tests/search_c_smoke.c)
+  target_link_libraries(ck_fs_search_c_abi_tests PRIVATE ck_file_engine_c)
+  target_include_directories(ck_fs_search_c_abi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME search_c_abi COMMAND ck_fs_search_c_abi_tests)
   add_executable(ck_fs_journal_root_c_native_tests tests/journal_root_c_native.c)
   target_link_libraries(ck_fs_journal_root_c_native_tests PRIVATE ck_file_engine_c)
   add_test(NAME journal_root_c_native COMMAND ${Python3_EXECUTABLE}

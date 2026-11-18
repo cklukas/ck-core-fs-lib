@@ -2,6 +2,14 @@
 
 ## Unreleased 0.5 development checkpoint
 
+- Add `include/ck_fs_search.h` (`ckfes_*`), a worker-owned, cancellable
+  recursive filename (substring/glob) and regular-file content search C ABI
+  built on handle-relative `DirectoryCursor` and `OpenedEntry` primitives
+  without following descendant symlinks or reparse points. Supports size and
+  modified-timestamp bounds, binary-file content skipping, incremental page
+  streaming while `CKFES_RUNNING`, exact relative path byte/UTF-16 copy, and
+  explicit `ckfes_worker_drained_v1` lifetime coordination.
+
 - Replace the remaining unsafe Windows fixture interception with compiled,
   read-only native observations; retain all fourteen legacy entrypoints and
   real read/completion/drain error channels. Guard private fault storage with

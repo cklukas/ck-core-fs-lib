@@ -1,8 +1,9 @@
 # C API
 
 The entry header is [`include/ck_file_engine.h`](../include/ck_file_engine.h).
-`ck_fs_tree.h`, `ck_fs_actions.h`, `ck_fs_session.h`, `ck_fs_journal_root.h`,
-and `ck_fs_retry.h` expose native reviewed execution, action jobs, durable
+`ck_fs_tree.h`, `ck_fs_actions.h`, `ck_fs_search.h`, `ck_fs_session.h`, `ck_fs_journal_root.h`,
+and `ck_fs_retry.h` expose native reviewed execution, action jobs, cancellable
+recursive filename/content search, durable
 sessions, owned journal roots and verified copy retry. All headers are usable from C and C++ and contain no C++ types, exceptions, STL
 containers, or frontend types.
 
@@ -286,3 +287,23 @@ and completed assessment command. The fixed cached getter does no filesystem
 I/O, allocation or rule evaluation. Read the
 [name feedback contract](tree-name-feedback.md) before presenting its typed
 reasons; eligibility never replaces native review or a receipt.
+
+## Streaming recursive filename and content search (`ck_fs_search.h`)
+
+`ck_fs_search.h` exposes `ckfes_options_init_v1`, `ckfes_start_v1`,
+`ckfes_poll_v1`, `ckfes_worker_drained_v1`, `ckfes_page_v1_get`,
+`ckfes_path_copy_v1`, `ckfes_request_cancel`, and `ckfes_release` under ABI
+minor 5. Every public entry point copies bounded caller memory without blocking
+on filesystem I/O. Enumeration and regular-file content matching execute on an
+owned worker through handle-relative `DirectoryCursor` and `OpenedEntry`
+operations without traversing descendant symlinks or reparse points.
+
+Callers may filter by substring or glob name patterns (`CKFES_NAME_SUBSTRING`,
+`CKFES_NAME_GLOB`), byte/UTF-16 content substrings (with optional NUL-byte
+binary-file skipping across chunk boundaries), inclusive minimum/maximum logical
+byte sizes, and modified-timestamp intervals (`modified_not_before` inclusive,
+`modified_before` exclusive). Matched entries append monotonically and can be
+paged via `ckfes_page_v1_get` and `ckfes_path_copy_v1` while the snapshot state
+is `CKFES_RUNNING` as well as after terminal completion or cancellation. Callers
+coordinating shutdown should observe `ckfes_worker_drained_v1` before releasing
+the handle.
