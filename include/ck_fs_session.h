@@ -291,6 +291,23 @@ CKFSS_API ckfss_status ckfss_two_way_open(const ckfss_options*, const ckfss_meta
 CKFSS_API ckfss_status ckfss_two_way_open_with_journal_root(const ckfss_options*,
     const ckfss_metadata_policy*, const ckfss_two_way_policy*, const ckfjr_root*,
     ckfss_two_way**, ckfss_error*) CKFSS_NOEXCEPT;
+
+#define CKFSS_TWO_WAY_TREE_VERSION UINT32_C(1)
+enum {
+    CKFSS_NAMESPACE_STRICT_HANDLE_LOCK=0,
+    CKFSS_NAMESPACE_HELD_PARENT_RENAME=1
+};
+typedef struct ckfss_two_way_tree_options_v1 {
+    uint32_t version, struct_size;
+    uint32_t allow_recursive_trees, namespace_policy;
+    uint64_t max_depth;
+    uint64_t reserved[2];
+} ckfss_two_way_tree_options_v1;
+CKFSS_API void ckfss_two_way_tree_options_init_v1(ckfss_two_way_tree_options_v1*) CKFSS_NOEXCEPT;
+CKFSS_API ckfss_status ckfss_two_way_open_tree_v1(const ckfss_options*,
+    const ckfss_metadata_policy*, const ckfss_two_way_policy*,
+    const ckfss_two_way_tree_options_v1*, const ckfjr_root*,
+    ckfss_two_way**, ckfss_error*) CKFSS_NOEXCEPT;
 // WORKER ONLY. Terminal consumer teardown; it never advances a pending baseline
 // intent or turns partial execution into Complete. Root owner remains held until
 // destroy; collect this result before Root finish/drain, as for session_finish_io.

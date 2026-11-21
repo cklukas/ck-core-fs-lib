@@ -465,19 +465,28 @@ void ckfet_options_init_v1(ckfet_options_v1* o) {
     o->limits = {l.max_entries, l.max_path_bytes, l.max_total_path_bytes, l.max_exclusions, l.max_page_rows, l.max_aggregate_bytes};
     o->filters.allowed_kind_mask = CKFSP_ALL_KINDS; o->filters.maximum_depth = 1024;
 }
+void ckfet_options_init_v2(ckfet_options_v2* o) {
+    if (!o) return;
+    *o = {};
+    ckfet_options_init_v1(&o->base);
+    o->base.version = CKFET_OPTIONS_V2_VERSION;
+    o->base.struct_size = sizeof(*o);
+    o->namespace_policy = CKFET_NAMESPACE_STRICT_HANDLE_LOCK;
+}
 }
 namespace {
 ckfe_api_status start_tree(const ckfe_entry* src, const ckfe_entry* dst,
-    const ckfet_options_v1* o, std::shared_ptr<PreparedJournalRoot> root,
-    ckfet_job** out, ckfe_error* e) {
+    const ckfet_options_v1* o, bool allow_held_posix_namespace, std::shared_ptr<PreparedJournalRoot> root,
+    ckfet_job** out, ckfe_error* e, uint32_t expected_version = CKFET_VERSION, size_t expected_size = sizeof(ckfet_options_v1)) {
     if (out) *out = nullptr; clear(e);
     return boundary([&] {
-        require(out && src && src->child && dst && dst->child && o && o->version == CKFET_VERSION &&
-            o->struct_size == sizeof(*o) && o->profile <= CKFSP_COMPARE && o->metadata_scope <= 1 &&
+        require(out && src && src->child && dst && dst->child && o && o->version == expected_version &&
+            o->struct_size == expected_size && o->profile <= CKFSP_COMPARE && o->metadata_scope <= 1 &&
             o->allow_metadata_loss <= 1 && !o->reserved && o->metadata_ownership <= 1 && o->allow_privilege_metadata <= 1);
         const bool reporting=o->profile==CKFSP_COMPARE;
         if(!reporting) require(std::any_of(std::begin(o->operation_id),std::end(o->operation_id),[](auto b){return b!=0;}));
         ReviewedTreePlanRequest r;
+        r.allow_held_posix_namespace = allow_held_posix_namespace;
         r.source_root = src->child; r.destination_root = dst->child;
         r.destination_address = dst->address;
         r.comparison.profile = static_cast<ComparisonProfile>(o->profile);
@@ -517,7 +526,7 @@ ckfe_api_status start_tree(const ckfe_entry* src, const ckfe_entry* dst,
 extern "C" {
 ckfe_api_status ckfet_start_v1(const ckfe_entry* src,const ckfe_entry* dst,
     const ckfet_options_v1* o,ckfet_job** out,ckfe_error* e) {
-    return start_tree(src,dst,o,{},out,e);
+    return start_tree(src,dst,o,false,{},out,e);
 }
 ckfe_api_status ckfet_start_with_journal_root_v1(const ckfe_entry* src,const ckfe_entry* dst,
     const ckfet_options_v1* o,const ckfjr_root* root,ckfet_job** out,ckfe_error* e) {
@@ -525,11 +534,35 @@ ckfe_api_status ckfet_start_with_journal_root_v1(const ckfe_entry* src,const ckf
     return boundary([&] {
         // Compare has no mutation-root dependency, including through this
         // additive entry point. Validate its ordinary options in start_tree.
-        if(o && o->profile==CKFSP_COMPARE)return start_tree(src,dst,o,{},out,e);
+        if(o && o->profile==CKFSP_COMPARE)return start_tree(src,dst,o,false,{},out,e);
         require(out && root);
         auto retained=retain_prepared_journal_root(root);
         if(!retained.value())return CKFE_API_NOT_READY;
-        return start_tree(src,dst,o,std::move(retained).take_value(),out,e);
+        return start_tree(src,dst,o,false,std::move(retained).take_value(),out,e);
+    });
+}
+ckfe_api_status ckfet_start_v2(const ckfe_entry* src,const ckfe_entry* dst,
+    const ckfet_options_v2* o,ckfet_job** out,ckfe_error* e) {
+    if(out)*out=nullptr;clear(e);
+    return boundary([&] {
+        require(o && o->namespace_policy <= CKFET_NAMESPACE_HELD_PARENT_RENAME && !o->reserved_v2);
+        return start_tree(src,dst,&o->base,o->namespace_policy==CKFET_NAMESPACE_HELD_PARENT_RENAME,
+            {},out,e,CKFET_OPTIONS_V2_VERSION,sizeof(*o));
+    });
+}
+ckfe_api_status ckfet_start_with_journal_root_v2(const ckfe_entry* src,const ckfe_entry* dst,
+    const ckfet_options_v2* o,const ckfjr_root* root,ckfet_job** out,ckfe_error* e) {
+    if(out)*out=nullptr;clear(e);
+    return boundary([&] {
+        require(o && o->namespace_policy <= CKFET_NAMESPACE_HELD_PARENT_RENAME && !o->reserved_v2);
+        const bool held_ns = o->namespace_policy == CKFET_NAMESPACE_HELD_PARENT_RENAME;
+        if(o->base.profile==CKFSP_COMPARE)
+            return start_tree(src,dst,&o->base,held_ns,{},out,e,CKFET_OPTIONS_V2_VERSION,sizeof(*o));
+        require(out && root);
+        auto retained=retain_prepared_journal_root(root);
+        if(!retained.value())return CKFE_API_NOT_READY;
+        return start_tree(src,dst,&o->base,held_ns,std::move(retained).take_value(),out,e,
+            CKFET_OPTIONS_V2_VERSION,sizeof(*o));
     });
 }
 ckfe_api_status ckfet_poll_v1(const ckfet_job* j, ckfet_snapshot_v1* out) {

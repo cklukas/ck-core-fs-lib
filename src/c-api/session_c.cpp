@@ -653,8 +653,17 @@ void ckfss_two_way_policy_init(ckfss_two_way_policy* p) noexcept {
     p->max_entries=proof.max_entries;p->chunk_bytes=proof.chunk_bytes;p->max_ledger_files=ledger.max_ledgers;
     p->max_ledger_bytes=ledger.max_total_wire_bytes;p->max_retained_artifacts=ledger.max_artifacts;
 }
+void ckfss_two_way_tree_options_init_v1(ckfss_two_way_tree_options_v1* t) noexcept {
+    if(!t)return;
+    *t={};
+    t->version=CKFSS_TWO_WAY_TREE_VERSION;
+    t->struct_size=sizeof(*t);
+    t->allow_recursive_trees=0;
+    t->namespace_policy=CKFSS_NAMESPACE_STRICT_HANDLE_LOCK;
+    t->max_depth=1024;
+}
 static ckfss_status two_way_open_impl(const ckfss_options* o,const ckfss_metadata_policy* metadata,const ckfss_two_way_policy* execution,
-    PreparedJournalRoot::Pointer owner,ckfss_two_way** out,ckfss_error* error) noexcept {
+    const ckfss_two_way_tree_options_v1* tree_opts,PreparedJournalRoot::Pointer owner,ckfss_two_way** out,ckfss_error* error) noexcept {
     if(out)*out=nullptr;clear(error);
     return boundary([&]()->ckfss_status {
         require(o&&metadata&&execution&&out&&o->version==CKFSS_VERSION&&o->struct_size==sizeof(*o));
@@ -664,8 +673,22 @@ static ckfss_status two_way_open_impl(const ckfss_options* o,const ckfss_metadat
             p.chunk_bytes&&p.chunk_bytes<=ContentReadLimits::hard_max_bytes&&p.max_ledger_files&&p.max_ledger_files<=4096&&
             p.max_ledger_bytes&&p.max_ledger_bytes<=OperationJournalLimits::hard_max_evidence_bytes&&
             p.max_retained_artifacts<=1'000'000&&p.max_deletions<=1'000'000&&p.max_delete_basis_points<=10000);
+        bool recursive=false;
+        bool held_ns=false;
+        std::size_t max_depth=1024;
+        if(tree_opts) {
+            require(tree_opts->version==CKFSS_TWO_WAY_TREE_VERSION&&tree_opts->struct_size==sizeof(*tree_opts)&&
+                tree_opts->allow_recursive_trees<=1&&tree_opts->namespace_policy<=CKFSS_NAMESPACE_HELD_PARENT_RENAME&&
+                tree_opts->max_depth>=1&&tree_opts->max_depth<=1024&&!tree_opts->reserved[0]&&!tree_opts->reserved[1]);
+            recursive=tree_opts->allow_recursive_trees!=0;
+            held_ns=tree_opts->namespace_policy==CKFSS_NAMESPACE_HELD_PARENT_RENAME;
+            max_depth=static_cast<std::size_t>(tree_opts->max_depth);
+        }
         NativeSyncCoordinatorRequest request{owner?std::optional<NativeAbsolutePath>{}:path(o->coordinator),path(o->left),path(o->right),digest(o->policy_fingerprint),{},{},{},{},{},{}};
         request.prepared_journal_root=std::move(owner);
+        request.recursive_trees=recursive;
+        request.max_depth=max_depth;
+        request.allow_held_posix_namespace=held_ns;
         request.metadata.scope=static_cast<RegularMetadataScope>(metadata->scope);request.metadata.ownership=static_cast<MetadataOwnership>(metadata->ownership);
         request.metadata.allow_privilege_metadata=metadata->allow_privilege_metadata!=0;
         request.metadata.limits={static_cast<std::size_t>(metadata->max_metadata_bytes),static_cast<std::size_t>(metadata->max_metadata_records)};
@@ -679,13 +702,27 @@ static ckfss_status two_way_open_impl(const ckfss_options* o,const ckfss_metadat
     });
 }
 ckfss_status ckfss_two_way_open(const ckfss_options* o,const ckfss_metadata_policy* metadata,const ckfss_two_way_policy* execution,
-    ckfss_two_way** out,ckfss_error* error) noexcept {return two_way_open_impl(o,metadata,execution,{},out,error);}
+    ckfss_two_way** out,ckfss_error* error) noexcept {return two_way_open_impl(o,metadata,execution,nullptr,{},out,error);}
 ckfss_status ckfss_two_way_open_with_journal_root(const ckfss_options* o,const ckfss_metadata_policy* metadata,const ckfss_two_way_policy* execution,
     const ckfjr_root* root,ckfss_two_way** out,ckfss_error* error) noexcept {
     if(out)*out=nullptr;clear(error);
     return boundary([&]()->ckfss_status {require(root&&out);auto owner=retain_prepared_journal_root(root);
         if(!owner.value())return unavailable(owner,error);
-        return two_way_open_impl(o,metadata,execution,std::move(owner).take_value(),out,error);});
+        return two_way_open_impl(o,metadata,execution,nullptr,std::move(owner).take_value(),out,error);});
+}
+ckfss_status ckfss_two_way_open_tree_v1(const ckfss_options* o,const ckfss_metadata_policy* metadata,const ckfss_two_way_policy* execution,
+    const ckfss_two_way_tree_options_v1* tree_opts,const ckfjr_root* root,ckfss_two_way** out,ckfss_error* error) noexcept {
+    if(out)*out=nullptr;clear(error);
+    return boundary([&]()->ckfss_status {
+        require(out&&tree_opts);
+        PreparedJournalRoot::Pointer owner;
+        if(root) {
+            auto retained=retain_prepared_journal_root(root);
+            if(!retained.value())return unavailable(retained,error);
+            owner=std::move(retained).take_value();
+        }
+        return two_way_open_impl(o,metadata,execution,tree_opts,std::move(owner),out,error);
+    });
 }
 ckfss_status ckfss_two_way_finish_io(ckfss_two_way* worker,ckfss_error* error) noexcept {
     clear(error);return boundary([&]()->ckfss_status {require(worker);worker->stop.request_stop();

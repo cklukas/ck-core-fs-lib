@@ -20,6 +20,8 @@ struct RetainedTargetRequest final {
     std::function<Observation<std::unique_ptr<OperationJournalFile>>(
         const NativeAbsolutePath&, const NativeName&, bool)> open_journal = open_native_operation_journal_file;
     std::shared_ptr<PreparedJournalRoot> prepared_journal_root = {};
+    bool allow_held_posix_namespace = false;
+    std::shared_ptr<const DirectoryCursor> retained_destination = {};
 };
 enum class RetainedTargetState { Verifying, Ready, Retained, Failed, Cancelled, NeedsReconciliation };
 // Worker-owned replacement prerequisite. Original data, ACLs, xattrs and

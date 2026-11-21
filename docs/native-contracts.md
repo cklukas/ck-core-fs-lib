@@ -86,8 +86,16 @@ journals are separate durable evidence; they are not a cross-object atomic
 transaction.
 
 The provider must qualify source-object conditional rename and writer
-exclusion. A POSIX `stat` followed by a name-based rename does not satisfy that
-contract. Neither does an advisory session lock. Unsupported providers refuse
+exclusion on default strict handle-lock requests (`ckfet_start_v1` /
+`CKFET_NAMESPACE_STRICT_HANDLE_LOCK`). On qualified Linux `ext4`/`XFS`/`Btrfs`
+mounts, callers that explicitly opt into `CKFET_NAMESPACE_HELD_PARENT_RENAME`
+(`ckfet_options_v2`) authorize safe `.ck-retire-<pid>-<seq>` `renameat2(...,
+RENAME_NOREPLACE)` staging with post-rename `statx`/`fstatat` identity
+verification (restoring the original entry without unlinking on concurrent
+mismatch) and full content SHA-256 verification before target retention or
+reviewed deletion. A plain POSIX `stat` followed by an unchecked name-based
+rename or unlink does not satisfy either contract. Neither does an advisory
+session lock. Unsupported providers refuse
 this operation before moving the old target. Provider refusals are limits,
 not completed platform implementations.
 

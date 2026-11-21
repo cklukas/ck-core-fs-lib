@@ -18,6 +18,8 @@
 #include "prepared_journal_failure_latch.hpp"
 #include "native_directory_reader.hpp"
 #include "held_directory_scan.hpp"
+#include "native_caller_ownership.hpp"
+#include "../metadata_ownership_digest.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1924,6 +1926,10 @@ private:
     }
     friend class PosixDirectoryCursor;
     friend class PosixTargetReadSeed;
+    friend Observation<bool> ck::files::qualify_native_directory_creation(const DirectoryCursor&,const MetadataReplayPolicy&);
+    friend Observation<bool> ck::files::qualify_held_posix_namespace(const DirectoryCursor&);
+    friend Observation<std::unique_ptr<NativeCreatedDirectory>> ck::files::create_native_directory(
+        std::shared_ptr<const DirectoryCursor>,NativeName,const MetadataReplayPolicy&);
 #if defined(__APPLE__)
     static std::optional<UnavailableObservation> provider_guard(const BasicMetadata& metadata) {
         const auto review = provider_review_required(metadata, StorageModel::DarwinStatFlags);
@@ -2502,6 +2508,183 @@ public:
             NativeIdentifier::from_u64(static_cast<std::uint64_t>(actual.st_dev)),
             NativeIdentifier::from_u64(static_cast<std::uint64_t>(actual.st_ino)), generation});
         return Result::available(std::make_unique<PosixDirectoryCursor>(std::move(opened), std::move(observed), scope_));
+    }
+    Observation<bool> retire_child(const NativeName& name, const ObjectIdentity& expected_identity) const override {
+        using Result = Observation<bool>;
+        const auto* spelling = name.posix_bytes();
+        if (!name.is_valid() || !spelling)
+            return Result::unavailable(ObservationState::Failed,
+                adapter_error(AdapterError::InvalidIdentifier, "retire_child.name"));
+        if (compare_identity(expected_identity, expected_identity) != IdentityComparison::Same || !identity().value())
+            return Result::unavailable(ObservationState::Failed,
+                adapter_error(AdapterError::UnqualifiedIdentity, "retire_child.identity"));
+        const int parent_fd = dirfd(directory_.get());
+        const auto parent_now = inspect_basic();
+        if (!parent_now.value()) {
+            const auto& e = *parent_now.unavailable_detail();
+            return Result::unavailable(e.state, e.error);
+        }
+        if (!parent_now.value()->identity.value() ||
+            compare_identity(*identity().value(), *parent_now.value()->identity.value()) != IdentityComparison::Same)
+            return Result::unavailable(ObservationState::Changed,
+                adapter_error(AdapterError::MetadataChanged, "retire_child.parent_identity"));
+#if defined(__linux__)
+        const auto metadata = statx_metadata(parent_fd, spelling->c_str(), AT_SYMLINK_NOFOLLOW, scope_);
+#else
+        const auto metadata = stat_metadata(parent_fd, spelling->c_str(), false, scope_, AT_SYMLINK_NOFOLLOW);
+#endif
+        if (!metadata.value()) {
+            const auto& e = *metadata.unavailable_detail();
+            return Result::unavailable(e.state, e.error);
+        }
+        if (!metadata.value()->identity.value() || !metadata.value()->kind.value())
+            return Result::unavailable(ObservationState::Unknown,
+                adapter_error(AdapterError::UnqualifiedIdentity, "retire_child.source_metadata"));
+        if (compare_identity(*metadata.value()->identity.value(), expected_identity) != IdentityComparison::Same)
+            return Result::unavailable(ObservationState::Changed,
+                adapter_error(AdapterError::MetadataChanged, "retire_child.identity"));
+        const ObjectKind child_kind = *metadata.value()->kind.value();
+        const bool is_dir = child_kind == ObjectKind::Directory;
+        if (!is_dir && child_kind != ObjectKind::RegularFile)
+            return Result::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::NotApplicable, "retire_child.kind"));
+        if (!is_dir && (!metadata.value()->link_count.value() || *metadata.value()->link_count.value() != 1))
+            return Result::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::UnsupportedQuery, "retire_child.hard_link"));
+
+        OwnedDescriptor pinned(-1);
+        if (is_dir) {
+            pinned = OwnedDescriptor(openat(parent_fd, spelling->c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+            if (pinned.get() < 0) {
+                const int code = errno;
+                return Result::unavailable(errno_state(code), {ErrorDomain::Posix, code, "retire_child.open_directory"});
+            }
+            struct stat dir_stat{};
+            if (::ck::files::detail::legacy_fstat(pinned.get(), &dir_stat, "legacy.metadata_posix.fstat.2506") != 0)
+                return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "retire_child.fstat_directory"});
+            std::optional<std::uint64_t> gen;
+#if defined(__APPLE__)
+            gen = dir_stat.st_gen;
+#endif
+            const ObjectIdentity actual_id{scope_, IdentityScheme::PosixDeviceInode,
+                NativeIdentifier::from_u64(static_cast<std::uint64_t>(dir_stat.st_dev)),
+                NativeIdentifier::from_u64(static_cast<std::uint64_t>(dir_stat.st_ino)), gen};
+            if (!S_ISDIR(dir_stat.st_mode) || compare_identity(actual_id, expected_identity) != IdentityComparison::Same)
+                return Result::unavailable(ObservationState::Changed,
+                    adapter_error(AdapterError::MetadataChanged, "retire_child.directory_identity"));
+            OwnedDescriptor scan_dup(fcntl(pinned.get(), F_DUPFD_CLOEXEC, 0));
+            if (scan_dup.get() < 0)
+                return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "retire_child.dup_directory"});
+            OwnedDirectory scan_dir(fdopendir(scan_dup.get()));
+            if (!scan_dir)
+                return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "retire_child.fdopendir"});
+            scan_dup.release();
+            for (;;) {
+                errno = 0;
+                const auto* dent = readdir(scan_dir.get());
+                if (!dent) {
+                    if (errno != 0)
+                        return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "retire_child.readdir"});
+                    break;
+                }
+                const std::string_view dname(dent->d_name);
+                if (dname == "." || dname == "..") continue;
+                return Result::unavailable(ObservationState::Changed,
+                    {ErrorDomain::Posix, ENOTEMPTY, "retire_child.nonempty_directory"});
+            }
+        } else {
+#if defined(__linux__)
+            pinned = OwnedDescriptor(openat(parent_fd, spelling->c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC));
+#else
+            pinned = OwnedDescriptor(openat(parent_fd, spelling->c_str(), O_EVTONLY | O_SYMLINK | O_NONBLOCK | O_NOCTTY | O_CLOEXEC));
+#endif
+            if (pinned.get() < 0) {
+                const int code = errno;
+                return Result::unavailable(errno_state(code), {ErrorDomain::Posix, code, "retire_child.open_file"});
+            }
+            struct stat file_stat{};
+            if (::ck::files::detail::legacy_fstat(pinned.get(), &file_stat, "legacy.metadata_posix.fstat.2507") != 0)
+                return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "retire_child.fstat_file"});
+            std::optional<std::uint64_t> gen;
+#if defined(__APPLE__)
+            gen = file_stat.st_gen;
+#endif
+            const ObjectIdentity actual_id{scope_, IdentityScheme::PosixDeviceInode,
+                NativeIdentifier::from_u64(static_cast<std::uint64_t>(file_stat.st_dev)),
+                NativeIdentifier::from_u64(static_cast<std::uint64_t>(file_stat.st_ino)), gen};
+            if (!S_ISREG(file_stat.st_mode) || compare_identity(actual_id, expected_identity) != IdentityComparison::Same)
+                return Result::unavailable(ObservationState::Changed,
+                    adapter_error(AdapterError::MetadataChanged, "retire_child.file_identity"));
+            if (file_stat.st_nlink != 1)
+                return Result::unavailable(ObservationState::Unsupported,
+                    adapter_error(AdapterError::UnsupportedQuery, "retire_child.hard_link"));
+        }
+
+        static std::atomic<std::uint64_t> retire_seq{1};
+        std::string isolated_name;
+        bool isolated_ok = false;
+        for (unsigned attempt = 0; attempt < 128; ++attempt) {
+            const auto seq = retire_seq.fetch_add(1, std::memory_order_relaxed);
+            isolated_name = ".ck-retire-" + std::to_string(static_cast<unsigned long long>(getpid())) +
+                            "-" + std::to_string(static_cast<unsigned long long>(seq));
+            if (rename_noreplace(parent_fd, spelling->c_str(), parent_fd, isolated_name.c_str()) == 0) {
+                isolated_ok = true;
+                break;
+            }
+            const int code = errno;
+            if (code == EEXIST) continue;
+            if (code == ENOSYS || code == ENOTSUP || code == EOPNOTSUPP)
+                return Result::unavailable(ObservationState::Unsupported,
+                    {ErrorDomain::Posix, code, "retire_child.atomic_rename"});
+            return Result::unavailable(errno_state(code), {ErrorDomain::Posix, code, "retire_child.isolate"});
+        }
+        if (!isolated_ok)
+            return Result::unavailable(ObservationState::Unknown,
+                adapter_error(AdapterError::InventoryLimit, "retire_child.isolate_exhausted"));
+
+#if defined(__linux__)
+        const auto isolated = statx_metadata(parent_fd, isolated_name.c_str(), AT_SYMLINK_NOFOLLOW, scope_);
+#else
+        const auto isolated = stat_metadata(parent_fd, isolated_name.c_str(), false, scope_, AT_SYMLINK_NOFOLLOW);
+#endif
+        if (!isolated.value() || !isolated.value()->identity.value() ||
+            compare_identity(*isolated.value()->identity.value(), expected_identity) != IdentityComparison::Same) {
+            // Do NOT unlink an unreviewed substituted object; restore original name if unoccupied.
+            (void)rename_noreplace(parent_fd, isolated_name.c_str(), parent_fd, spelling->c_str());
+            return Result::unavailable(ObservationState::Changed,
+                adapter_error(AdapterError::MetadataChanged, "retire_child.isolated_identity"));
+        }
+        if (!is_dir && (!isolated.value()->link_count.value() || *isolated.value()->link_count.value() != 1)) {
+            (void)rename_noreplace(parent_fd, isolated_name.c_str(), parent_fd, spelling->c_str());
+            return Result::unavailable(ObservationState::Unsupported,
+                adapter_error(AdapterError::UnsupportedQuery, "retire_child.isolated_hard_link"));
+        }
+        pinned = OwnedDescriptor(-1);
+        if (unlinkat(parent_fd, isolated_name.c_str(), is_dir ? AT_REMOVEDIR : 0) != 0) {
+            const int code = errno;
+            if (code == ENOTEMPTY || code == EEXIST) {
+                (void)rename_noreplace(parent_fd, isolated_name.c_str(), parent_fd, spelling->c_str());
+                return Result::unavailable(ObservationState::Changed,
+                    {ErrorDomain::Posix, ENOTEMPTY, "retire_child.nonempty_directory"});
+            }
+            return Result::unavailable(ObservationState::Unknown,
+                {ErrorDomain::Posix, code, "retire_child.disposition"});
+        }
+        if (fsync(parent_fd) != 0) {
+            const int code = errno;
+            return Result::unavailable(ObservationState::Unknown,
+                {ErrorDomain::Posix, code, "retire_child.directory_flush"});
+        }
+        return Result::available(true);
+    }
+    Observation<bool> discard_child(const NativeName& name, const ObjectIdentity& expected_identity) const override {
+        if (!name.is_valid() || !name.posix_bytes())
+            return Observation<bool>::unavailable(ObservationState::Failed,
+                adapter_error(AdapterError::InvalidIdentifier, "discard_child.name"));
+        if (compare_identity(expected_identity, expected_identity) != IdentityComparison::Same || !identity().value())
+            return Observation<bool>::unavailable(ObservationState::Failed,
+                adapter_error(AdapterError::UnqualifiedIdentity, "discard_child.identity"));
+        return retire_child(name, expected_identity);
     }
     Observation<bool> trash_child(const NativeName& name, const ObjectIdentity& expected_identity) const override {
         using Result = Observation<bool>;
@@ -3128,6 +3311,10 @@ public:
 private:
     friend class PosixTargetReadSeed;
     friend class PosixHeldDirectoryScan;
+    friend Observation<bool> ck::files::qualify_native_directory_creation(const DirectoryCursor&,const MetadataReplayPolicy&);
+    friend Observation<bool> ck::files::qualify_held_posix_namespace(const DirectoryCursor&);
+    friend Observation<std::unique_ptr<NativeCreatedDirectory>> ck::files::create_native_directory(
+        std::shared_ptr<const DirectoryCursor>,NativeName,const MetadataReplayPolicy&);
     Observation<DirectoryStep> next_step() override {
         if(journal_scan_finished_)return Observation<DirectoryStep>::unavailable(ObservationState::Denied,{ErrorDomain::Posix,EBADF,"journal_reader.root_finished"});
         using Result = Observation<DirectoryStep>;
@@ -3763,14 +3950,240 @@ Observation<bool> verify_native_metadata_replay_channels(const MetadataReplaySna
     return Observation<bool>::unavailable(ObservationState::Unsupported,
         adapter_error(AdapterError::NotApplicable,"metadata_channels.native_windows_evidence_required"));
 }
-Observation<bool> qualify_native_directory_creation(const DirectoryCursor&,const MetadataReplayPolicy&) {
+Observation<bool> qualify_held_posix_namespace(const DirectoryCursor& parent) {
+#if defined(__linux__)
+    using Result = Observation<bool>;
+    const auto* cursor = dynamic_cast<const PosixDirectoryCursor*>(&parent);
+    if (!cursor || !parent.identity().value() || parent.identity().value()->scheme != IdentityScheme::PosixDeviceInode)
+        return Result::unavailable(ObservationState::Unsupported,
+            adapter_error(AdapterError::ProviderReviewRequired, "held_posix_namespace.parent_identity"));
+    const auto before = cursor->inspect_basic();
+    if (!before.value()) {
+        const auto& e = *before.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    if (!before.value()->kind.value() || *before.value()->kind.value() != ObjectKind::Directory ||
+        !before.value()->identity.value() ||
+        compare_identity(*before.value()->identity.value(), *parent.identity().value()) != IdentityComparison::Same)
+        return Result::unavailable(ObservationState::Changed,
+            adapter_error(AdapterError::MetadataChanged, "held_posix_namespace.parent_changed"));
+    const int parent_fd = dirfd(cursor->directory_.get());
+    struct statfs filesystem{};
+    if (fstatfs(parent_fd, &filesystem) != 0)
+        return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "held_posix_namespace.fstatfs"});
+    const auto provider = detail::linux_ordinary_metadata_provider(filesystem.f_type);
+    if (provider == detail::LinuxOrdinaryMetadataProvider::Unknown)
+        return Result::unavailable(ObservationState::Unsupported,
+            adapter_error(AdapterError::ProviderReviewRequired, "held_posix_namespace.filesystem"));
+    int flags = 0;
+    if (ioctl(parent_fd, FS_IOC_GETFLAGS, &flags) != 0 ||
+        !detail::linux_ordinary_inode_flags(provider, static_cast<std::uint32_t>(flags), true))
+        return Result::unavailable(ObservationState::Unsupported,
+            adapter_error(AdapterError::ProviderReviewRequired, "held_posix_namespace.inode_flags"));
+    const auto access = cursor->check_access(DirectoryAccess::AddFile);
+    if (!access.value()) {
+        const auto& e = *access.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    const auto after = cursor->inspect_basic();
+    if (!after.value()) {
+        const auto& e = *after.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    if (!after.value()->identity.value() ||
+        compare_identity(*after.value()->identity.value(), *parent.identity().value()) != IdentityComparison::Same)
+        return Result::unavailable(ObservationState::Changed,
+            adapter_error(AdapterError::MetadataChanged, "held_posix_namespace.parent_bookend"));
+    return Result::available(true);
+#else
+    (void)parent;
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        adapter_error(AdapterError::ProviderReviewRequired, "held_posix_namespace.platform_unqualified"));
+#endif
+}
+Observation<bool> qualify_native_directory_creation(const DirectoryCursor& parent,const MetadataReplayPolicy& policy) {
+#if defined(__linux__)
+    using Result = Observation<bool>;
+    const auto refuse = [](const char* op) {
+        return Result::unavailable(ObservationState::Unsupported,
+            adapter_error(AdapterError::ProviderReviewRequired, op));
+    };
+    if (!policy.valid()) return refuse("directory_creation.policy");
+    const auto* cursor = dynamic_cast<const PosixDirectoryCursor*>(&parent);
+    if (!cursor || !parent.identity().value() || parent.identity().value()->scheme != IdentityScheme::PosixDeviceInode)
+        return refuse("directory_creation.parent_provider_identity");
+    const auto before = cursor->inspect_basic();
+    if (!before.value()) {
+        const auto& e = *before.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    if (!before.value()->kind.value() || *before.value()->kind.value() != ObjectKind::Directory ||
+        !before.value()->identity.value() ||
+        compare_identity(*before.value()->identity.value(), *parent.identity().value()) != IdentityComparison::Same)
+        return Result::unavailable(ObservationState::Changed,
+            adapter_error(AdapterError::MetadataChanged, "directory_creation.parent_changed"));
+    const int parent_fd = dirfd(cursor->directory_.get());
+    struct statfs filesystem{};
+    if (fstatfs(parent_fd, &filesystem) != 0)
+        return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "directory_creation.fstatfs"});
+    const auto provider = detail::linux_ordinary_metadata_provider(filesystem.f_type);
+    if (provider == detail::LinuxOrdinaryMetadataProvider::Unknown ||
+        (policy.scope != RegularMetadataScope::OrdinaryCallerVisibleV1 &&
+         provider != detail::LinuxOrdinaryMetadataProvider::Ext4))
+        return refuse("directory_creation.filesystem");
+    if (policy.scope == RegularMetadataScope::CompleteMetadataV1) {
+        if (!policy.allow_privilege_metadata) return refuse("directory_creation.full_security_optin_required");
+        __user_cap_header_struct header{}; header.version = _LINUX_CAPABILITY_VERSION_3;
+        __user_cap_data_struct capabilities[2]{};
+        if (syscall(SYS_capget, &header, capabilities) != 0)
+            return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "directory_creation.capget"});
+        if ((capabilities[CAP_SYS_ADMIN / 32].effective & (1U << (CAP_SYS_ADMIN % 32))) == 0)
+            return refuse("directory_creation.complete_requires_initial_sys_admin");
+        const auto environment = linux_full_environment();
+        if (!environment.value()) {
+            const auto& e = *environment.unavailable_detail();
+            return Result::unavailable(e.state, e.error);
+        }
+    }
+    int flags = 0;
+    if (ioctl(parent_fd, FS_IOC_GETFLAGS, &flags) != 0 ||
+        !detail::linux_ordinary_inode_flags(provider, static_cast<std::uint32_t>(flags), true))
+        return refuse("directory_creation.parent_inode_flags");
+    struct fsxattr extended{};
+    if (ioctl(parent_fd, FS_IOC_FSGETXATTR, &extended) != 0 ||
+        !detail::linux_ordinary_storage_policy(provider, extended))
+        return refuse("directory_creation.parent_storage_policy");
+    const auto access = cursor->check_access(DirectoryAccess::AddDirectory);
+    if (!access.value()) {
+        const auto& e = *access.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    const auto after = cursor->inspect_basic();
+    if (!after.value()) {
+        const auto& e = *after.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    if (!after.value()->identity.value() ||
+        compare_identity(*after.value()->identity.value(), *parent.identity().value()) != IdentityComparison::Same)
+        return Result::unavailable(ObservationState::Changed,
+            adapter_error(AdapterError::MetadataChanged, "directory_creation.parent_bookend"));
+    return Result::available(true);
+#else
+    (void)parent; (void)policy;
     return Observation<bool>::unavailable(ObservationState::Unsupported,
         adapter_error(AdapterError::ProviderReviewRequired,"directory_creation.posix_creator_identity_unproved"));
+#endif
 }
 Observation<std::unique_ptr<NativeCreatedDirectory>> create_native_directory(
-    std::shared_ptr<const DirectoryCursor>,NativeName,const MetadataReplayPolicy&) {
+    std::shared_ptr<const DirectoryCursor> parent,NativeName name,const MetadataReplayPolicy& policy) {
+#if defined(__linux__)
+    using Result = Observation<std::unique_ptr<NativeCreatedDirectory>>;
+    if (!parent)
+        return Result::unavailable(ObservationState::Failed,
+            adapter_error(AdapterError::InvalidIdentifier, "directory_creation.parent"));
+    const auto* spelling = name.posix_bytes();
+    if (!name.is_valid() || !spelling)
+        return Result::unavailable(ObservationState::Failed,
+            adapter_error(AdapterError::InvalidIdentifier, "directory_creation.name"));
+    const auto qualified = qualify_native_directory_creation(*parent, policy);
+    if (!qualified.value()) {
+        const auto& e = *qualified.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    if (!*qualified.value())
+        return Result::unavailable(ObservationState::Unsupported,
+            adapter_error(AdapterError::ProviderReviewRequired, "directory_creation.qualification_false"));
+    const auto* cursor = dynamic_cast<const PosixDirectoryCursor*>(parent.get());
+    const int parent_fd = dirfd(cursor->directory_.get());
+    if (mkdirat(parent_fd, spelling->c_str(), 0700) != 0) {
+        const int code = errno;
+        if (code == EEXIST)
+            return Result::unavailable(ObservationState::Changed,
+                adapter_error(AdapterError::PlanDecisionStale, "directory_creation.existing"));
+        return Result::unavailable(errno_state(code), {ErrorDomain::Posix, code, "directory_creation.mkdirat"});
+    }
+    const auto initial = statx_metadata(parent_fd, spelling->c_str(), AT_SYMLINK_NOFOLLOW, cursor->scope_);
+    if (!initial.value()) {
+        const auto& e = *initial.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    if (!initial.value()->kind.value() || *initial.value()->kind.value() != ObjectKind::Directory ||
+        !initial.value()->identity.value())
+        return Result::unavailable(ObservationState::Failed,
+            adapter_error(AdapterError::InvalidNativeResult, "directory_creation.created_kind"));
+
+    OwnedDescriptor writer_fd(openat(parent_fd, spelling->c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (writer_fd.get() < 0)
+        return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "directory_creation.open_writer"});
+    const auto writer_check = statx_metadata(writer_fd.get(), "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, cursor->scope_);
+    if (!writer_check.value()) {
+        const auto& e = *writer_check.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    if (!writer_check.value()->identity.value() || !writer_check.value()->kind.value() ||
+        *writer_check.value()->kind.value() != ObjectKind::Directory ||
+        compare_identity(*writer_check.value()->identity.value(), *initial.value()->identity.value()) != IdentityComparison::Same)
+        return Result::unavailable(ObservationState::Changed,
+            adapter_error(AdapterError::MetadataChanged, "directory_creation.writer_identity"));
+    if (writer_check.value()->posix_permissions.value() &&
+        (*writer_check.value()->posix_permissions.value() & 0777U) != 0700U) {
+        if (fchmod(writer_fd.get(), 0700) != 0)
+            return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "directory_creation.fchmod_private"});
+    }
+
+    // Open cursor and verifier descriptions from the verified held writer_fd, never by pathname.
+    OwnedDescriptor cursor_fd(openat(writer_fd.get(), ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (cursor_fd.get() < 0)
+        return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "directory_creation.open_cursor"});
+    OwnedDirectory dir_stream(fdopendir(cursor_fd.get()));
+    if (!dir_stream)
+        return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "directory_creation.fdopendir"});
+    cursor_fd.release();
+
+    OwnedDescriptor verifier_fd(openat(writer_fd.get(), ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (verifier_fd.get() < 0)
+        return Result::unavailable(errno_state(errno), {ErrorDomain::Posix, errno, "directory_creation.open_verifier"});
+
+    auto observed = statx_metadata(writer_fd.get(), "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, cursor->scope_);
+    if (!observed.value()) {
+        const auto& e = *observed.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    if (!observed.value()->identity.value() ||
+        compare_identity(*observed.value()->identity.value(), *initial.value()->identity.value()) != IdentityComparison::Same)
+        return Result::unavailable(ObservationState::Changed,
+            adapter_error(AdapterError::MetadataChanged, "directory_creation.observed_identity"));
+
+    auto writer = std::make_unique<PosixOpenedEntry>(std::move(writer_fd), cursor->scope_, false, false, true, nullptr, true);
+    const auto metadata_qualified = writer->qualify_metadata_replay(policy);
+    if (!metadata_qualified.value()) {
+        const auto& e = *metadata_qualified.unavailable_detail();
+        return Result::unavailable(e.state, e.error);
+    }
+    if (!*metadata_qualified.value())
+        return Result::unavailable(ObservationState::Unsupported,
+            adapter_error(AdapterError::ProviderReviewRequired, "directory_creation.metadata_qualification_false"));
+
+    auto result_cursor = std::make_shared<PosixDirectoryCursor>(std::move(dir_stream), observed.value()->identity, cursor->scope_);
+    auto verifier = std::make_unique<PosixOpenedEntry>(std::move(verifier_fd), cursor->scope_);
+    const auto verifier_check = verifier->inspect_basic();
+    if (!verifier_check.value() || !verifier_check.value()->identity.value() ||
+        compare_identity(*verifier_check.value()->identity.value(), *observed.value()->identity.value()) != IdentityComparison::Same)
+        return Result::unavailable(ObservationState::Changed,
+            adapter_error(AdapterError::MetadataChanged, "directory_creation.verifier_identity"));
+
+    if (fsync(parent_fd) != 0)
+        return Result::unavailable(ObservationState::Unknown,
+            {ErrorDomain::Posix, errno, "directory_creation.parent_fsync"});
+
+    return Result::available(std::unique_ptr<NativeCreatedDirectory>(new NativeCreatedDirectory(
+        std::move(parent), std::move(name), std::move(result_cursor), std::move(writer),
+        std::move(verifier), *observed.value(), policy)));
+#else
+    (void)parent; (void)name; (void)policy;
     return Observation<std::unique_ptr<NativeCreatedDirectory>>::unavailable(ObservationState::Unsupported,
         adapter_error(AdapterError::ProviderReviewRequired,"directory_creation.posix_creator_identity_unproved"));
+#endif
 }
 Observation<bool> NativeCreatedDirectory::finish_io() {
     if(!finish_result_)finish_result_=writer_->finish_content_writes();
@@ -3794,6 +4207,25 @@ Observation<std::unique_ptr<DirectoryCursor>> detail::open_native_session_root(c
     OwnedDirectory directory(fdopendir(fd.get()));if(!directory){const int e=errno;return R::unavailable(errno_state(e),{ErrorDomain::Posix,e,"session_lease.fdopendir"});}fd.release();
     return R::available(std::make_unique<PosixDirectoryCursor>(std::move(directory),std::move(id),lease.scope_));
 }
+
+#if defined(__linux__)
+Observation<std::array<std::byte,32>> detail::native_metadata_caller_ownership(const DirectoryCursor& parent) {
+    using R = Observation<std::array<std::byte,32>>;
+    const auto* native = dynamic_cast<const PosixDirectoryCursor*>(&parent);
+    if (!native || !native->identity().value())
+        return R::unavailable(ObservationState::Unsupported,
+            {ErrorDomain::Adapter, static_cast<std::int64_t>(AdapterError::InvalidAccess), "caller_owner.genuine_native_parent_required"});
+    const auto uid = geteuid();
+    const auto gid = getegid();
+    if (uid >= std::numeric_limits<uid_t>::max() || gid >= std::numeric_limits<gid_t>::max())
+        return R::unavailable(ObservationState::Unsupported,
+            adapter_error(AdapterError::UnsupportedQuery, "caller_owner.posix_owner_range"));
+    MetadataReplaySnapshot values;
+    values.basic.posix_uid = Observation<std::uint64_t>::available(static_cast<std::uint64_t>(uid));
+    values.basic.posix_gid = Observation<std::uint64_t>::available(static_cast<std::uint64_t>(gid));
+    return metadata_ownership_digest(values);
+}
+#endif
 } // namespace ck::files
 
 #ifdef CK_FS_LEGACY_NATIVE_TEST_OBSERVERS

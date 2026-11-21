@@ -32,10 +32,6 @@ with tempfile.TemporaryDirectory(prefix="tree-c-", dir=scratch) as work:
     (source / "alpha").write_bytes(b"complete file data\0\xff" * 256)
     (source / "nested").mkdir()
     (source / "nested" / "beta").write_bytes(b"nested exact bytes\x80" * 128)
-    if sys.platform.startswith("linux") and mode != "compare":
-        # Linux qualifies replay into existing directories; its strong native
-        # new-directory creator remains unavailable. Keep both source rows.
-        (target / "nested").mkdir()
     target_before = {p.relative_to(target): (p.is_dir(), p.stat().st_mtime_ns,
                                            p.stat().st_ctime_ns)
                      for p in target.rglob("*")}

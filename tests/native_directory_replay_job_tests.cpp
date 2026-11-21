@@ -420,7 +420,7 @@ void positive(const std::filesystem::path& path,bool existing,bool exact_name=fa
         return Observation<bool>::available(true);
     });
     auto job=take(NativeDirectoryReplayJob::create(std::move(request)));job->advance();
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__linux__)
     if(!existing) {CHECK(job->progress().phase==DirectoryReplayPhase::Unsupported&&!job->progress().creation_attempted);
         CHECK(take(f.parent->lookup_child(f.target,ChildLookupMode::NativeDefault)).state()==ChildLookupState::Missing);CHECK(take(f.root->finish_io()));return;}
 #endif
@@ -537,7 +537,7 @@ void cancelled(const std::filesystem::path& path,bool after_create) {
     Fixture f(path);auto job=take(NativeDirectoryReplayJob::create(f.request(!after_create,[](std::stop_token){return Observation<bool>::available(false);})));std::stop_source stop;
     if(after_create) {
         job->advance();
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__linux__)
         CHECK(job->progress().phase==DirectoryReplayPhase::Unsupported);CHECK(take(f.root->finish_io()));return;
 #else
         CHECK(job->progress().created&&job->progress().phase==DirectoryReplayPhase::AwaitingChildren);
@@ -561,11 +561,15 @@ void changed_source(const std::filesystem::path& path) {
 void changed_source_after_prepare(const std::filesystem::path& path) {
     Fixture f(path);auto job=take(NativeDirectoryReplayJob::create(f.request(false,[](std::stop_token){return Observation<bool>::available(true);})));
     job->advance();
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__linux__)
     CHECK(job->progress().phase==DirectoryReplayPhase::Unsupported);CHECK(take(f.root->finish_io()));
 #else
     CHECK(job->progress().phase==DirectoryReplayPhase::AwaitingChildren&&job->progress().created);
+#ifdef _WIN32
     directory_permissions(take(f.address.child_address(f.source_held->name())),false);
+#else
+    auto source_address=take(f.address.child_address(f.source_held->name()));CHECK(::chmod(source_address.host_path().value()->c_str(),0750)==0);
+#endif
     const auto result=job->children_finished();CHECK(!result.value());
     CHECK(job->progress().phase==DirectoryReplayPhase::ReviewRequired&&job->progress().worker_drained&&job->progress().recovery_required);
     CHECK(!job->progress().metadata_attempted);CHECK(take(f.parent->lookup_child(f.target,ChildLookupMode::NativeDefault)).state()==ChildLookupState::Found);

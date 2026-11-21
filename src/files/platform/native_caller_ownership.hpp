@@ -7,7 +7,7 @@ namespace ck::files::detail {
 // Native effective-token owner/group, read on the owning worker before any
 // target effects. Genuine native parent required. Not caller-authored expected
 // metadata, a session/baseline authority, or permission to change ownership.
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 Observation<std::array<std::byte,32>> native_metadata_caller_ownership(const DirectoryCursor&);
 #else
 inline Observation<std::array<std::byte,32>> native_metadata_caller_ownership(const DirectoryCursor&){

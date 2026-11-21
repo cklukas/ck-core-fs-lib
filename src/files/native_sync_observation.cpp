@@ -10,6 +10,7 @@
 #include "windows_acl_semantics.hpp"
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <set>
 #include <bit>
@@ -331,54 +332,142 @@ Observation<NativeSyncFileProof> observe_native_sync_file(std::shared_ptr<const 
     });
 }
 Observation<std::unique_ptr<NativeSyncInventory>> observe_native_sync_root(std::shared_ptr<const DirectoryCursor> root,MetadataReplayPolicy policy,
-    const NativeSyncProofLimits& limits,NativeSyncProofBudget& budget,std::stop_token stop) {
+    const NativeSyncProofLimits& limits,NativeSyncProofBudget& budget,std::stop_token stop,std::size_t max_depth) {
     return observed<std::unique_ptr<NativeSyncInventory>>([&]{
+        if(max_depth==0||max_depth>1024)native_fail("native_sync.depth_limit",ObservationState::Failed,AdapterError::InvalidLimit);
         check_stop(stop);auto owned=std::make_unique<NativeSyncInventory>();auto& out=*owned;out.root=root;out.root_metadata=native_value(root->inspect_basic());
         if(!out.root_metadata.identity.value()||!out.root_metadata.kind.value()||*out.root_metadata.kind.value()!=ObjectKind::Directory||
-            !out.root_metadata.changed.value()||!out.root_metadata.modified.value())native_fail("native_sync.root_version",ObservationState::Unsupported);
+            !out.root_metadata.changed.value()||!out.root_metadata.modified.value()||!out.root_metadata.mount_id.value())
+            native_fail("native_sync.root_version",ObservationState::Unsupported);
         require_true(qualify_native_sync_root_channels(*root,policy.limits));
+        if(max_depth==1) {
 #ifndef _WIN32
-        DirectoryReaderOwner enumeration;
-        const auto check_close=[&]{if(enumeration.error){const auto&e=*enumeration.error;
-            throw NativeFailure{{e.state,{e.domain,e.code,e.operation}}};}};
+            DirectoryReaderOwner enumeration;
+            const auto check_close=[&]{if(enumeration.error){const auto&e=*enumeration.error;
+                throw NativeFailure{{e.state,{e.domain,e.code,e.operation}}};}};
 #endif
-        try {
+            try {
 #ifndef _WIN32
-        { DirectoryReaderCloseSink sink(enumeration.error);detail::MetadataCaptureCleanupScope scope(&sink);
-          enumeration.reader=native_value(detail::open_posix_directory_reader(*root)); }
-        check_close();
-        auto* reader=enumeration.reader.get();
+                { DirectoryReaderCloseSink sink(enumeration.error);detail::MetadataCaptureCleanupScope scope(&sink);
+                  enumeration.reader=native_value(detail::open_posix_directory_reader(*root)); }
+                check_close();
+                auto* reader=enumeration.reader.get();
 #else
-        auto* reader=const_cast<DirectoryCursor*>(root.get());
+                auto* reader=const_cast<DirectoryCursor*>(root.get());
 #endif
-        std::size_t total=0;
-        for(;;){check_stop(stop);auto batch=reader->read(128,stop);
-            if(batch.state==DirectoryReadState::Error)throw NativeFailure{*batch.error};
-            if(batch.state==DirectoryReadState::Cancelled)check_stop(stop);
-            for(auto& name:batch.names){std::array names{name};const auto key=native_sync_key(names);
-                if(key.size()>limits.baseline.max_path_bytes||key.size()>limits.baseline.max_total_path_bytes-total)
-                    native_fail("native_sync.path_limit",ObservationState::Unknown,AdapterError::InventoryLimit);
-                total+=key.size();auto proof=native_value(observe_native_sync_file(root,name,policy,limits,budget,stop));
-                if(!out.files.emplace(key,std::move(proof)).second)native_fail("native_sync.duplicate_name");}
-            if(batch.state==DirectoryReadState::End)break;}
-        require_true(qualify_native_sync_root_channels(*root,policy.limits));
-        auto after=native_value(root->inspect_basic());if(!native_sync_same_version(out.root_metadata,after))native_fail("native_sync.inventory_changed");
+                std::size_t total=0;
+                for(;;){check_stop(stop);auto batch=reader->read(128,stop);
+                    if(batch.state==DirectoryReadState::Error)throw NativeFailure{*batch.error};
+                    if(batch.state==DirectoryReadState::Cancelled)check_stop(stop);
+                    for(auto& name:batch.names){std::array names{name};const auto key=native_sync_key(names);
+                        if(key.size()>limits.baseline.max_path_bytes||key.size()>limits.baseline.max_total_path_bytes-total)
+                            native_fail("native_sync.path_limit",ObservationState::Unknown,AdapterError::InventoryLimit);
+                        total+=key.size();auto proof=native_value(observe_native_sync_file(root,name,policy,limits,budget,stop));
+                        if(!out.files.emplace(key,std::move(proof)).second)native_fail("native_sync.duplicate_name");}
+                    if(batch.state==DirectoryReadState::End)break;}
+                require_true(qualify_native_sync_root_channels(*root,policy.limits));
+                auto after=native_value(root->inspect_basic());if(!native_sync_same_version(out.root_metadata,after))native_fail("native_sync.inventory_changed");
 #ifndef _WIN32
-        enumeration.close();check_close();
+                enumeration.close();check_close();
 #endif
-        return owned;
-        }catch(...){
+                return owned;
+            }catch(...){
 #ifndef _WIN32
-            enumeration.close();check_close();
+                enumeration.close();check_close();
 #endif
-            throw;
+                throw;
+            }
         }
+        std::size_t total=0;
+        std::vector<ObjectIdentity> ancestors{*out.root_metadata.identity.value()};
+        std::function<void(std::shared_ptr<const DirectoryCursor>,const BasicMetadata&,const std::vector<NativeName>&)> scan_dir =
+            [&](std::shared_ptr<const DirectoryCursor> dir_cursor,const BasicMetadata& dir_before,const std::vector<NativeName>& prefix) {
+#ifndef _WIN32
+            DirectoryReaderOwner enumeration;
+            const auto check_close=[&]{if(enumeration.error){const auto&e=*enumeration.error;
+                throw NativeFailure{{e.state,{e.domain,e.code,e.operation}}};}};
+#endif
+            try {
+#ifndef _WIN32
+                { DirectoryReaderCloseSink sink(enumeration.error);detail::MetadataCaptureCleanupScope scope(&sink);
+                  enumeration.reader=native_value(detail::open_posix_directory_reader(*dir_cursor)); }
+                check_close();
+                auto* reader=enumeration.reader.get();
+#else
+                auto* reader=const_cast<DirectoryCursor*>(dir_cursor.get());
+#endif
+                for(;;) {
+                    check_stop(stop);
+                    auto batch=reader->read(128,stop);
+                    if(batch.state==DirectoryReadState::Error)throw NativeFailure{*batch.error};
+                    if(batch.state==DirectoryReadState::Cancelled)check_stop(stop);
+                    for(auto& name:batch.names) {
+                        std::vector<NativeName> child_names=prefix;
+                        child_names.push_back(name);
+                        const auto key=native_sync_key(child_names);
+                        if(key.size()>limits.baseline.max_path_bytes||key.size()>limits.baseline.max_total_path_bytes-total)
+                            native_fail("native_sync.path_limit",ObservationState::Unknown,AdapterError::InventoryLimit);
+                        total+=key.size();
+                        auto child_held=native_value(HeldChild::observe(dir_cursor,name,stop));
+                        const auto& cm=child_held->metadata();
+                        if(!cm.kind.value()||!cm.identity.value()||!cm.mount_id.value())
+                            native_fail("native_sync.kind_or_identity",ObservationState::Unsupported,AdapterError::UnqualifiedIdentity);
+                        if(*cm.mount_id.value()!=*out.root_metadata.mount_id.value())
+                            native_fail("native_sync.mount_crossing",ObservationState::Unsupported,AdapterError::PlanTopologyUnsafe);
+                        if(*cm.kind.value()==ObjectKind::Directory) {
+                            if(child_names.size()>=max_depth)
+                                native_fail("native_sync.depth_limit",ObservationState::Unknown,AdapterError::InventoryLimit);
+                            if(budget.entries>=limits.max_entries)
+                                native_fail("native_sync.entry_limit",ObservationState::Unknown,AdapterError::InventoryLimit);
+                            ++budget.entries;
+                            charge(budget.metadata,sizeof(NativeSyncDirectoryProof),limits.max_metadata_bytes,"native_sync.proof_limit");
+                            auto sub_cursor=std::shared_ptr<const DirectoryCursor>(native_value(dir_cursor->open_directory_child(name)));
+                            auto sub_before=native_value(sub_cursor->inspect_basic());
+                            if(!native_sync_same_version(cm,sub_before))native_fail("native_sync.directory_open_changed");
+                            for(const auto& anc:ancestors)
+                                if(compare_identity(anc,*sub_before.identity.value())==IdentityComparison::Same)
+                                    native_fail("native_sync.directory_cycle",ObservationState::Unsupported,AdapterError::PlanTopologyUnsafe);
+                            require_true(qualify_native_sync_root_channels(*sub_cursor,policy.limits));
+                            ancestors.push_back(*sub_before.identity.value());
+                            scan_dir(sub_cursor,sub_before,child_names);
+                            ancestors.pop_back();
+                            auto sub_after=native_value(sub_cursor->inspect_basic());
+                            if(!native_sync_same_version(sub_before,sub_after))native_fail("native_sync.directory_changed");
+                            NativeSyncDirectoryProof dproof{std::move(child_names),std::move(child_held),std::move(sub_cursor),std::move(sub_before)};
+                            if(!out.directories.emplace(key,std::move(dproof)).second)native_fail("native_sync.duplicate_name");
+                        } else if(*cm.kind.value()==ObjectKind::RegularFile) {
+                            auto proof=native_value(observe_native_sync_file(dir_cursor,name,policy,limits,budget,stop));
+                            proof.components=std::move(child_names);
+                            if(!out.files.emplace(key,std::move(proof)).second)native_fail("native_sync.duplicate_name");
+                        } else {
+                            native_fail("native_sync.regular_files_only",ObservationState::Unsupported,AdapterError::UnsupportedQuery);
+                        }
+                    }
+                    if(batch.state==DirectoryReadState::End)break;
+                }
+                require_true(qualify_native_sync_root_channels(*dir_cursor,policy.limits));
+                auto after=native_value(dir_cursor->inspect_basic());
+                if(!native_sync_same_version(dir_before,after))native_fail("native_sync.inventory_changed");
+#ifndef _WIN32
+                enumeration.close();check_close();
+#endif
+            }catch(...){
+#ifndef _WIN32
+                enumeration.close();check_close();
+#endif
+                throw;
+            }
+        };
+        scan_dir(root,out.root_metadata,{});
+        return owned;
     });
 }
 Observation<bool> compare_native_sync_inventories(const NativeSyncInventory& a,const NativeSyncInventory& b) {
-    return observed<bool>([&]{if(!native_sync_same_version(a.root_metadata,b.root_metadata)||a.files.size()!=b.files.size())native_fail("native_sync.inventory_version_changed");
+    return observed<bool>([&]{if(!native_sync_same_version(a.root_metadata,b.root_metadata)||a.files.size()!=b.files.size()||a.directories.size()!=b.directories.size())native_fail("native_sync.inventory_version_changed");
         for(const auto& [key,p]:a.files){auto it=b.files.find(key);if(it==b.files.end()||p.status!=it->second.status||
             !native_sync_same_version(p.metadata.basic,it->second.metadata.basic))native_fail("native_sync.file_version_changed");}
+        for(const auto& [key,d]:a.directories){auto it=b.directories.find(key);if(it==b.directories.end()||d.status!=it->second.status||
+            !native_sync_same_version(d.metadata,it->second.metadata))native_fail("native_sync.directory_version_changed");}
         return true;});
 }
 } // namespace ck::files

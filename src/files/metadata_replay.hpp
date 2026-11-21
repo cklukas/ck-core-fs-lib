@@ -96,6 +96,7 @@ Observation<bool> verify_metadata_replay_values(const OpenedEntry&, const Metada
 // no-replace, retains the actual created object, and never adopts a name reopen.
 class NativeCreatedDirectory;
 Observation<bool> qualify_native_directory_creation(const DirectoryCursor&,const MetadataReplayPolicy&);
+Observation<bool> qualify_held_posix_namespace(const DirectoryCursor&);
 Observation<std::unique_ptr<NativeCreatedDirectory>> create_native_directory(
     std::shared_ptr<const DirectoryCursor> parent,NativeName name,const MetadataReplayPolicy&);
 // Worker-only live authority; never reconstructed from journal bytes. Creation

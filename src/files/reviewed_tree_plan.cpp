@@ -68,8 +68,11 @@ template<class T> Observation<T> unavailable(const UnavailableObservation& e) {
 template<class T> Observation<T> invalid(const char* op) {
     return unavailable<T>(error(AdapterError::PlanInvalid, op));
 }
-Observation<bool> qualify_namespace(const DirectoryCursor& cursor) {
-    return cursor.qualify_identity_bound_rename();
+Observation<bool> qualify_namespace(const DirectoryCursor& cursor, bool allow_held_posix_namespace = false) {
+    auto strict = cursor.qualify_identity_bound_rename();
+    if (!strict.value() && allow_held_posix_namespace && strict.state() == ObservationState::Unsupported)
+        return qualify_held_posix_namespace(cursor);
+    return strict;
 }
 Observation<RegularMetadataPreservation::Pointer> preservation_for(
     const HeldChild::Pointer& source,const NativeOperationCopyBatchPolicy& policy,std::stop_token stop) {
@@ -1218,6 +1221,7 @@ struct ReviewedTreePlanJob::Impl {
         old.held = *observed.value(); old.metadata = metadata;
         old.entry.relative_path = key_path(old.names); old.entry.object = comparison_object(metadata);
         if (old.entry.digest) { old.entry.digest->before = old.entry.object; old.entry.digest->after = old.entry.object; }
+        if (old.entry.metadata_digest) { old.entry.metadata_digest->before = old.entry.object; old.entry.metadata_digest->after = old.entry.object; }
         target.nodes.erase(found);
         const auto key = old.entry.relative_path;
         if (!target.nodes.emplace(key, std::move(old)).second) {
@@ -1403,6 +1407,7 @@ struct ReviewedTreePlanJob::Impl {
                 *request.journal_root, *retention_id, address_for(old), [this, &old] { return target_guard(old); }, request.digest_chunk_bytes};
             retention.open_journal=request.open_journal;
             retention.prepared_journal_root=request.prepared_journal_root;
+            retention.allow_held_posix_namespace=request.allow_held_posix_namespace;
             auto prepared = RetainedTarget::create(std::move(retention));
             if (!prepared.value()) { fail(*prepared.unavailable_detail(), prepared.state() == ObservationState::Unknown); return; }
             retained = *prepared.value(); progress.recovery_required = true; items[index()].recovery_required = true;
@@ -1595,8 +1600,8 @@ struct ReviewedTreePlanJob::Impl {
                 facts.time_order = st > dt ? ConflictTimeOrder::SourceNewer : st < dt ? ConflictTimeOrder::TargetNewer : ConflictTimeOrder::Equal;
                 facts.equal_time = facts.time_order == ConflictTimeOrder::Equal;
                 if (!reporting && facts.compatible_regular_files && request.journal_root && request.open_journal) {
-                    const auto qualified = qualify_namespace(*d->second.held->parent());
-                    if (qualified.value() && *qualified.value() && d->second.metadata.link_count.value() && *d->second.metadata.link_count.value() == 1) {
+                    const auto strict = d->second.held->parent()->qualify_identity_bound_rename();
+                    if (strict.value() && *strict.value() && d->second.metadata.link_count.value() && *d->second.metadata.link_count.value() == 1) {
                         // Provider rename support alone is not a content freeze.
                         // Probe the same owning guard required by RetainedTarget;
                         // execution reacquires/revalidates it before any hashing.
@@ -1605,6 +1610,21 @@ struct ReviewedTreePlanJob::Impl {
                         if (guard.value() && unchanged(d->second.metadata, (*guard.value())->metadata())) {
                             const auto stable = (*guard.value())->qualify_stable_content();
                             if (stable.value() && *stable.value()) {
+                                const auto guarded_current = (*guard.value())->inspect_basic();
+                                const auto membership = d->second.held->refresh();
+                                facts.retention_available = guarded_current.value() && membership.value() &&
+                                    unchanged(d->second.metadata, *guarded_current.value()) &&
+                                    unchanged(d->second.metadata, (*membership.value())->metadata());
+                            }
+                        }
+                    } else if (!strict.value() && request.allow_held_posix_namespace &&
+                               strict.state() == ObservationState::Unsupported &&
+                               d->second.metadata.link_count.value() && *d->second.metadata.link_count.value() == 1) {
+                        const auto held_ns = qualify_held_posix_namespace(*d->second.held->parent());
+                        if (held_ns.value() && *held_ns.value()) {
+                            auto guard = HeldChild::observe_with_access(d->second.held->parent(), d->second.held->name(),
+                                EntryAccess::ContentRead);
+                            if (guard.value() && unchanged(d->second.metadata, (*guard.value())->metadata())) {
                                 const auto guarded_current = (*guard.value())->inspect_basic();
                                 const auto membership = d->second.held->refresh();
                                 facts.retention_available = guarded_current.value() && membership.value() &&
@@ -1698,7 +1718,7 @@ struct ReviewedTreePlanJob::Impl {
         if (!unchanged(n.metadata, (*now.value())->metadata()))
             return unavailable<bool>(error(AdapterError::PlanDecisionStale, "reviewed_tree.deletion_changed", ObservationState::Changed));
         if (!require_native_rename) return Observation<bool>::available(true);
-        auto capability = qualify_namespace(**parent.value());
+        auto capability = qualify_namespace(**parent.value(), request.allow_held_posix_namespace);
         if (!capability.value()) return capability;
         if (!*capability.value()) return unavailable<bool>(error(AdapterError::UnsupportedQuery, "reviewed_tree.deletion_provider", ObservationState::Unsupported));
         return Observation<bool>::available(true);
@@ -2246,14 +2266,14 @@ Observation<bool> ReviewedTreePlanJob::begin_execution(const ReviewedTreeReceipt
             if (s == impl_->source.nodes.end() || d == impl_->target.nodes.end() || !s->second.entry.digest || !d->second.entry.digest ||
                 *s->second.metadata.kind.value() != ObjectKind::RegularFile || *d->second.metadata.kind.value() != ObjectKind::RegularFile)
                 return unavailable<bool>(error(AdapterError::UnsupportedQuery, "reviewed_tree.replacement_kind", ObservationState::Unsupported));
-            const auto qualified = qualify_namespace(*d->second.held->parent());
+            const auto qualified = qualify_namespace(*d->second.held->parent(), impl_->request.allow_held_posix_namespace);
             if (!qualified.value()) return qualified;
             if (!*qualified.value()) return unavailable<bool>(error(AdapterError::UnsupportedQuery, "reviewed_tree.retention_unqualified", ObservationState::Unsupported));
         }
         if (removal(item.action)) {
             auto binding = native_binding(item.row.token);
             if (!binding.value()) return unavailable<bool>(*binding.unavailable_detail());
-            auto capability = qualify_namespace(*binding.value()->destination_parent);
+            auto capability = qualify_namespace(*binding.value()->destination_parent, impl_->request.allow_held_posix_namespace);
             if (!capability.value()) return capability;
             if (!*capability.value()) return unavailable<bool>(error(AdapterError::UnsupportedQuery, "reviewed_tree.identity_bound_deletion_unavailable", ObservationState::Unsupported));
         }

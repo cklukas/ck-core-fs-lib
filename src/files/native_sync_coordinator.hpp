@@ -21,6 +21,9 @@ struct NativeSyncCoordinatorRequest final {
     std::function<bool(NativeSyncCoordinatorEvent)> before_event;
     SyncSessionFaults storage_faults;
     PreparedJournalRoot::Pointer prepared_journal_root={};
+    bool recursive_trees=false;
+    std::size_t max_depth=1024;
+    bool allow_held_posix_namespace=false;
 };
 enum class NativeSyncChoice { Proposal, Skip, LeftWins, RightWins };
 struct NativeSyncDecision final {std::string exact_key;NativeSyncChoice choice=NativeSyncChoice::Skip;};

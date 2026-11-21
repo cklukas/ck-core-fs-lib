@@ -1,6 +1,7 @@
 // Copyright (c) 2026 C. Klukas. All rights reserved.
 // SPDX-License-Identifier: LGPL-2.0-or-later
 #include "retained_target.hpp"
+#include "metadata_replay.hpp"
 #include "prepared_journal_root.hpp"
 #include <algorithm>
 
@@ -46,17 +47,32 @@ Observation<RetainedTarget::Pointer> RetainedTarget::create(RetainedTargetReques
         !r.target->metadata().logical_size.value() || !r.target->metadata().modified.value() || !r.target->metadata().changed.value() ||
         !r.target->metadata().link_count.value() || *r.target->metadata().link_count.value() != 1)
         return unavailable<Pointer>(rejected("retained_target.input",ObservationState::Failed,AdapterError::PlanInvalid));
-    const auto capability = r.target->parent()->qualify_identity_bound_rename();
+    const auto dest_cursor = r.retained_destination ? r.retained_destination : r.target->parent();
+    if (!dest_cursor || !dest_cursor->identity().value())
+        return unavailable<Pointer>(rejected("retained_target.destination",ObservationState::Failed,AdapterError::PlanInvalid));
+    if (dest_cursor.get() == r.target->parent().get() && r.retained_name == r.target->name())
+        return unavailable<Pointer>(rejected("retained_target.input",ObservationState::Failed,AdapterError::PlanInvalid));
+    auto capability = r.target->parent()->qualify_identity_bound_rename();
+    bool use_held_posix = false;
+    if (!capability.value() && r.allow_held_posix_namespace && capability.state() == ObservationState::Unsupported) {
+        capability = qualify_held_posix_namespace(*r.target->parent());
+        if (capability.value() && *capability.value() && dest_cursor.get() != r.target->parent().get())
+            capability = qualify_held_posix_namespace(*dest_cursor);
+        use_held_posix = true;
+    }
     if (!capability.value()) return unavailable<Pointer>(*capability.unavailable_detail());
     if (!*capability.value()) return unavailable<Pointer>(rejected("retained_target.rename_unqualified",ObservationState::Unsupported,AdapterError::ProviderReviewRequired));
-    auto guard = HeldChild::observe_with_access(r.target->parent(),r.target->name(),EntryAccess::ContentRead | EntryAccess::RenameSource);
+    auto guard = HeldChild::observe_with_access(r.target->parent(),r.target->name(),
+        use_held_posix ? EntryAccess::ContentRead : (EntryAccess::ContentRead | EntryAccess::RenameSource));
     if (!guard.value()) return unavailable<Pointer>(*guard.unavailable_detail());
     if (!version(r.target->metadata(),(*guard.value())->metadata())) return unavailable<Pointer>(rejected("retained_target.changed"));
-    // This proof belongs to the exact retained guard, not its provider, file
-    // identity, stat brackets, or the fact that DELETE/read access was granted.
-    const auto stable = (*guard.value())->qualify_stable_content();
-    if (!stable.value()) return unavailable<Pointer>(*stable.unavailable_detail());
-    if (!*stable.value()) return unavailable<Pointer>(rejected("retained_target.stable_content_unqualified",ObservationState::Unsupported,AdapterError::ProviderReviewRequired));
+    if (!use_held_posix) {
+        // This proof belongs to the exact retained guard, not its provider, file
+        // identity, stat brackets, or the fact that DELETE/read access was granted.
+        const auto stable = (*guard.value())->qualify_stable_content();
+        if (!stable.value()) return unavailable<Pointer>(*stable.unavailable_detail());
+        if (!*stable.value()) return unavailable<Pointer>(rejected("retained_target.stable_content_unqualified",ObservationState::Unsupported,AdapterError::ProviderReviewRequired));
+    }
     // Establish the reviewed namespace binding only after the guard is active.
     // Refresh the ordinary observation, not a second DELETE guard: the first
     // guard must continue denying new DELETE opens through the entire operation.
@@ -70,8 +86,9 @@ Observation<RetainedTarget::Pointer> RetainedTarget::create(RetainedTargetReques
         !version(r.target->metadata(),(*membership.value())->metadata()) || !version(r.target->metadata(),*current.value()))
         return unavailable<Pointer>(rejected("retained_target.guarded_membership_changed"));
     const auto parent = NativeDurableIdentity::from_live(*r.target->parent_identity().value());
+    const auto dest_parent = NativeDurableIdentity::from_live(*dest_cursor->identity().value());
     const auto object = NativeDurableIdentity::from_live(*r.target->metadata().identity.value());
-    if (!parent || !object) return unavailable<Pointer>(rejected("retained_target.identity",ObservationState::Unknown,AdapterError::UnqualifiedIdentity));
+    if (!parent || !dest_parent || !object) return unavailable<Pointer>(rejected("retained_target.identity",ObservationState::Unknown,AdapterError::UnqualifiedIdentity));
     auto journal = OperationJournal::create(FileOperation::Move,r.journal_id,{1,16,1024 * 1024});
     if (!journal.value()) return unavailable<Pointer>(*journal.unavailable_detail());
     const auto safe_root = r.prepared_journal_root ? r.prepared_journal_root->revalidate()
@@ -82,7 +99,7 @@ Observation<RetainedTarget::Pointer> RetainedTarget::create(RetainedTargetReques
                                       : r.open_journal(r.journal_root,journal_name(r),true);
     if (!file.value()) return unavailable<Pointer>(*file.unavailable_detail());
     if (!*file.value()) return unavailable<Pointer>(rejected("retained_target.null_journal",ObservationState::Failed,AdapterError::InvalidNativeResult));
-    NativeOperationRecoveryEvidence evidence{r.target->name(),r.retained_name,*parent,*object,*parent,*object,
+    NativeOperationRecoveryEvidence evidence{r.target->name(),r.retained_name,*dest_parent,*object,*parent,*object,
         r.parent_address,r.reviewed_digest,{}};
     evidence.source_name = r.target->name();
     auto value = Pointer(new RetainedTarget(std::move(r),*guard.value(),*journal.value(),
@@ -92,9 +109,13 @@ Observation<RetainedTarget::Pointer> RetainedTarget::create(RetainedTargetReques
     return Observation<Pointer>::available(std::move(value));
 }
 Observation<bool> RetainedTarget::verify_guard_and_membership() const {
-    const auto stable = guard_->qualify_stable_content();
-    if (!stable.value()) return stable;
-    if (!*stable.value()) return unavailable<bool>(rejected("retained_target.stable_content_unqualified",ObservationState::Unsupported,AdapterError::ProviderReviewRequired));
+    if (requests_rename_source(guard_->access())) {
+        const auto stable = guard_->qualify_stable_content();
+        if (!stable.value()) return stable;
+        if (!*stable.value()) return unavailable<bool>(rejected("retained_target.stable_content_unqualified",ObservationState::Unsupported,AdapterError::ProviderReviewRequired));
+    } else if (!request_.allow_held_posix_namespace) {
+        return unavailable<bool>(rejected("retained_target.rename_access_required",ObservationState::Denied,AdapterError::InvalidAccess));
+    }
     const auto parent = guard_->parent()->inspect_basic();
     const auto membership = request_.target->refresh();
     const auto current = guard_->inspect_basic();
@@ -104,6 +125,13 @@ Observation<bool> RetainedTarget::verify_guard_and_membership() const {
     if (!parent.value()->identity.value() || !same(*guard_->parent_identity().value(), *parent.value()->identity.value()) ||
         !version(request_.target->metadata(),(*membership.value())->metadata()) || !version(request_.target->metadata(),*current.value()))
         return unavailable<bool>(rejected("retained_target.guarded_membership_changed"));
+    if (request_.retained_destination && request_.retained_destination.get() != guard_->parent().get()) {
+        const auto dest_now = request_.retained_destination->inspect_basic();
+        if (!dest_now.value()) return unavailable<bool>(*dest_now.unavailable_detail());
+        if (!dest_now.value()->identity.value() || !request_.retained_destination->identity().value() ||
+            !same(*request_.retained_destination->identity().value(), *dest_now.value()->identity.value()))
+            return unavailable<bool>(rejected("retained_target.destination_changed"));
+    }
     return Observation<bool>::available(true);
 }
 Observation<bool> RetainedTarget::append(OperationJournalState state) {
@@ -166,9 +194,22 @@ Observation<bool> RetainedTarget::retain(std::stop_token stop) {
     // still refuses before namespace mutation and preserves the journal.
     const auto at_use = verify_guard_and_membership();
     if (!at_use.value()) return fail(*at_use.unavailable_detail());
-    const auto renamed = guard_->rename_noreplace(*guard_->parent(),request_.retained_name);
+    const auto& dest = request_.retained_destination ? *request_.retained_destination : *guard_->parent();
+    const auto renamed = requests_rename_source(guard_->access())
+        ? guard_->rename_noreplace(dest, request_.retained_name)
+        : guard_->parent()->rename_child_noreplace(guard_->name(), *guard_->metadata().identity.value(), dest, request_.retained_name);
     if (!renamed.value()) return fail(*renamed.unavailable_detail(),renamed.state() != ObservationState::Unsupported && renamed.state() != ObservationState::Denied && renamed.state() != ObservationState::Changed);
     if (!*renamed.value()) return fail(rejected("retained_target.invalid_rename",ObservationState::Unknown,AdapterError::InvalidNativeResult),true);
+    if (!requests_rename_source(guard_->access())) {
+        const auto post = guard_->inspect_basic();
+        if (!post.value() || !post.value()->identity.value() ||
+            !same(*request_.target->metadata().identity.value(), *post.value()->identity.value()) ||
+            !equal(request_.target->metadata().logical_size, post.value()->logical_size) ||
+            !equal(request_.target->metadata().modified, post.value()->modified) ||
+            !equal(request_.target->metadata().kind, post.value()->kind) ||
+            !equal(request_.target->metadata().link_count, post.value()->link_count))
+            return fail(rejected("retained_target.post_rename_changed",ObservationState::Changed,AdapterError::MetadataChanged),true);
+    }
     evidence_.published_identity = evidence_.source_identity;
     for (const auto phase : {OperationJournalState::DestinationCommitted,OperationJournalState::SourceRemovalIntended,
              OperationJournalState::SourceRetired,OperationJournalState::Complete}) {

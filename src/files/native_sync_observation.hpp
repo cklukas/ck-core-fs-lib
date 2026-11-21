@@ -39,10 +39,18 @@ struct NativeSyncFileProof final {
     std::shared_ptr<const OpenedEntry> native_source;
     NativeSyncChannelFacts channel_facts;
 };
+struct NativeSyncDirectoryProof final {
+    std::vector<NativeName> components;
+    HeldChild::Pointer held;
+    std::shared_ptr<const DirectoryCursor> cursor;
+    BasicMetadata metadata;
+    SyncEntryStatus status{SyncPresence::Present,SyncKind::Directory,{},{}};
+};
 struct NativeSyncInventory final {
     std::shared_ptr<const DirectoryCursor> root;
     BasicMetadata root_metadata;
     std::map<std::string,NativeSyncFileProof> files;
+    std::map<std::string,NativeSyncDirectoryProof> directories;
 };
 bool native_sync_same_ownership(const MetadataReplaySnapshot&,const MetadataReplaySnapshot&);
 bool native_sync_same_version(const BasicMetadata&,const BasicMetadata&) noexcept;
@@ -61,6 +69,6 @@ Observation<NativeSyncFileProof> observe_native_sync_file(std::shared_ptr<const 
 // The map's move constructor may allocate on MSVC. Transfer a unique owner
 // through Observation instead of asserting a false noexcept payload contract.
 Observation<std::unique_ptr<NativeSyncInventory>> observe_native_sync_root(std::shared_ptr<const DirectoryCursor>,
-    MetadataReplayPolicy,const NativeSyncProofLimits&,NativeSyncProofBudget&,std::stop_token={});
+    MetadataReplayPolicy,const NativeSyncProofLimits&,NativeSyncProofBudget&,std::stop_token={},std::size_t max_depth=1);
 Observation<bool> compare_native_sync_inventories(const NativeSyncInventory&,const NativeSyncInventory&);
 } // namespace ck::files

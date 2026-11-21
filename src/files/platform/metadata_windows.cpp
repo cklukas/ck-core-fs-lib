@@ -4448,6 +4448,10 @@ Observation<bool> qualify_native_directory_creation(const DirectoryCursor& paren
     if(!detail::legacy_close_handle(handle,"legacy.metadata_windows.CloseHandle.4"))return failure<bool>(GetLastError(),"directory_creation.qualify_parent_close");
     return Result::available(true);
 }
+Observation<bool> qualify_held_posix_namespace(const DirectoryCursor&) {
+    return Observation<bool>::unavailable(ObservationState::Unsupported,
+        {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::NotApplicable),"held_posix_namespace.windows"});
+}
 Observation<std::unique_ptr<NativeCreatedDirectory>> create_native_directory(
     std::shared_ptr<const DirectoryCursor> parent,NativeName name,const MetadataReplayPolicy& policy) {
     using Result=Observation<std::unique_ptr<NativeCreatedDirectory>>;

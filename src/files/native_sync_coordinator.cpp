@@ -67,6 +67,7 @@ struct NativeSyncCoordinator::State {
     std::map<std::string,std::vector<NativeName>> paths;
     struct Selected {std::string key;SyncAction action;bool skip;std::optional<NativeSyncArtifact> artifact;};
     std::vector<Selected> selected;
+    std::vector<std::size_t> execution_order;
     NativeSyncCoordinatorResult result;
     std::optional<OperationJournalId> transaction;
     std::optional<NativeName> ledger_name;
@@ -107,7 +108,7 @@ struct NativeSyncCoordinator::State {
             }}catch(...) {record_finish(owner,ObservationState::Unknown,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"native_sync.ledger_finish_exception");}
             ledger.reset();
         }
-        for(auto& inventory:inventories){inventory.files.clear();inventory.root.reset();}
+        for(auto& inventory:inventories){inventory.files.clear();inventory.directories.clear();inventory.root.reset();}
         if(session)try {auto close_result=session->finish_io();if(!close_result.value()||!*close_result.value()) {
             if(auto* failure=close_result.unavailable_detail())record_finish(owner,failure->state,failure->error.domain,failure->error.code,failure->error.operation);
             else record_finish(owner,ObservationState::Unknown,ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::InvalidNativeResult),"native_sync.session_finish_false");
@@ -143,17 +144,24 @@ struct NativeSyncCoordinator::State {
     std::array<NativeSyncInventory,2> scan(std::stop_token token) {
         NativeSyncProofBudget budget;
         std::array<NativeSyncInventory,2> out;
+        const std::size_t depth=request.recursive_trees?request.max_depth:1;
         for(unsigned side=0;side<2;++side) {
-            auto observed=value(observe_native_sync_root(cursor(side!=0),request.metadata,request.proof_limits,budget,token));
+            auto observed=value(observe_native_sync_root(cursor(side!=0),request.metadata,request.proof_limits,budget,token,depth));
             // Observation transfers only the unique owner. Map assignment and
             // any allocation remain ordinary throwing work, before publication
             // of this fresh inventory or baseline advancement.
             if(!observed)fail("native_sync.null_inventory",ObservationState::Unknown,AdapterError::InvalidNativeResult);
             out[side]=std::move(*observed);
         }
-        for(const auto& root:out)for(const auto& [key,proof]:root.files) {
-            auto [it,inserted]=paths.emplace(key,proof.components);
-            if(!inserted&&it->second!=proof.components)fail("native_sync.opaque_label_collision",ObservationState::Changed,AdapterError::ProviderReviewRequired);
+        for(const auto& root:out) {
+            for(const auto& [key,proof]:root.files) {
+                auto [it,inserted]=paths.emplace(key,proof.components);
+                if(!inserted&&it->second!=proof.components)fail("native_sync.opaque_label_collision",ObservationState::Changed,AdapterError::ProviderReviewRequired);
+            }
+            for(const auto& [key,dproof]:root.directories) {
+                auto [it,inserted]=paths.emplace(key,dproof.components);
+                if(!inserted&&it->second!=dproof.components)fail("native_sync.opaque_label_collision",ObservationState::Changed,AdapterError::ProviderReviewRequired);
+            }
         }
         require(session->revalidate());return out;
     }
@@ -172,15 +180,44 @@ struct NativeSyncCoordinator::State {
     }
     SyncEntryStatus status(const NativeSyncInventory& root,const std::string& key) {
         auto it=root.files.find(key);if(it!=root.files.end())return it->second.status;
+        auto dit=root.directories.find(key);if(dit!=root.directories.end())return dit->second.status;
         auto binding=paths.find(key);
         if(binding==paths.end())fail("native_sync.baseline_missing_native_record",ObservationState::Changed,AdapterError::ProviderReviewRequired);
-        const auto& names=binding->second;if(names.size()!=1)fail("native_sync.structural_path",ObservationState::Unsupported,AdapterError::UnsupportedQuery);
-        auto before=value(root.root->inspect_basic());if(!native_sync_same_version(root.root_metadata,before))fail("native_sync.absence_parent_changed");
-        for(unsigned i=0;i<2;++i) {
-            auto lookup=value(root.root->lookup_child(names.front(),ChildLookupMode::NativeDefault));
-            if(lookup.state()!=ChildLookupState::Missing||!lookup.missing_witness())fail("native_sync.absence_unproved",ObservationState::Changed,AdapterError::ProviderReviewRequired);
+        const auto& names=binding->second;
+        if(!request.recursive_trees) {
+            if(names.size()!=1)fail("native_sync.structural_path",ObservationState::Unsupported,AdapterError::UnsupportedQuery);
+            auto before=value(root.root->inspect_basic());if(!native_sync_same_version(root.root_metadata,before))fail("native_sync.absence_parent_changed");
+            for(unsigned i=0;i<2;++i) {
+                auto lookup=value(root.root->lookup_child(names.front(),ChildLookupMode::NativeDefault));
+                if(lookup.state()!=ChildLookupState::Missing||!lookup.missing_witness())fail("native_sync.absence_unproved",ObservationState::Changed,AdapterError::ProviderReviewRequired);
+            }
+            auto after=value(root.root->inspect_basic());if(!native_sync_same_version(before,after))fail("native_sync.absence_parent_changed");
+            return absent();
         }
-        auto after=value(root.root->inspect_basic());if(!native_sync_same_version(before,after))fail("native_sync.absence_parent_changed");
+        auto current_cursor=root.root;
+        BasicMetadata current_meta=root.root_metadata;
+        for(std::size_t idx=0;idx<names.size();++idx) {
+            auto before=value(current_cursor->inspect_basic());
+            if(!native_sync_same_version(current_meta,before))fail("native_sync.absence_parent_changed");
+            if(idx+1<names.size()) {
+                const auto prefix_key=native_sync_key(std::span(names).first(idx+1));
+                auto sub=root.directories.find(prefix_key);
+                if(sub!=root.directories.end()) {
+                    current_cursor=sub->second.cursor;
+                    current_meta=sub->second.metadata;
+                    continue;
+                }
+                if(root.files.contains(prefix_key))return absent();
+            }
+            for(unsigned pass=0;pass<2;++pass) {
+                auto lookup=value(current_cursor->lookup_child(names[idx],ChildLookupMode::NativeDefault));
+                if(lookup.state()!=ChildLookupState::Missing||!lookup.missing_witness())
+                    fail("native_sync.absence_unproved",ObservationState::Changed,AdapterError::ProviderReviewRequired);
+            }
+            auto after=value(current_cursor->inspect_basic());
+            if(!native_sync_same_version(before,after))fail("native_sync.absence_parent_changed");
+            return absent();
+        }
         return absent();
     }
     bool pair_equal(const std::array<NativeSyncInventory,2>& data,const std::string& key) {
@@ -191,7 +228,11 @@ struct NativeSyncCoordinator::State {
             left!=data[0].files.end()&&right!=data[1].files.end()&&native_sync_same_ownership(left->second.metadata,right->second.metadata);
     }
     std::vector<SyncBaselineRow> current_rows(const std::array<NativeSyncInventory,2>& data) {
-        std::set<std::string> keys;for(const auto& root:data)for(const auto& [key,proof]:root.files){(void)proof;keys.insert(key);}
+        std::set<std::string> keys;
+        for(const auto& root:data) {
+            for(const auto& [key,proof]:root.files){(void)proof;keys.insert(key);}
+            for(const auto& [key,dproof]:root.directories){(void)dproof;keys.insert(key);}
+        }
         if(session->snapshot().baseline)for(const auto& row:session->snapshot().baseline->rows)keys.insert(row.relative_path);
         if(keys.size()>request.proof_limits.baseline.max_rows)fail("native_sync.row_limit",ObservationState::Unknown,AdapterError::InventoryLimit);
         std::vector<SyncBaselineRow> rows;
@@ -346,8 +387,14 @@ struct NativeSyncCoordinator::State {
         const auto metadata_schema=schema_hash.digest();
         for(unsigned side=0;side<2;++side)for(const auto& row:reviewed) {
             ComparisonEntry e;e.relative_path=row.exact_key;auto it=inventories[side].files.find(row.exact_key);
-            if(it==inventories[side].files.end())e.object.state=ComparisonObjectState::Gone;
-            else {
+            if(it==inventories[side].files.end()) {
+                auto dit=inventories[side].directories.find(row.exact_key);
+                if(dit==inventories[side].directories.end())e.object.state=ComparisonObjectState::Gone;
+                else {
+                    const auto& db=dit->second.metadata;
+                    e.object={ComparisonObjectState::Stable,*db.identity.value(),ObjectKind::Directory,{},*db.modified.value(),1,{}};
+                }
+            } else {
                 const auto& p=it->second;const auto& b=p.metadata.basic;
                 e.object={ComparisonObjectState::Stable,*b.identity.value(),*b.kind.value(),*b.logical_size.value(),*b.modified.value(),1,{}};
                 ComparisonDigest d;d.state=ComparisonDigestState::CompleteStable;d.algorithm=ComparisonDigestAlgorithm::Sha256;
@@ -384,21 +431,51 @@ struct NativeSyncCoordinator::State {
                 const auto& reviewed_row=reviewed[index];NativeSyncRawFacts f;f.token=comparison.token;f.relation=comparison.relation;
                 auto side_facts=[&](unsigned side,NativeSyncObservedFacts& output,Observation<bool>& retention) {
                     output.status=side?reviewed_row.right:reviewed_row.left;auto it=inventories[side].files.find(reviewed_row.exact_key);
-                    if(it==inventories[side].files.end()){retention=Observation<bool>::available(false);return;}
+                    if(it==inventories[side].files.end()) {
+                        auto dit=inventories[side].directories.find(reviewed_row.exact_key);
+                        if(dit==inventories[side].directories.end()){retention=Observation<bool>::available(false);return;}
+                        const auto& dproof=dit->second;
+                        output.kind=ObjectKind::Directory;
+                        output.modified=*dproof.metadata.modified.value();
+                        retention=attempt<bool>([&]{
+                            auto strict=dproof.held->parent()->qualify_identity_bound_rename();
+                            if(!strict.value()&&request.allow_held_posix_namespace&&strict.state()==ObservationState::Unsupported)
+                                strict=qualify_held_posix_namespace(*dproof.held->parent());
+                            return value(std::move(strict));
+                        });
+                        return;
+                    }
                     const auto& proof=it->second;output.kind=*proof.metadata.basic.kind.value();output.size=*proof.metadata.basic.logical_size.value();output.modified=*proof.metadata.basic.modified.value();
                     output.all_stream_size=proof.channel_facts.all_stream_logical_bytes;
                     output.named_stream_count=proof.channel_facts.coverage==DataChannelCoverage::WindowsFileStreamInfo?
                         std::optional<std::uint64_t>(proof.channel_facts.named_stream_count):std::nullopt;
                     output.channel_coverage=proof.channel_facts.coverage;
                     retention=attempt<bool>([&]{
-                        auto guard=value(HeldChild::observe_with_access(proof.held->parent(),proof.held->name(),EntryAccess::ContentRead|EntryAccess::RenameSource));
-                        if(!native_sync_same_version(proof.metadata.basic,guard->metadata()))fail("native_sync.retention_probe_changed");
-                        require(guard->qualify_stable_content());require(source_guard(proof));return true;
+                        auto strict=HeldChild::observe_with_access(proof.held->parent(),proof.held->name(),EntryAccess::ContentRead|EntryAccess::RenameSource);
+                        if(strict.value()) {
+                            auto guard=std::move(strict).take_value();
+                            if(!native_sync_same_version(proof.metadata.basic,guard->metadata()))fail("native_sync.retention_probe_changed");
+                            require(guard->qualify_stable_content());require(source_guard(proof));return true;
+                        }
+                        if(request.allow_held_posix_namespace&&strict.state()==ObservationState::Unsupported) {
+                            if(!proof.metadata.basic.link_count.value()||*proof.metadata.basic.link_count.value()!=1)
+                                fail("native_sync.retention_hard_link",ObservationState::Unsupported,AdapterError::UnsupportedQuery);
+                            require(qualify_held_posix_namespace(*proof.held->parent()));
+                            if(proof.held->parent().get()!=inventories[side].root.get())
+                                require(qualify_held_posix_namespace(*inventories[side].root));
+                            auto guard=value(HeldChild::observe_with_access(proof.held->parent(),proof.held->name(),EntryAccess::ContentRead));
+                            if(!native_sync_same_version(proof.metadata.basic,guard->metadata()))fail("native_sync.retention_probe_changed");
+                            require(source_guard(proof));return true;
+                        }
+                        throw Failure{*strict.unavailable_detail()};
                     });
                 };
                 side_facts(0,f.left,f.left_retention);side_facts(1,f.right,f.right_retention);
                 const bool both=f.left.status.presence==SyncPresence::Present&&f.right.status.presence==SyncPresence::Present;
-                f.conflict_class=reviewed_row.reason==SyncReason::DeleteEdit?ConflictClass::DeleteEdit:!both?ConflictClass::Unavailable:
+                f.conflict_class=reviewed_row.reason==SyncReason::DirectoryDeleteChangedSubtree?ConflictClass::DirectoryDeleteEditedChild:
+                    reviewed_row.reason==SyncReason::DeleteEdit?ConflictClass::DeleteEdit:!both?ConflictClass::Unavailable:
+                    (f.left.kind&&f.right.kind&&*f.left.kind!=*f.right.kind)?ConflictClass::TypeMismatch:
+                    (f.left.kind==ObjectKind::Directory&&f.right.kind==ObjectKind::Directory)?ConflictClass::DirectoryPair:
                     f.relation==ComparisonRelation::Unknown?ConflictClass::RequiredMetadata:
                     reviewed_row.reason==SyncReason::ConcurrentEdit?ConflictClass::BothEdited:
                         ConflictClass::ExistingRegular;
@@ -528,9 +605,44 @@ struct NativeSyncCoordinator::State {
             }
             next.push_back({row.exact_key,action,skip,{}});
         }
+        if(request.recursive_trees) {
+            for(std::size_t i=0;i<next.size();++i) {
+                if(next[i].skip) {
+                    const std::string prefix=next[i].key+"/";
+                    const bool left_dir=reviewed[i].left.presence==SyncPresence::Present&&reviewed[i].left.kind==SyncKind::Directory;
+                    const bool right_dir=reviewed[i].right.presence==SyncPresence::Present&&reviewed[i].right.kind==SyncKind::Directory;
+                    if(!left_dir||!right_dir) {
+                        for(std::size_t j=0;j<next.size();++j)if(next[j].key.starts_with(prefix)) {
+                            if((!right_dir&&next[j].action==SyncAction::CopyLeftToRight)||
+                               (!left_dir&&next[j].action==SyncAction::CopyRightToLeft)) {
+                                next[j].skip=true;next[j].action=SyncAction::Unchanged;
+                            }
+                        }
+                    }
+                }
+            }
+            for(std::size_t i=next.size();i-->0;) {
+                const bool keeps_right=(next[i].skip&&reviewed[i].right.presence==SyncPresence::Present)||next[i].action==SyncAction::CopyLeftToRight;
+                const bool keeps_left=(next[i].skip&&reviewed[i].left.presence==SyncPresence::Present)||next[i].action==SyncAction::CopyRightToLeft;
+                if(!keeps_left&&!keeps_right)continue;
+                for(auto slash=next[i].key.rfind('/');slash!=std::string::npos;slash=slash==0?std::string::npos:next[i].key.rfind('/',slash-1)) {
+                    const std::string_view anc_key(next[i].key.data(),slash);
+                    for(std::size_t p=0;p<i;++p)if(next[p].key==anc_key) {
+                        if((keeps_right&&next[p].action==SyncAction::DeleteRight)||
+                           (keeps_left&&next[p].action==SyncAction::DeleteLeft)) {
+                            next[p].skip=true;next[p].action=SyncAction::Unchanged;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         selected=std::move(next);check_deletion_guard();approved_first=approve_first_run;
         rule_revision=std::make_shared<const int>(0);selected_rules_digest={};
         result.state=NativeSyncCoordinatorState::Executing;
+    }
+    bool is_directory_row(const std::string& key) const {
+        return inventories[0].directories.contains(key)||inventories[1].directories.contains(key);
     }
     void prepare_ledger(std::stop_token token) {
         revalidate_inventory(token);
@@ -544,10 +656,19 @@ struct NativeSyncCoordinator::State {
             NativeSyncPathRecord record;record.opaque_key=s.key;record.components=it->second;record.action=s.action;record.skipped=s.skip;
             record.left=status(inventories[0],s.key);record.right=status(inventories[1],s.key);
             for(unsigned side=0;side<2;++side) {
-                auto file=inventories[side].files.find(s.key);if(file==inventories[side].files.end())continue;
-                auto id=NativeDurableIdentity::from_live(*file->second.metadata.basic.identity.value());
-                if(!id)fail("native_sync.plan_file_identity",ObservationState::Unsupported,AdapterError::UnqualifiedIdentity);
-                (side?record.right_object:record.left_object)=*id;
+                auto file=inventories[side].files.find(s.key);
+                if(file!=inventories[side].files.end()) {
+                    auto id=NativeDurableIdentity::from_live(*file->second.metadata.basic.identity.value());
+                    if(!id)fail("native_sync.plan_file_identity",ObservationState::Unsupported,AdapterError::UnqualifiedIdentity);
+                    (side?record.right_object:record.left_object)=*id;
+                    continue;
+                }
+                auto dir=inventories[side].directories.find(s.key);
+                if(dir!=inventories[side].directories.end()) {
+                    auto id=NativeDurableIdentity::from_live(*dir->second.metadata.identity.value());
+                    if(!id)fail("native_sync.plan_directory_identity",ObservationState::Unsupported,AdapterError::UnqualifiedIdentity);
+                    (side?record.right_object:record.left_object)=*id;
+                }
             }
             evidence.paths.push_back(std::move(record));
         }
@@ -562,9 +683,39 @@ struct NativeSyncCoordinator::State {
             if(!parent||!object)fail("native_sync.artifact_identity",ObservationState::Unsupported,AdapterError::UnqualifiedIdentity);
             s.artifact=NativeSyncArtifact{side,{artifact_name},*parent,*object,it->second.status};evidence.artifacts.push_back(*s.artifact);
         }
+        execution_order.clear();
+        if(!request.recursive_trees) {
+            for(std::size_t i=0;i<selected.size();++i)execution_order.push_back(i);
+        } else {
+            std::vector<std::size_t> dir_creates,file_ops,dir_deletes;
+            for(std::size_t i=0;i<selected.size();++i) {
+                const auto& s=selected[i];
+                if(s.skip||s.action==SyncAction::Unchanged)continue;
+                if(is_directory_row(s.key)) {
+                    if(is_delete(s.action))dir_deletes.push_back(i);
+                    else dir_creates.push_back(i);
+                } else file_ops.push_back(i);
+            }
+            std::sort(dir_creates.begin(),dir_creates.end(),[&](std::size_t a,std::size_t b){
+                const auto da=paths.at(selected[a].key).size(),db=paths.at(selected[b].key).size();
+                return da!=db?da<db:a<b;
+            });
+            std::sort(dir_deletes.begin(),dir_deletes.end(),[&](std::size_t a,std::size_t b){
+                const auto da=paths.at(selected[a].key).size(),db=paths.at(selected[b].key).size();
+                return da!=db?da>db:a<b;
+            });
+            execution_order.insert(execution_order.end(),dir_creates.begin(),dir_creates.end());
+            execution_order.insert(execution_order.end(),file_ops.begin(),file_ops.end());
+            execution_order.insert(execution_order.end(),dir_deletes.begin(),dir_deletes.end());
+        }
+        const auto encode_fn=[&](const NativeSyncLedgerEvidence& ev){
+            return request.recursive_trees
+                ? encode_native_sync_hierarchy_ledger(ev,request.ledger_limits)
+                : encode_native_sync_ledger(ev,request.ledger_limits);
+        };
         // One opaque receipt binds this complete immutable plan/rules record
         // to the session generation/policy and exclusive durable ledger ID.
-        Sha256 receipt;receipt.update(transaction->bytes);receipt.update(selected_rules_digest);receipt.update(value(encode_native_sync_ledger(evidence,request.ledger_limits)));evidence.reviewed_plan=receipt.digest();
+        Sha256 receipt;receipt.update(transaction->bytes);receipt.update(selected_rules_digest);receipt.update(value(encode_fn(evidence)));evidence.reviewed_plan=receipt.digest();
         // Preflight the entire predicted ledger's bounded wire size before
         // data mutation. Prediction is for allocation/capacity ONLY; it never
         // supplies convergence authority or replaces final native verification.
@@ -581,7 +732,7 @@ struct NativeSyncCoordinator::State {
         std::size_t wire_size=0;
         for(auto phase:{OperationJournalState::Planned,OperationJournalState::Prepared,OperationJournalState::Copied,OperationJournalState::Verified,
             OperationJournalState::CommitIntended,OperationJournalState::DestinationCommitted,OperationJournalState::Complete}) {
-            auto payload=value(encode_native_sync_ledger(phase==OperationJournalState::Planned||phase==OperationJournalState::Prepared?evidence:proposal,request.ledger_limits));
+            auto payload=value(encode_fn(phase==OperationJournalState::Planned||phase==OperationJournalState::Prepared?evidence:proposal));
             OperationJournalRecord record{sizing->records().size()+1,0,phase,std::move(payload)};
             auto frame=value(encode_operation_journal_frame(*sizing,record,{request.ledger_limits.max_total_wire_bytes}));
             if(stored_ledger_bytes>request.ledger_limits.max_total_wire_bytes||wire_size>request.ledger_limits.max_total_wire_bytes-stored_ledger_bytes||
@@ -589,7 +740,9 @@ struct NativeSyncCoordinator::State {
                 fail("native_sync.ledger_wire_capacity_review",ObservationState::Unknown,AdapterError::InventoryLimit);
             wire_size+=frame.size();require(sizing->append(std::move(record)));
         }
-        ledger=value(NativeSyncLedger::create(session->storage_root(),*ledger_name,*transaction,evidence,request.ledger_limits));
+        ledger=value(request.recursive_trees
+            ? NativeSyncLedger::create_hierarchy(session->storage_root(),*ledger_name,*transaction,evidence,request.ledger_limits)
+            : NativeSyncLedger::create(session->storage_root(),*ledger_name,*transaction,evidence,request.ledger_limits));
         require(ledger->append(OperationJournalState::Prepared,evidence));
     }
     Observation<bool> source_guard(const NativeSyncFileProof& proof,std::stop_token token={}) {
@@ -598,10 +751,21 @@ struct NativeSyncCoordinator::State {
             require(proof.held->verify_metadata_source(proof.metadata,token));return true;});
     }
     void start_retention(Selected& s,std::stop_token token) {
-        const bool side=destination_right(s.action);auto& old=inventories[side?1:0].files.at(s.key);
+        const bool side=destination_right(s.action);auto& dest=inventories[side?1:0];auto& old=dest.files.at(s.key);
+        auto parent_addr=side?request.right:request.left;
+        for(std::size_t i=0;i+1<old.components.size();++i)parent_addr=value(parent_addr.child_address(old.components[i]));
+        const auto key=s.key;
         RetainedTargetRequest r{old.held,s.artifact->components.back(),old.status.content_digest,request.coordinator.value_or(request.left),value(new_native_operation_journal_id()),
-            side?request.right:request.left,[this,&old,token]{return source_guard(old,token);},request.proof_limits.chunk_bytes};
+            parent_addr,[this,side,key,token]{
+                const auto& current_dest=inventories[side?1:0];
+                auto it=current_dest.files.find(key);
+                if(it==current_dest.files.end())return Observation<bool>::unavailable(ObservationState::Changed,
+                    {ErrorDomain::Adapter,static_cast<std::int64_t>(AdapterError::PlanDecisionStale),"native_sync.retained_target_missing"});
+                return source_guard(it->second,token);
+            },request.proof_limits.chunk_bytes};
         r.prepared_journal_root=session->storage_root();
+        r.allow_held_posix_namespace=request.allow_held_posix_namespace;
+        r.retained_destination=dest.root;
         retained=value(RetainedTarget::create(std::move(r)));stop(token);
     }
     void start_copy(Selected& s,std::stop_token token) {
@@ -610,24 +774,96 @@ struct NativeSyncCoordinator::State {
         auto& dest=inventories[side?1:0];auto policy=value(RegularMetadataPreservation::create_with_policy(source.held,false,request.metadata,token));
         if(!policy->captured_metadata()||value(native_sync_metadata_digest(*source.native_source,*policy->captured_metadata(),token))!=source.status.required_metadata_digest||
             !native_sync_same_version(source.metadata.basic,policy->captured_metadata()->basic))fail("native_sync.metadata_review_changed");
+        std::shared_ptr<const DirectoryCursor> dest_parent=dest.root;
+        ObjectIdentity dest_parent_id=*dest.root_metadata.identity.value();
+        auto dest_addr=side?request.right:request.left;
+        if(source.components.size()>1) {
+            const auto parent_key=native_sync_key(std::span(source.components).first(source.components.size()-1));
+            auto dit=dest.directories.find(parent_key);
+            if(dit==dest.directories.end())fail("native_sync.destination_parent_missing",ObservationState::Changed,AdapterError::PlanDecisionStale);
+            dest_parent=dit->second.cursor;
+            dest_parent_id=*dit->second.metadata.identity.value();
+            for(std::size_t i=0;i+1<source.components.size();++i)dest_addr=value(dest_addr.child_address(source.components[i]));
+        }
         auto id=value(new_native_operation_journal_id());auto name=generated_name(".ck-sync-copy-",id,session->storage_root()->encoding());
         auto f=value(open_prepared_operation_journal_file(*session->storage_root(),name,true));auto j=value(OperationJournal::create(FileOperation::Copy,id));
         require(append_operation_journal_file(*f,*j,{1,0,OperationJournalState::Planned,{}}));
+        const auto key=s.key;
         NativeOperationCopyRequest r{
             .journal=j,.journal_file=std::shared_ptr<OperationJournalFile>(std::move(f)),.item=0,
             .source_parent=source.held->parent(),.source_parent_identity=*source.held->parent_identity().value(),
             .source_name=source.components.back(),.source_identity=*source.metadata.basic.identity.value(),
-            .destination=dest.root,.destination_identity=*dest.root_metadata.identity.value(),
-            .destination_address=side?request.right:request.left,.staging_name=generated_name(".ck-sync-stage-",id,source.components.back().encoding()),
+            .destination=dest_parent,.destination_identity=dest_parent_id,
+            .destination_address=dest_addr,.staging_name=generated_name(".ck-sync-stage-",id,source.components.back().encoding()),
             .destination_name=source.components.back(),.copy_limits={request.proof_limits.chunk_bytes,request.proof_limits.max_file_bytes,1024},
             .prepare_metadata={},.operation=FileOperation::Copy,.verify_metadata_before_publication={}};
         r.reviewed_content_digest=source.status.content_digest;
         r.prepare_metadata=[policy](OpenedEntry& stage,std::stop_token t){return policy->prepare(stage,t);};
-        r.verify_metadata_before_publication=[this,policy,&source](OpenedEntry& stage,std::stop_token t){
-            return attempt<bool>([&]{require(source_guard(source,t));require(policy->verify(stage,t));return true;});};
+        r.verify_metadata_before_publication=[this,policy,side,key](OpenedEntry& stage,std::stop_token t){
+            return attempt<bool>([&]{
+                const auto& current_src=inventories[side?0:1];
+                auto it=current_src.files.find(key);
+                if(it==current_src.files.end())fail("native_sync.source_missing");
+                require(source_guard(it->second,t));
+                require(policy->verify(stage,t));
+                return true;
+            });};
         if(s.artifact)r.prepare_destination_before_publication=[this](std::stop_token t){
             return attempt<bool>([&]{require(retained->retain(t));mutated=true;return true;});};
         copy=value(NativeOperationCopyJob::create(std::move(r)));
+    }
+    void execute_directory(Selected& s,std::stop_token token) {
+        revalidate_inventory(token);
+        const bool side=destination_right(s.action);
+        auto& dest=inventories[side?1:0];
+        if(is_copy(s.action)) {
+            const auto& src_dir=inventories[side?0:1].directories.at(s.key);
+            if(!dest.directories.contains(s.key)) {
+                std::shared_ptr<const DirectoryCursor> dest_parent=dest.root;
+                if(src_dir.components.size()>1) {
+                    const auto parent_key=native_sync_key(std::span(src_dir.components).first(src_dir.components.size()-1));
+                    auto dit=dest.directories.find(parent_key);
+                    if(dit==dest.directories.end())fail("native_sync.destination_parent_missing",ObservationState::Changed,AdapterError::PlanDecisionStale);
+                    dest_parent=dit->second.cursor;
+                }
+                auto created=value(dest_parent->create_child_directory(src_dir.components.back()));
+                mutated=true;
+#ifndef _WIN32
+                if(src_dir.metadata.posix_permissions.value()) {
+                    const auto wanted=0700U|(*src_dir.metadata.posix_permissions.value()&0777U);
+                    auto held=value(HeldChild::observe(dest_parent,src_dir.components.back(),token));
+                    auto writer=held->open_directory_metadata_target(request.metadata);
+                    if(writer.value()) {
+                        BasicMetadata basic=(*writer.value())->inspect_basic().value()?*(*writer.value())->inspect_basic().value():src_dir.metadata;
+                        basic.posix_permissions=Observation<std::uint32_t>::available(wanted);
+                        (void)(*writer.value())->apply_replay_basic(basic,request.metadata);
+                        require((*writer.value())->finish_content_writes());
+                    }
+                }
+#endif
+                (void)created;
+            }
+            accept_transition(s,token);
+            return;
+        }
+        if(is_delete(s.action)) {
+            auto dit=dest.directories.find(s.key);
+            if(dit==dest.directories.end())fail("native_sync.directory_delete_missing",ObservationState::Changed,AdapterError::PlanDecisionStale);
+            auto parent=dit->second.held->parent();
+            const NativeName leaf=dit->second.components.back();
+            const ObjectIdentity expected_id=*dit->second.metadata.identity.value();
+            auto strict=parent->qualify_identity_bound_rename();
+            if(!strict.value()&&request.allow_held_posix_namespace&&strict.state()==ObservationState::Unsupported)
+                strict=qualify_held_posix_namespace(*parent);
+            require(std::move(strict));
+            dit->second.cursor.reset();
+            dit->second.held.reset();
+            require(parent->retire_child(leaf,expected_id));
+            mutated=true;
+            accept_transition(s,token);
+            return;
+        }
+        fail("native_sync.directory_action",ObservationState::Failed,AdapterError::PlanInvalid);
     }
     void accept_transition(Selected& s,std::stop_token token) {
         auto after=scan(token);auto next_catalog=catalog;if(s.artifact)next_catalog.push_back(*s.artifact);protect(after,next_catalog);
@@ -643,16 +879,27 @@ struct NativeSyncCoordinator::State {
                 (void)proof;if(side==dest&&key==s.key)continue;
                 if(!old.files.contains(key))fail("native_sync.unrelated_file_appeared",ObservationState::Changed,AdapterError::ProviderReviewRequired);
             }
+            for(const auto& [key,dproof]:old.directories) {
+                if(side==dest&&key==s.key)continue;
+                auto it=fresh.directories.find(key);
+                if(it==fresh.directories.end()||compare_identity(*dproof.metadata.identity.value(),*it->second.metadata.identity.value())!=IdentityComparison::Same)
+                    fail("native_sync.unrelated_directory_changed",ObservationState::Changed,AdapterError::ProviderReviewRequired);
+            }
+            for(const auto& [key,dproof]:fresh.directories) {
+                (void)dproof;if(side==dest&&key==s.key)continue;
+                if(!old.directories.contains(key))fail("native_sync.unrelated_directory_appeared",ObservationState::Changed,AdapterError::ProviderReviewRequired);
+            }
         }
-        auto expected=is_delete(s.action)?absent():inventories[1-dest].files.at(s.key).status;
+        auto expected=is_delete(s.action)?absent():
+            (inventories[1-dest].files.contains(s.key)?inventories[1-dest].files.at(s.key).status:inventories[1-dest].directories.at(s.key).status);
         if(status(after[dest],s.key)!=expected||!pair_equal(after,s.key))fail("native_sync.publication_not_converged",ObservationState::Changed,AdapterError::ProviderReviewRequired);
         inventories=std::move(after);catalog=std::move(next_catalog);++result.completed_operations;++current;copy.reset();retained.reset();
     }
     void execute(std::stop_token token) {
         stop(token);if(!ledger) {prepare_ledger(token);return;}
-        while(current<selected.size()&&(selected[current].skip||selected[current].action==SyncAction::Unchanged))++current;
-        if(current==selected.size()) {result.state=NativeSyncCoordinatorState::Verifying;return;}
-        auto& s=selected[current];
+        while(current<execution_order.size()&&(selected[execution_order[current]].skip||selected[execution_order[current]].action==SyncAction::Unchanged))++current;
+        if(current==execution_order.size()) {result.state=NativeSyncCoordinatorState::Verifying;return;}
+        auto& s=selected[execution_order[current]];
         if(copy) {
             auto state=copy->advance(token);
             if(state==OperationExecutionState::Complete) {mutated=true;accept_transition(s,token);return;}
@@ -665,6 +912,7 @@ struct NativeSyncCoordinator::State {
                 if(retained->failure())throw Failure{*retained->failure()};fail("native_sync.retention_incomplete",ObservationState::Changed,AdapterError::ProviderReviewRequired);}
             return;
         }
+        if(is_directory_row(s.key)) {execute_directory(s,token);return;}
         if(s.artifact&&!retained) {revalidate_inventory(token);start_retention(s,token);return;}
         if(is_delete(s.action)) {require(retained->retain(token));mutated=true;accept_transition(s,token);return;}
         revalidate_inventory(token);start_copy(s,token);

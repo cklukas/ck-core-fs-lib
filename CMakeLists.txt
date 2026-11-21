@@ -537,7 +537,7 @@ if(BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/audit_archive_layers.py ${CMAKE_NM}
       $<TARGET_FILE:ck_core_fs_engine> $<TARGET_FILE:ck_files_platform> $<TARGET_FILE:ck_core_fs_native>)
     add_executable(ck_fs_native_tree_linux_tests tests/native_tree_execution_tests.cpp)
-    target_link_libraries(ck_fs_native_tree_linux_tests PRIVATE ck_core_fs_native ${CMAKE_DL_LIBS})
+    target_link_libraries(ck_fs_native_tree_linux_tests PRIVATE ck_file_engine_c_test_support ${CMAKE_DL_LIBS})
     target_compile_options(ck_fs_native_tree_linux_tests PRIVATE -UNDEBUG)
     add_test(NAME native_tree_linux COMMAND ck_fs_native_tree_linux_tests)
     set_tests_properties(native_tree_linux PROPERTIES TIMEOUT 180

@@ -98,7 +98,12 @@ immutable preview facts and native names. Review produces a matching receipt;
 execution revalidates the frozen evidence. Each command outcome persists until
 acknowledged. Rules, manual native names, per-row eligibility, rejection reasons,
 retained names and recovery identifiers are backend results. Unknown or failed
-inventory cannot become `identical` or authorize mirror deletion. See
+inventory cannot become `identical` or authorize mirror deletion. Default
+`ckfet_start_v1` / `ckfet_start_with_journal_root_v1` entry points enforce
+`CKFET_NAMESPACE_STRICT_HANDLE_LOCK`, whereas additive `ckfet_options_v2` /
+`ckfet_start_v2` / `ckfet_start_with_journal_root_v2` allow callers to opt into
+`CKFET_NAMESPACE_HELD_PARENT_RENAME` on qualified Linux `ext4`/`XFS`/`Btrfs`
+mounts for reviewed `Mirror` removals and retained `Replace` execution. See
 [native contracts](native-contracts.md) for lifetime and platform limits.
 
 Compare accepts no journal root and a zero operation ID. Mutation-only
@@ -128,8 +133,12 @@ commit receipts. Open retains both root locks, including overlap protection;
 commit is generation-checked and crash recovery preserves uncertain evidence.
 The `ckfss_two_way_*` companion composes native inventory, frozen conflict
 rules, mixed-direction execution, convergence verification and baseline commit.
-Its current native scope is ordinary regular files directly below each root;
-nested trees and structural directory metadata remain unavailable. Bulk rules
+Default `ckfss_two_way_open` and `ckfss_two_way_open_with_journal_root` restrict
+scope to ordinary regular files directly below each root; additive
+`ckfss_two_way_open_tree_v1` (`ckfss_two_way_tree_options_v1`) enables bounded
+recursive directory tree synchronization with `hierarchy_magic` ledger closure
+and optional `CKFSS_NAMESPACE_HELD_PARENT_RENAME` retention/deletion on
+qualified Linux providers. Bulk rules
 use backend facts and an opaque assessed receipt. A baseline receipt alone
 never authorizes data execution.
 

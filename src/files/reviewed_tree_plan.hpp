@@ -29,6 +29,7 @@ struct ReviewedTreePlanRequest final {
     // Cumulative native metadata/data-stream admission for each independent
     // scan; read.max_bytes is always replaced by digest_chunk_bytes.
     MetadataCaptureLimits metadata_limits{};
+    bool allow_held_posix_namespace = false;
 };
 
 enum class ReviewedTreeState {

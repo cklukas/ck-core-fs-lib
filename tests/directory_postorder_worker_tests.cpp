@@ -52,7 +52,7 @@ void bounded_positive(const std::filesystem::path& path,bool existing,bool with_
  if(existing){destination=execution_source(f,request.existing_destination,budget,limits);request.destination_review_proof=take(destination->proof());}
  request.source_proof=original;request.reviewed_metadata=original->snapshot();request.metadata_limits=limits;request.metadata_budget=budget;
  auto job=take(NativeDirectoryReplayJob::create(std::move(request)));CHECK(!job->verified_target_values());
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__linux__)
  if(!existing){bounded_await(*job,DirectoryReplayPhase::Unsupported);CHECK(!job->progress().creation_attempted);CHECK(take(source->finish_io()));CHECK(take(f.root->finish_io()));return;}
 #endif
  bounded_await(*job,DirectoryReplayPhase::AwaitingChildren);CHECK(!original->io_finished());CHECK(!take(job->children_finished()));

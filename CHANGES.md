@@ -2,6 +2,29 @@
 
 ## Unreleased 0.5 development checkpoint
 
+- Add Linux native directory creation (`mkdirat(..., 0700)` + held `O_RDONLY |
+  O_DIRECTORY | O_NOFOLLOW` writer/cursor/verifier opened via `openat(writer_fd,
+  ".")` + parent `fsync`) on qualified `ext4`, `XFS`, and `Btrfs` mounts, while
+  keeping Darwin directory creation explicitly `Unsupported`.
+- Add additive held-parent namespace policy opt-in for Linux reviewed tree
+  mutation (`CKFET_OPTIONS_V2_VERSION`, `CKFET_NAMESPACE_HELD_PARENT_RENAME`,
+  `ckfet_options_v2`, `ckfet_options_init_v2`, `ckfet_start_v2`,
+  `ckfet_start_with_journal_root_v2`), qualifying safe `.ck-retire-<pid>-<seq>`
+  `renameat2(..., RENAME_NOREPLACE)` + post-rename `statx`/`fstatat` identity
+  verification (restoring the original entry without unlinking on concurrent
+  mismatch) for reviewed `Mirror` file/empty-directory deletion and retained
+  `Replace` execution, while preserving strict handle-lock `Unsupported`
+  refusals on default v1 entry points.
+- Add additive recursive two-way tree synchronization (`CKFSS_TWO_WAY_TREE_VERSION`,
+  `ckfss_two_way_tree_options_v1`, `ckfss_two_way_tree_options_init_v1`,
+  `ckfss_two_way_open_tree_v1`), extending `NativeSyncCoordinator` with bounded
+  recursive directory tree inventory (`NativeSyncDirectoryProof`), nested
+  absence proofs, pre-order directory creation, file copy/retained replacement,
+  post-order empty-directory removal, root-container retained artifacts, and
+  canonical `hierarchy_magic` (`NativeSyncLedger::create_hierarchy`) ledger
+  parent-closure encoding while preserving flat-only v1 behavior on
+  `ckfss_two_way_open` and `ckfss_two_way_open_with_journal_root`.
+
 - Release the transient `2 * max_native_bytes` native attribute/security read
   scratch reservation from `MetadataCaptureBudget` once a `MetadataCaptureJob`
   seals its `NativeMetadataProof` (or terminates), retaining only the sealed

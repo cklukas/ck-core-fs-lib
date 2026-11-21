@@ -186,6 +186,23 @@ CK_FILE_ENGINE_API ckfe_api_status ckfet_start_v1(const ckfe_entry *source_root,
 CK_FILE_ENGINE_API ckfe_api_status ckfet_start_with_journal_root_v1(const ckfe_entry *source_root,
     const ckfe_entry *destination_root, const ckfet_options_v1 *options, const ckfjr_root *journal_root,
     ckfet_job **out_job, ckfe_error *error);
+
+#define CKFET_OPTIONS_V2_VERSION UINT32_C(2)
+enum {
+    CKFET_NAMESPACE_STRICT_HANDLE_LOCK = 0,
+    CKFET_NAMESPACE_HELD_PARENT_RENAME = 1
+};
+typedef struct ckfet_options_v2 {
+    ckfet_options_v1 base;
+    uint32_t namespace_policy;
+    uint32_t reserved_v2;
+} ckfet_options_v2;
+CK_FILE_ENGINE_API void ckfet_options_init_v2(ckfet_options_v2 *options);
+CK_FILE_ENGINE_API ckfe_api_status ckfet_start_v2(const ckfe_entry *source_root,
+    const ckfe_entry *destination_root, const ckfet_options_v2 *options, ckfet_job **out_job, ckfe_error *error);
+CK_FILE_ENGINE_API ckfe_api_status ckfet_start_with_journal_root_v2(const ckfe_entry *source_root,
+    const ckfe_entry *destination_root, const ckfet_options_v2 *options, const ckfjr_root *journal_root,
+    ckfet_job **out_job, ckfe_error *error);
 CK_FILE_ENGINE_API ckfe_api_status ckfet_poll_v1(const ckfet_job *job, ckfet_snapshot_v1 *out_snapshot);
 /* Nonblocking shutdown completion. A terminal snapshot records the operation
  * outcome, including all required writes/flushes and any retained recovery
